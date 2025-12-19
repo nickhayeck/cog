@@ -1,0 +1,40 @@
+// v0.0.4: name resolution + nominal types + method calls + match typing + move checking.
+
+mod util;
+
+use util::{CounterSink as CS, Mode, Sink};
+
+pub struct Buffer {
+    len: usize,
+    ptr: mut* [u8],
+}
+
+fn make_buf() -> Buffer {
+    Buffer { len: 4, ptr: 0 as mut* [u8] }
+}
+
+fn classify(m: Mode) -> i32 {
+    match m {
+        Mode::On(x) if x > 0 => x,
+        _ => 0,
+    }
+}
+
+fn main() -> i32 {
+    let (a, b): (i32, i32) = (40, 2);
+    let mut s: CS = CS { n: 0 };
+    s.write(1 as u8);
+
+    let mut buf: Buffer = make_buf();
+    let moved: Buffer = buf;
+    buf = make_buf();
+
+    let _ignore: Buffer = moved;
+
+    if a == 40 && b == 2 {
+        classify(Mode::On(1))
+    } else {
+        classify(Mode::Off)
+    }
+}
+

@@ -1,45 +1,97 @@
 %{
 #include "parse_state.hpp"
 
-#include <cstdio>
+#include <cstdint>
 #include <string>
 #include <utility>
+#include <vector>
 
 extern int yylex(void);
-extern int yylineno;
 int yyerror(const char* msg);
 
-static std::vector<cog::Node*>* vec_new() { return new std::vector<cog::Node*>(); }
-static std::vector<cog::Node*>* vec1(cog::Node* n) {
-  auto* v = new std::vector<cog::Node*>();
+template <class T>
+static std::vector<T*>* vec_new() {
+  return new std::vector<T*>();
+}
+template <class T>
+static std::vector<T*>* vec1(T* n) {
+  auto* v = new std::vector<T*>();
   v->push_back(n);
   return v;
 }
-static std::vector<cog::Node*>* vec_push(std::vector<cog::Node*>* v, cog::Node* n) {
+template <class T>
+static std::vector<T*>* vec_push(std::vector<T*>* v, T* n) {
   v->push_back(n);
   return v;
 }
-static cog::Node* node_from_vec(cog::NodeKind kind, std::vector<cog::Node*>* v) {
-  std::vector<cog::Node*> children = std::move(*v);
+template <class T>
+static std::vector<T*> take_vec(std::vector<T*>* v) {
+  std::vector<T*> out = std::move(*v);
   delete v;
-  return cog::mk(kind, std::move(children));
-}
-static cog::Node* node_from_vec(cog::NodeKind kind, std::string text, std::vector<cog::Node*>* v) {
-  std::vector<cog::Node*> children = std::move(*v);
-  delete v;
-  return cog::mk(kind, std::move(text), std::move(children));
+  return out;
 }
 
-static void parse_error(const char* msg) {
-  cog::push_error(std::to_string(yylineno) + ": " + msg);
-}
+#define SPAN(loc)                                                                                   \
+  cog::Span {                                                                                       \
+    .file = cog::g_parse_state ? cog::g_parse_state->file : 0,                                      \
+    .begin = cog::SourceLoc{                                                                        \
+        static_cast<std::uint32_t>((loc).first_line), static_cast<std::uint32_t>((loc).first_column)}, \
+    .end = cog::SourceLoc{                                                                          \
+        static_cast<std::uint32_t>((loc).last_line), static_cast<std::uint32_t>((loc).last_column)}     \
+  }
+
+#define MK(T, loc, ...) cog::mk<T>(SPAN(loc) __VA_OPT__(,) __VA_ARGS__)
+
 %}
+
+%locations
+%error-verbose
 
 %union {
   long long int_val;
   char* str;
-  cog::Node* node;
-  std::vector<cog::Node*>* nodes;
+  cog::Visibility vis;
+
+  cog::FileAst* file;
+  cog::Item* item;
+  cog::ItemFn* item_fn;
+
+  cog::Attr* attr;
+  cog::Ident* ident;
+  cog::Path* path;
+  cog::UseTree* use_tree;
+
+  cog::FieldDecl* field_decl;
+  cog::VariantDecl* variant_decl;
+
+  cog::Param* param;
+  cog::FnDecl* fn_decl;
+
+  cog::Type* type;
+  cog::Block* block;
+  cog::Stmt* stmt;
+  cog::Expr* expr;
+  cog::Pattern* pat;
+  cog::MatchArm* arm;
+  cog::FieldInit* field_init;
+  cog::PatField* pat_field;
+
+  std::vector<cog::Item*>* items;
+  std::vector<cog::ItemFn*>* item_fns;
+  std::vector<cog::Attr*>* attrs;
+  std::vector<cog::Ident*>* idents;
+  std::vector<cog::UseTree*>* use_trees;
+  std::vector<cog::FieldDecl*>* field_decls;
+  std::vector<cog::VariantDecl*>* variant_decls;
+  std::vector<cog::Param*>* params;
+  std::vector<cog::FnDecl*>* fn_decls;
+  std::vector<cog::Type*>* types;
+  std::vector<cog::Stmt*>* stmts;
+  std::vector<cog::Expr*>* exprs;
+  std::vector<cog::Pattern*>* pats;
+  std::vector<cog::MatchArm*>* arms;
+  std::vector<cog::FieldInit*>* field_inits;
+  std::vector<cog::PatField*>* pat_fields;
 }
 
 %token <str> IDENT
@@ -49,20 +101,65 @@ static void parse_error(const char* msg) {
 %token KW_FN KW_STRUCT KW_ENUM KW_TRAIT KW_IMPL KW_FOR KW_TYPE KW_CONST KW_STATIC
 %token KW_MOD KW_USE KW_PUB KW_AS KW_LET KW_MUT KW_IF KW_ELSE KW_WHILE
 %token KW_LOOP KW_MATCH KW_RETURN KW_BREAK KW_CONTINUE KW_COMPTIME KW_DYN KW_SELF_TYPE
+%token KW_TRUE KW_FALSE
 
-%token TOK_COLONCOLON TOK_ARROW TOK_FATARROW TOK_EQEQ TOK_NEQ TOK_LE TOK_GE TOK_ANDAND TOK_OROR
+%token TOK_COLONCOLON TOK_COLONCOLON_LBRACE TOK_ARROW TOK_FATARROW TOK_EQEQ TOK_NEQ TOK_LE TOK_GE TOK_ANDAND TOK_OROR
 
-%type <node> program item item_core vis_opt attr path path_seg type ret_opt fn_sig
-%type <node> block stmt let_stmt expr expr_nostruct expr_or_block pattern match_arm
-%type <node> field variant param field_init
-%type <nodes> items attrs_opt fields_opt fields variants_opt variants
-%type <nodes> params_opt params args_opt args field_inits_opt field_inits
-%type <nodes> impl_items_opt impl_items trait_items_opt trait_items
-%type <nodes> match_arms_opt match_arms block_elems_opt block_elems stmts types_opt types
-%type <nodes> pat_list_opt pat_list
+%type <file> program
+%type <items> items
+%type <item> item item_core
+%type <vis> vis_opt
+%type <attrs> attrs_opt
+%type <attr> attr
+%type <path> path
+%type <idents> path_segments
+%type <ident> path_seg
+%type <path> qpath
+%type <idents> qpath_segments
+
+%type <use_tree> use_tree
+%type <use_trees> use_trees_opt use_trees
+%type <str> use_alias_opt
+
+%type <type> type ret_opt
+%type <types> types_opt types
+
+%type <param> param
+%type <params> params_opt params
+%type <fn_decl> fn_decl
+
+%type <field_decl> field_decl
+%type <field_decls> fields_opt fields
+
+%type <variant_decl> variant_decl
+%type <variant_decls> variants_opt variants
+
+%type <block> block
+%type <block> block_elems_opt block_elems
+%type <stmts> stmts
+%type <stmt> stmt let_stmt
+
+%type <expr> expr expr_nostruct expr_or_block guard_opt else_opt init_opt
+%type <expr> assign_expr logical_or_expr logical_and_expr equality_expr relational_expr additive_expr multiplicative_expr
+%type <expr> cast_expr unary_expr postfix_expr primary_expr
+%type <type> type_ann_opt
+%type <exprs> args_opt args
+%type <field_inits> field_inits_opt field_inits
+%type <field_init> field_init
+
+%type <arms> match_arms_opt match_arms
+%type <arm> match_arm
+
+%type <pat> pattern pattern_primary
+%type <pats> pat_list_opt pat_list
+%type <pat_fields> pat_fields_opt pat_fields
+%type <pat_field> pat_field
+
+%type <item_fns> impl_items_opt impl_items
+%type <item_fn> impl_item
+%type <fn_decls> trait_items_opt trait_items
 
 %start program
-%error-verbose
 
 %right '='
 %left TOK_OROR
@@ -72,194 +169,172 @@ static void parse_error(const char* msg) {
 %left '+' '-'
 %left '*' '/' '%'
 %left KW_AS
-%right UMINUS
+%right UNARY
 
-%destructor { free($$); } IDENT STRING
-%destructor { delete $$; } items attrs_opt fields_opt fields variants_opt variants params_opt params args_opt args field_inits_opt field_inits impl_items_opt impl_items trait_items_opt trait_items match_arms_opt match_arms block_elems_opt block_elems stmts types_opt types pat_list_opt pat_list
+%destructor { free($$); } IDENT STRING use_alias_opt
+%destructor { delete $$; } items attrs_opt path_segments qpath_segments use_trees_opt use_trees fields_opt fields variants_opt variants params_opt params trait_items_opt trait_items impl_items_opt impl_items stmts args_opt args field_inits_opt field_inits match_arms_opt match_arms pat_list_opt pat_list pat_fields_opt pat_fields
 
 %%
 
 program
   : items {
-      cog::g_parse_state->root = node_from_vec(cog::NodeKind::Program, $1);
-      $$ = cog::g_parse_state->root;
+      std::vector<cog::Item*> its = take_vec($1);
+      $$ = MK(cog::FileAst, @$, its);
+      cog::g_parse_state->root = $$;
     }
   ;
 
 items
-  : /* empty */ { $$ = vec_new(); }
+  : /* empty */ { $$ = vec_new<cog::Item>(); }
   | items item { $$ = vec_push($1, $2); }
   ;
 
 item
   : attrs_opt vis_opt item_core {
-      cog::Node* attrs = node_from_vec(cog::NodeKind::List, $1);
-      $$ = cog::mk(cog::NodeKind::Item, std::vector<cog::Node*>{attrs, $2, $3});
+      $3->attrs = take_vec($1);
+      $3->vis = $2;
+      $3->span = SPAN(@$);
+      $$ = $3;
     }
   ;
 
 vis_opt
-  : /* empty */ { $$ = cog::mk(cog::NodeKind::Vis, "private"); }
-  | KW_PUB { $$ = cog::mk(cog::NodeKind::Vis, "pub"); }
+  : /* empty */ { $$ = cog::Visibility::Private; }
+  | KW_PUB { $$ = cog::Visibility::Pub; }
   ;
 
 attrs_opt
-  : /* empty */ { $$ = vec_new(); }
+  : /* empty */ { $$ = vec_new<cog::Attr>(); }
   | attrs_opt attr { $$ = vec_push($1, $2); }
   ;
 
 attr
-  : '#' '[' path ']' { $$ = cog::mk(cog::NodeKind::Attr, std::vector<cog::Node*>{$3}); }
-  | '#' '[' path '(' path ')' ']' { $$ = cog::mk(cog::NodeKind::Attr, std::vector<cog::Node*>{$3, $5}); }
+  : '#' '[' path ']' { $$ = MK(cog::Attr, @$, $3, nullptr); }
+  | '#' '[' path '(' path ')' ']' { $$ = MK(cog::Attr, @$, $3, $5); }
   ;
 
 item_core
-  : KW_USE path ';' { $$ = cog::mk(cog::NodeKind::ItemUse, std::vector<cog::Node*>{$2}); }
+  : KW_USE use_tree ';' {
+      $$ = MK(cog::ItemUse, @$, std::vector<cog::Attr*>{}, cog::Visibility::Private, $2);
+    }
   | KW_MOD IDENT '{' items '}' {
-      cog::Node* body = node_from_vec(cog::NodeKind::List, $4);
-      $$ = cog::mk(cog::NodeKind::ItemMod, cog::take_str($2), std::vector<cog::Node*>{body});
+      std::vector<cog::Item*> body = take_vec($4);
+      $$ = MK(
+          cog::ItemModInline, @$, std::vector<cog::Attr*>{}, cog::Visibility::Private, cog::take_str($2), std::move(body));
+    }
+  | KW_MOD IDENT ';' {
+      $$ = MK(cog::ItemModDecl, @$, std::vector<cog::Attr*>{}, cog::Visibility::Private, cog::take_str($2));
     }
   | KW_STRUCT IDENT '{' fields_opt '}' {
-      cog::Node* fs = node_from_vec(cog::NodeKind::List, $4);
-      $$ = cog::mk(cog::NodeKind::ItemStruct, cog::take_str($2), std::vector<cog::Node*>{fs});
+      std::vector<cog::FieldDecl*> fs = take_vec($4);
+      $$ = MK(
+          cog::ItemStruct, @$, std::vector<cog::Attr*>{}, cog::Visibility::Private, cog::take_str($2), std::move(fs));
     }
   | KW_ENUM IDENT '{' variants_opt '}' {
-      cog::Node* vs = node_from_vec(cog::NodeKind::List, $4);
-      $$ = cog::mk(cog::NodeKind::ItemEnum, cog::take_str($2), std::vector<cog::Node*>{vs});
+      std::vector<cog::VariantDecl*> vs = take_vec($4);
+      $$ = MK(
+          cog::ItemEnum, @$, std::vector<cog::Attr*>{}, cog::Visibility::Private, cog::take_str($2), std::move(vs));
     }
   | KW_TRAIT IDENT '{' trait_items_opt '}' {
-      cog::Node* ms = node_from_vec(cog::NodeKind::List, $4);
-      $$ = cog::mk(cog::NodeKind::ItemTrait, cog::take_str($2), std::vector<cog::Node*>{ms});
+      std::vector<cog::FnDecl*> ms = take_vec($4);
+      $$ = MK(
+          cog::ItemTrait, @$, std::vector<cog::Attr*>{}, cog::Visibility::Private, cog::take_str($2), std::move(ms));
     }
   | KW_IMPL path '{' impl_items_opt '}' {
-      cog::Node* ms = node_from_vec(cog::NodeKind::List, $4);
-      $$ = cog::mk(cog::NodeKind::ItemImpl, std::vector<cog::Node*>{$2, ms});
+      std::vector<cog::ItemFn*> ms = take_vec($4);
+      $$ = MK(cog::ItemImplInherent, @$, std::vector<cog::Attr*>{}, cog::Visibility::Private, $2, std::move(ms));
     }
   | KW_IMPL path KW_FOR path '{' impl_items_opt '}' {
-      cog::Node* ms = node_from_vec(cog::NodeKind::List, $6);
-      $$ = cog::mk(cog::NodeKind::ItemImpl, std::vector<cog::Node*>{$2, $4, ms});
+      std::vector<cog::ItemFn*> ms = take_vec($6);
+      $$ = MK(
+          cog::ItemImplTrait, @$, std::vector<cog::Attr*>{}, cog::Visibility::Private, $2, $4, std::move(ms));
     }
   | KW_FN IDENT '(' params_opt ')' ret_opt block {
-      cog::Node* ps = node_from_vec(cog::NodeKind::List, $4);
-      std::vector<cog::Node*> children;
-      children.push_back(ps);
-      if ($6) children.push_back($6);
-      children.push_back($7);
-      $$ = cog::mk(cog::NodeKind::ItemFn, cog::take_str($2), std::move(children));
+      std::vector<cog::Param*> ps = take_vec($4);
+      cog::FnSig* sig = MK(cog::FnSig, @$, std::move(ps), $6);
+      cog::FnDecl* decl = MK(cog::FnDecl, @$, cog::take_str($2), sig);
+      $$ = MK(cog::ItemFn, @$, std::vector<cog::Attr*>{}, cog::Visibility::Private, decl, $7);
     }
   | KW_CONST IDENT ':' type '=' expr ';' {
-      $$ = cog::mk(cog::NodeKind::ItemConst, cog::take_str($2), std::vector<cog::Node*>{$4, $6});
+      $$ = MK(
+          cog::ItemConst, @$, std::vector<cog::Attr*>{}, cog::Visibility::Private, cog::take_str($2), $4, $6);
+    }
+  | KW_STATIC IDENT ':' type '=' expr ';' {
+      $$ = MK(
+          cog::ItemStatic, @$, std::vector<cog::Attr*>{}, cog::Visibility::Private, cog::take_str($2), $4, $6);
+    }
+  | KW_TYPE IDENT '=' type ';' {
+      $$ = MK(
+          cog::ItemTypeAlias, @$, std::vector<cog::Attr*>{}, cog::Visibility::Private, cog::take_str($2), $4);
     }
   ;
 
-ret_opt
+use_tree
+  : path use_alias_opt {
+      std::string alias = $2 ? cog::take_str($2) : std::string{};
+      $$ = MK(cog::UseTree, @$, $1, std::move(alias), std::vector<cog::UseTree*>{});
+    }
+  | path TOK_COLONCOLON_LBRACE use_trees_opt '}' {
+      std::vector<cog::UseTree*> group = take_vec($3);
+      $$ = MK(cog::UseTree, @$, $1, std::string{}, std::move(group));
+    }
+  ;
+
+use_alias_opt
   : /* empty */ { $$ = nullptr; }
-  | TOK_ARROW type { $$ = $2; }
+  | KW_AS IDENT { $$ = $2; }
+  ;
+
+use_trees_opt
+  : /* empty */ { $$ = vec_new<cog::UseTree>(); }
+  | use_trees { $$ = $1; }
+  ;
+
+use_trees
+  : use_trees ',' use_tree { $$ = vec_push($1, $3); }
+  | use_trees ',' { $$ = $1; }
+  | use_tree { $$ = vec1($1); }
   ;
 
 trait_items_opt
-  : /* empty */ { $$ = vec_new(); }
+  : /* empty */ { $$ = vec_new<cog::FnDecl>(); }
   | trait_items { $$ = $1; }
   ;
 
 trait_items
-  : trait_items fn_sig ';' { $$ = vec_push($1, $2); }
-  | fn_sig ';' { $$ = vec1($1); }
+  : trait_items fn_decl ';' { $$ = vec_push($1, $2); }
+  | fn_decl ';' { $$ = vec1($1); }
   ;
 
 impl_items_opt
-  : /* empty */ { $$ = vec_new(); }
+  : /* empty */ { $$ = vec_new<cog::ItemFn>(); }
   | impl_items { $$ = $1; }
   ;
 
 impl_items
-  : impl_items vis_opt KW_FN IDENT '(' params_opt ')' ret_opt block {
-      cog::Node* ps = node_from_vec(cog::NodeKind::List, $6);
-      std::vector<cog::Node*> children;
-      children.push_back($2);
-      children.push_back(ps);
-      if ($8) children.push_back($8);
-      children.push_back($9);
-      $$ = vec_push($1, cog::mk(cog::NodeKind::ItemFn, cog::take_str($4), std::move(children)));
-    }
-  | vis_opt KW_FN IDENT '(' params_opt ')' ret_opt block {
-      cog::Node* ps = node_from_vec(cog::NodeKind::List, $5);
-      std::vector<cog::Node*> children;
-      children.push_back($1);
-      children.push_back(ps);
-      if ($7) children.push_back($7);
-      children.push_back($8);
-      $$ = vec1(cog::mk(cog::NodeKind::ItemFn, cog::take_str($3), std::move(children)));
+  : impl_items impl_item { $$ = vec_push($1, $2); }
+  | impl_item { $$ = vec1($1); }
+  ;
+
+impl_item
+  : attrs_opt vis_opt KW_FN IDENT '(' params_opt ')' ret_opt block {
+      std::vector<cog::Attr*> attrs = take_vec($1);
+      std::vector<cog::Param*> ps = take_vec($6);
+      cog::FnSig* sig = MK(cog::FnSig, @$, std::move(ps), $8);
+      cog::FnDecl* decl = MK(cog::FnDecl, @$, cog::take_str($4), sig);
+      $$ = MK(cog::ItemFn, @$, std::move(attrs), $2, decl, $9);
     }
   ;
 
-fn_sig
+fn_decl
   : KW_FN IDENT '(' params_opt ')' ret_opt {
-      cog::Node* ps = node_from_vec(cog::NodeKind::List, $4);
-      std::vector<cog::Node*> children;
-      children.push_back(ps);
-      if ($6) children.push_back($6);
-      $$ = cog::mk(cog::NodeKind::ItemFn, cog::take_str($2), std::move(children));
-    }
-  ;
-
-fields_opt
-  : /* empty */ { $$ = vec_new(); }
-  | fields { $$ = $1; }
-  ;
-
-fields
-  : fields field { $$ = vec_push($1, $2); }
-  | field { $$ = vec1($1); }
-  ;
-
-field
-  : attrs_opt vis_opt IDENT ':' type ',' {
-      cog::Node* attrs = node_from_vec(cog::NodeKind::List, $1);
-      $$ = cog::mk(cog::NodeKind::Field, cog::take_str($3), std::vector<cog::Node*>{attrs, $2, $5});
-    }
-  | attrs_opt vis_opt IDENT ':' type {
-      cog::Node* attrs = node_from_vec(cog::NodeKind::List, $1);
-      $$ = cog::mk(cog::NodeKind::Field, cog::take_str($3), std::vector<cog::Node*>{attrs, $2, $5});
-    }
-  ;
-
-variants_opt
-  : /* empty */ { $$ = vec_new(); }
-  | variants { $$ = $1; }
-  ;
-
-variants
-  : variants variant { $$ = vec_push($1, $2); }
-  | variant { $$ = vec1($1); }
-  ;
-
-types_opt
-  : /* empty */ { $$ = vec_new(); }
-  | types { $$ = $1; }
-  ;
-
-types
-  : types ',' type { $$ = vec_push($1, $3); }
-  | types ',' { $$ = $1; }
-  | type { $$ = vec1($1); }
-  ;
-
-variant
-  : IDENT ',' { $$ = cog::mk(cog::NodeKind::Variant, cog::take_str($1)); }
-  | IDENT { $$ = cog::mk(cog::NodeKind::Variant, cog::take_str($1)); }
-  | IDENT '(' types_opt ')' ',' {
-      cog::Node* ts = node_from_vec(cog::NodeKind::List, $3);
-      $$ = cog::mk(cog::NodeKind::Variant, cog::take_str($1), std::vector<cog::Node*>{ts});
-    }
-  | IDENT '(' types_opt ')' {
-      cog::Node* ts = node_from_vec(cog::NodeKind::List, $3);
-      $$ = cog::mk(cog::NodeKind::Variant, cog::take_str($1), std::vector<cog::Node*>{ts});
+      std::vector<cog::Param*> ps = take_vec($4);
+      $$ = MK(cog::FnDecl, @$, cog::take_str($2), MK(cog::FnSig, @$, std::move(ps), $6));
     }
   ;
 
 params_opt
-  : /* empty */ { $$ = vec_new(); }
+  : /* empty */ { $$ = vec_new<cog::Param>(); }
   | params { $$ = $1; }
   ;
 
@@ -270,55 +345,124 @@ params
   ;
 
 param
-  : IDENT ':' type { $$ = cog::mk(cog::NodeKind::Param, cog::take_str($1), std::vector<cog::Node*>{$3}); }
-  | KW_COMPTIME IDENT ':' type {
-      $$ = cog::mk(
-          cog::NodeKind::Param,
-          cog::take_str($2),
-          std::vector<cog::Node*>{cog::mk(cog::NodeKind::ExprComptime, "comptime"), $4});
-    }
+  : IDENT ':' type { $$ = MK(cog::Param, @$, false, cog::take_str($1), $3); }
+  | KW_COMPTIME IDENT ':' type { $$ = MK(cog::Param, @$, true, cog::take_str($2), $4); }
   ;
 
 path
-  : path_seg { $$ = cog::mk(cog::NodeKind::Path, std::vector<cog::Node*>{$1}); }
-  | path TOK_COLONCOLON path_seg {
-      $1->children.push_back($3);
-      $$ = $1;
-    }
+  : path_segments { $$ = MK(cog::Path, @$, take_vec($1)); }
+  ;
+
+path_segments
+  : path_seg { $$ = vec1($1); }
+  | path_segments TOK_COLONCOLON path_seg { $$ = vec_push($1, $3); }
   ;
 
 path_seg
-  : IDENT { $$ = cog::mk(cog::NodeKind::Ident, cog::take_str($1)); }
-  | KW_SELF_TYPE { $$ = cog::mk(cog::NodeKind::Ident, "Self"); }
+  : IDENT { $$ = MK(cog::Ident, @$, cog::take_str($1)); }
+  | KW_SELF_TYPE { $$ = MK(cog::Ident, @$, std::string("Self")); }
+  ;
+
+qpath
+  : qpath_segments { $$ = MK(cog::Path, @$, take_vec($1)); }
+  ;
+
+qpath_segments
+  : path_seg TOK_COLONCOLON path_seg {
+      auto* v = vec1($1);
+      $$ = vec_push(v, $3);
+    }
+  | qpath_segments TOK_COLONCOLON path_seg { $$ = vec_push($1, $3); }
   ;
 
 type
-  : path { $$ = cog::mk(cog::NodeKind::TypePath, std::vector<cog::Node*>{$1}); }
-  | KW_CONST '*' type { $$ = cog::mk(cog::NodeKind::TypePtr, "const", std::vector<cog::Node*>{$3}); }
-  | KW_MUT '*' type { $$ = cog::mk(cog::NodeKind::TypePtr, "mut", std::vector<cog::Node*>{$3}); }
-  | KW_DYN path { $$ = cog::mk(cog::NodeKind::TypeDyn, std::vector<cog::Node*>{$2}); }
-  | '[' type ']' { $$ = cog::mk(cog::NodeKind::TypeSlice, std::vector<cog::Node*>{$2}); }
-  | '[' type ';' expr ']' { $$ = cog::mk(cog::NodeKind::TypeArray, std::vector<cog::Node*>{$2, $4}); }
-  | '(' ')' { $$ = cog::mk(cog::NodeKind::TypeUnit); }
+  : path { $$ = MK(cog::TypePath, @$, $1); }
+  | KW_TYPE { $$ = MK(cog::TypeType, @$); }
+  | KW_CONST '*' type { $$ = MK(cog::TypePtr, @$, cog::Mutability::Const, $3); }
+  | KW_MUT '*' type { $$ = MK(cog::TypePtr, @$, cog::Mutability::Mut, $3); }
+  | KW_DYN path { $$ = MK(cog::TypeDyn, @$, $2); }
+  | '[' type ']' { $$ = MK(cog::TypeSlice, @$, $2); }
+  | '[' type ';' expr ']' { $$ = MK(cog::TypeArray, @$, $2, $4); }
+  | '(' ')' { $$ = MK(cog::TypeUnit, @$); }
+  | '(' type ')' { $$ = $2; }
+  | '(' type ',' types_opt ')' {
+      std::vector<cog::Type*> elems;
+      elems.push_back($2);
+      for (cog::Type* t : take_vec($4)) elems.push_back(t);
+      $$ = MK(cog::TypeTuple, @$, std::move(elems));
+    }
+  ;
+
+types_opt
+  : /* empty */ { $$ = vec_new<cog::Type>(); }
+  | types { $$ = $1; }
+  ;
+
+types
+  : types ',' type { $$ = vec_push($1, $3); }
+  | types ',' { $$ = $1; }
+  | type { $$ = vec1($1); }
+  ;
+
+ret_opt
+  : /* empty */ { $$ = nullptr; }
+  | TOK_ARROW type { $$ = $2; }
+  ;
+
+fields_opt
+  : /* empty */ { $$ = vec_new<cog::FieldDecl>(); }
+  | fields { $$ = $1; }
+  ;
+
+fields
+  : fields field_decl { $$ = vec_push($1, $2); }
+  | field_decl { $$ = vec1($1); }
+  ;
+
+field_decl
+  : attrs_opt vis_opt IDENT ':' type ',' {
+      $$ = MK(cog::FieldDecl, @$, take_vec($1), $2, cog::take_str($3), $5);
+    }
+  | attrs_opt vis_opt IDENT ':' type {
+      $$ = MK(cog::FieldDecl, @$, take_vec($1), $2, cog::take_str($3), $5);
+    }
+  ;
+
+variants_opt
+  : /* empty */ { $$ = vec_new<cog::VariantDecl>(); }
+  | variants { $$ = $1; }
+  ;
+
+variants
+  : variants variant_decl { $$ = vec_push($1, $2); }
+  | variant_decl { $$ = vec1($1); }
+  ;
+
+variant_decl
+  : IDENT ',' { $$ = MK(cog::VariantDecl, @$, cog::take_str($1), std::vector<cog::Type*>{}); }
+  | IDENT { $$ = MK(cog::VariantDecl, @$, cog::take_str($1), std::vector<cog::Type*>{}); }
+  | IDENT '(' types_opt ')' ',' {
+      $$ = MK(cog::VariantDecl, @$, cog::take_str($1), take_vec($3));
+    }
+  | IDENT '(' types_opt ')' {
+      $$ = MK(cog::VariantDecl, @$, cog::take_str($1), take_vec($3));
+    }
   ;
 
 block
   : '{' block_elems_opt '}' {
-      std::vector<cog::Node*> children = std::move(*$2);
-      delete $2;
-      $$ = cog::mk(cog::NodeKind::Block, std::move(children));
+      if ($2) {
+        $2->span = SPAN(@$);
+        $$ = $2;
+      } else {
+        $$ = MK(cog::Block, @$, std::vector<cog::Stmt*>{}, nullptr);
+      }
     }
   ;
 
 block_elems_opt
-  : /* empty */ { $$ = vec_new(); }
+  : /* empty */ { $$ = nullptr; }
   | block_elems { $$ = $1; }
-  ;
-
-block_elems
-  : stmts expr { $$ = vec_push($1, $2); }
-  | stmts { $$ = $1; }
-  | expr { $$ = vec1($1); }
   ;
 
 stmts
@@ -326,73 +470,149 @@ stmts
   | stmt { $$ = vec1($1); }
   ;
 
+block_elems
+  : stmts expr { $$ = MK(cog::Block, @$, take_vec($1), $2); }
+  | stmts { $$ = MK(cog::Block, @$, take_vec($1), nullptr); }
+  | expr { $$ = MK(cog::Block, @$, std::vector<cog::Stmt*>{}, $1); }
+  ;
+
 stmt
   : let_stmt ';' { $$ = $1; }
-  | expr ';' { $$ = cog::mk(cog::NodeKind::StmtExpr, std::vector<cog::Node*>{$1}); }
-  | KW_RETURN ';' { $$ = cog::mk(cog::NodeKind::StmtReturn); }
-  | KW_RETURN expr ';' { $$ = cog::mk(cog::NodeKind::StmtReturn, std::vector<cog::Node*>{$2}); }
+  | expr ';' { $$ = MK(cog::StmtExpr, @$, $1); }
+  | KW_RETURN ';' { $$ = MK(cog::StmtReturn, @$, nullptr); }
+  | KW_RETURN expr ';' { $$ = MK(cog::StmtReturn, @$, $2); }
+  | KW_BREAK ';' { $$ = MK(cog::StmtBreak, @$, nullptr); }
+  | KW_BREAK expr ';' { $$ = MK(cog::StmtBreak, @$, $2); }
+  | KW_CONTINUE ';' { $$ = MK(cog::StmtContinue, @$); }
   ;
 
 let_stmt
-  : KW_LET IDENT ':' type '=' expr {
-      $$ = cog::mk(cog::NodeKind::StmtLet, cog::take_str($2), std::vector<cog::Node*>{$4, $6});
+  : KW_LET pattern type_ann_opt init_opt {
+      $$ = MK(cog::StmtLet, @$, $2, $3, $4);
     }
-  | KW_LET KW_MUT IDENT ':' type '=' expr {
-      $$ = cog::mk(
-          cog::NodeKind::StmtLet,
-          cog::take_str($3),
-          std::vector<cog::Node*>{cog::mk(cog::NodeKind::Ident, "mut"), $5, $7});
-    }
+  ;
+
+type_ann_opt
+  : /* empty */ { $$ = nullptr; }
+  | ':' type { $$ = $2; }
+  ;
+
+init_opt
+  : /* empty */ { $$ = nullptr; }
+  | '=' expr { $$ = $2; }
   ;
 
 expr_or_block
   : expr { $$ = $1; }
   ;
 
+else_opt
+  : /* empty */ { $$ = nullptr; }
+  | KW_ELSE expr_or_block { $$ = $2; }
+  ;
+
+guard_opt
+  : /* empty */ { $$ = nullptr; }
+  | KW_IF expr { $$ = $2; }
+  ;
+
 expr
   : expr_nostruct { $$ = $1; }
   | path '{' field_inits_opt '}' {
-      cog::Node* inits = node_from_vec(cog::NodeKind::List, $3);
-      $$ = cog::mk(cog::NodeKind::ExprStructLit, std::vector<cog::Node*>{$1, inits});
+      $$ = MK(cog::ExprStructLit, @$, $1, take_vec($3));
     }
   ;
 
 expr_nostruct
-  : INT { $$ = cog::mk(cog::NodeKind::ExprInt, std::to_string($1)); }
-  | STRING { $$ = cog::mk(cog::NodeKind::ExprString, cog::take_str($1)); }
-  | '(' ')' { $$ = cog::mk(cog::NodeKind::ExprUnit); }
-  | path { $$ = cog::mk(cog::NodeKind::ExprPath, std::vector<cog::Node*>{$1}); }
-  | block { $$ = cog::mk(cog::NodeKind::ExprBlock, std::vector<cog::Node*>{$1}); }
-  | KW_COMPTIME block { $$ = cog::mk(cog::NodeKind::ExprComptime, std::vector<cog::Node*>{$2}); }
-  | KW_MATCH expr_nostruct '{' match_arms_opt '}' {
-      cog::Node* arms = node_from_vec(cog::NodeKind::List, $4);
-      $$ = cog::mk(cog::NodeKind::ExprMatch, std::vector<cog::Node*>{$2, arms});
-    }
-  | expr_nostruct '=' expr { $$ = cog::mk(cog::NodeKind::ExprAssign, std::vector<cog::Node*>{$1, $3}); }
-  | expr_nostruct '+' expr { $$ = cog::mk(cog::NodeKind::ExprBinary, "+", std::vector<cog::Node*>{$1, $3}); }
-  | expr_nostruct '-' expr { $$ = cog::mk(cog::NodeKind::ExprBinary, "-", std::vector<cog::Node*>{$1, $3}); }
-  | expr_nostruct '*' expr { $$ = cog::mk(cog::NodeKind::ExprBinary, "*", std::vector<cog::Node*>{$1, $3}); }
-  | expr_nostruct '/' expr { $$ = cog::mk(cog::NodeKind::ExprBinary, "/", std::vector<cog::Node*>{$1, $3}); }
-  | expr_nostruct KW_AS type { $$ = cog::mk(cog::NodeKind::ExprCast, std::vector<cog::Node*>{$1, $3}); }
-  | '-' expr %prec UMINUS { $$ = cog::mk(cog::NodeKind::ExprUnary, "-", std::vector<cog::Node*>{$2}); }
-  | '*' expr %prec UMINUS { $$ = cog::mk(cog::NodeKind::ExprUnary, "*", std::vector<cog::Node*>{$2}); }
-  | expr_nostruct '(' args_opt ')' {
-      cog::Node* as = node_from_vec(cog::NodeKind::List, $3);
-      $$ = cog::mk(cog::NodeKind::ExprCall, std::vector<cog::Node*>{$1, as});
-    }
-  | expr_nostruct '.' IDENT {
-      $$ = cog::mk(cog::NodeKind::ExprField, cog::take_str($3), std::vector<cog::Node*>{$1});
-    }
-  | expr_nostruct '.' IDENT '(' args_opt ')' {
-      cog::Node* as = node_from_vec(cog::NodeKind::List, $5);
-      $$ = cog::mk(cog::NodeKind::ExprMethodCall, cog::take_str($3), std::vector<cog::Node*>{$1, as});
-    }
-  | expr_nostruct '[' expr ']' { $$ = cog::mk(cog::NodeKind::ExprIndex, std::vector<cog::Node*>{$1, $3}); }
+  : assign_expr { $$ = $1; }
+  ;
+
+assign_expr
+  : logical_or_expr { $$ = $1; }
+  | postfix_expr '=' assign_expr { $$ = MK(cog::ExprAssign, @$, $1, $3); }
+  ;
+
+logical_or_expr
+  : logical_or_expr TOK_OROR logical_and_expr { $$ = MK(cog::ExprBinary, @$, cog::BinaryOp::Or, $1, $3); }
+  | logical_and_expr { $$ = $1; }
+  ;
+
+logical_and_expr
+  : logical_and_expr TOK_ANDAND equality_expr { $$ = MK(cog::ExprBinary, @$, cog::BinaryOp::And, $1, $3); }
+  | equality_expr { $$ = $1; }
+  ;
+
+equality_expr
+  : equality_expr TOK_EQEQ relational_expr { $$ = MK(cog::ExprBinary, @$, cog::BinaryOp::Eq, $1, $3); }
+  | equality_expr TOK_NEQ relational_expr { $$ = MK(cog::ExprBinary, @$, cog::BinaryOp::Ne, $1, $3); }
+  | relational_expr { $$ = $1; }
+  ;
+
+relational_expr
+  : relational_expr '<' additive_expr { $$ = MK(cog::ExprBinary, @$, cog::BinaryOp::Lt, $1, $3); }
+  | relational_expr '>' additive_expr { $$ = MK(cog::ExprBinary, @$, cog::BinaryOp::Gt, $1, $3); }
+  | relational_expr TOK_LE additive_expr { $$ = MK(cog::ExprBinary, @$, cog::BinaryOp::Le, $1, $3); }
+  | relational_expr TOK_GE additive_expr { $$ = MK(cog::ExprBinary, @$, cog::BinaryOp::Ge, $1, $3); }
+  | additive_expr { $$ = $1; }
+  ;
+
+additive_expr
+  : additive_expr '+' multiplicative_expr { $$ = MK(cog::ExprBinary, @$, cog::BinaryOp::Add, $1, $3); }
+  | additive_expr '-' multiplicative_expr { $$ = MK(cog::ExprBinary, @$, cog::BinaryOp::Sub, $1, $3); }
+  | multiplicative_expr { $$ = $1; }
+  ;
+
+multiplicative_expr
+  : multiplicative_expr '*' cast_expr { $$ = MK(cog::ExprBinary, @$, cog::BinaryOp::Mul, $1, $3); }
+  | multiplicative_expr '/' cast_expr { $$ = MK(cog::ExprBinary, @$, cog::BinaryOp::Div, $1, $3); }
+  | multiplicative_expr '%' cast_expr { $$ = MK(cog::ExprBinary, @$, cog::BinaryOp::Mod, $1, $3); }
+  | cast_expr { $$ = $1; }
+  ;
+
+cast_expr
+  : cast_expr KW_AS type { $$ = MK(cog::ExprCast, @$, $1, $3); }
+  | unary_expr { $$ = $1; }
+  ;
+
+unary_expr
+  : '-' unary_expr { $$ = MK(cog::ExprUnary, @$, cog::UnaryOp::Neg, $2); }
+  | '*' unary_expr { $$ = MK(cog::ExprUnary, @$, cog::UnaryOp::Deref, $2); }
+  | '!' unary_expr { $$ = MK(cog::ExprUnary, @$, cog::UnaryOp::Not, $2); }
+  | postfix_expr { $$ = $1; }
+  ;
+
+postfix_expr
+  : primary_expr { $$ = $1; }
+  | postfix_expr '(' args_opt ')' { $$ = MK(cog::ExprCall, @$, $1, take_vec($3)); }
+  | postfix_expr '.' IDENT { $$ = MK(cog::ExprField, @$, $1, cog::take_str($3)); }
+  | postfix_expr '.' IDENT '(' args_opt ')' { $$ = MK(cog::ExprMethodCall, @$, $1, cog::take_str($3), take_vec($5)); }
+  | postfix_expr '[' expr ']' { $$ = MK(cog::ExprIndex, @$, $1, $3); }
+  ;
+
+primary_expr
+  : INT { $$ = MK(cog::ExprInt, @$, static_cast<std::int64_t>($1)); }
+  | STRING { $$ = MK(cog::ExprString, @$, cog::take_str($1)); }
+  | KW_TRUE { $$ = MK(cog::ExprBool, @$, true); }
+  | KW_FALSE { $$ = MK(cog::ExprBool, @$, false); }
+  | '(' ')' { $$ = MK(cog::ExprUnit, @$); }
   | '(' expr ')' { $$ = $2; }
+  | '(' expr ',' args_opt ')' {
+      std::vector<cog::Expr*> elems;
+      elems.push_back($2);
+      for (cog::Expr* e : take_vec($4)) elems.push_back(e);
+      $$ = MK(cog::ExprTuple, @$, std::move(elems));
+    }
+  | path { $$ = MK(cog::ExprPath, @$, $1); }
+  | block { $$ = MK(cog::ExprBlock, @$, $1); }
+  | KW_COMPTIME block { $$ = MK(cog::ExprComptime, @$, $2); }
+  | KW_IF expr_nostruct block else_opt { $$ = MK(cog::ExprIf, @$, $2, $3, $4); }
+  | KW_WHILE expr_nostruct block { $$ = MK(cog::ExprWhile, @$, $2, $3); }
+  | KW_LOOP block { $$ = MK(cog::ExprLoop, @$, $2); }
+  | KW_MATCH expr_nostruct '{' match_arms_opt '}' { $$ = MK(cog::ExprMatch, @$, $2, take_vec($4)); }
   ;
 
 args_opt
-  : /* empty */ { $$ = vec_new(); }
+  : /* empty */ { $$ = vec_new<cog::Expr>(); }
   | args { $$ = $1; }
   ;
 
@@ -403,7 +623,7 @@ args
   ;
 
 field_inits_opt
-  : /* empty */ { $$ = vec_new(); }
+  : /* empty */ { $$ = vec_new<cog::FieldInit>(); }
   | field_inits { $$ = $1; }
   ;
 
@@ -414,11 +634,11 @@ field_inits
   ;
 
 field_init
-  : IDENT ':' expr { $$ = cog::mk(cog::NodeKind::Field, cog::take_str($1), std::vector<cog::Node*>{$3}); }
+  : IDENT ':' expr { $$ = MK(cog::FieldInit, @$, cog::take_str($1), $3); }
   ;
 
 match_arms_opt
-  : /* empty */ { $$ = vec_new(); }
+  : /* empty */ { $$ = vec_new<cog::MatchArm>(); }
   | match_arms { $$ = $1; }
   ;
 
@@ -428,23 +648,51 @@ match_arms
   ;
 
 match_arm
-  : pattern TOK_FATARROW expr_or_block ',' { $$ = cog::mk(cog::NodeKind::MatchArm, std::vector<cog::Node*>{$1, $3}); }
-  | pattern TOK_FATARROW expr_or_block { $$ = cog::mk(cog::NodeKind::MatchArm, std::vector<cog::Node*>{$1, $3}); }
+  : pattern guard_opt TOK_FATARROW expr_or_block ',' {
+      $$ = MK(cog::MatchArm, @$, $1, $2, $4);
+    }
+  | pattern guard_opt TOK_FATARROW expr_or_block {
+      $$ = MK(cog::MatchArm, @$, $1, $2, $4);
+    }
   ;
 
 pattern
-  : '_' { $$ = cog::mk(cog::NodeKind::PatWildcard); }
-  | INT { $$ = cog::mk(cog::NodeKind::PatInt, std::to_string($1)); }
-  | path { $$ = cog::mk(cog::NodeKind::PatPath, std::vector<cog::Node*>{$1}); }
-  | path '(' pat_list_opt ')' {
-      cog::Node* ps = node_from_vec(cog::NodeKind::List, $3);
-      $$ = cog::mk(cog::NodeKind::PatVariant, std::vector<cog::Node*>{$1, ps});
+  : pattern_primary { $$ = $1; }
+  | pattern '|' pattern_primary { $$ = MK(cog::PatOr, @$, $1, $3); }
+  ;
+
+pattern_primary
+  : '_' { $$ = MK(cog::PatWildcard, @$); }
+  | INT { $$ = MK(cog::PatInt, @$, static_cast<std::int64_t>($1)); }
+  | KW_TRUE { $$ = MK(cog::PatBool, @$, true); }
+  | KW_FALSE { $$ = MK(cog::PatBool, @$, false); }
+  | KW_MUT IDENT { $$ = MK(cog::PatBinding, @$, true, cog::take_str($2)); }
+  | IDENT { $$ = MK(cog::PatBinding, @$, false, cog::take_str($1)); }
+  | '(' ')' { $$ = MK(cog::PatTuple, @$, std::vector<cog::Pattern*>{}); }
+  | '(' pattern ')' { $$ = $2; }
+  | '(' pattern ',' pat_list_opt ')' {
+      std::vector<cog::Pattern*> elems;
+      elems.push_back($2);
+      for (cog::Pattern* p : take_vec($4)) elems.push_back(p);
+      $$ = MK(cog::PatTuple, @$, std::move(elems));
     }
-  | pattern '|' pattern { $$ = cog::mk(cog::NodeKind::PatOr, std::vector<cog::Node*>{$1, $3}); }
+  | qpath '(' pat_list_opt ')' {
+      $$ = MK(cog::PatVariant, @$, $1, take_vec($3));
+    }
+  | qpath '{' pat_fields_opt '}' {
+      $$ = MK(cog::PatStruct, @$, $1, take_vec($3));
+    }
+  | path '(' pat_list_opt ')' {
+      $$ = MK(cog::PatVariant, @$, $1, take_vec($3));
+    }
+  | path '{' pat_fields_opt '}' {
+      $$ = MK(cog::PatStruct, @$, $1, take_vec($3));
+    }
+  | qpath { $$ = MK(cog::PatPath, @$, $1); }
   ;
 
 pat_list_opt
-  : /* empty */ { $$ = vec_new(); }
+  : /* empty */ { $$ = vec_new<cog::Pattern>(); }
   | pat_list { $$ = $1; }
   ;
 
@@ -454,9 +702,26 @@ pat_list
   | pattern { $$ = vec1($1); }
   ;
 
+pat_fields_opt
+  : /* empty */ { $$ = vec_new<cog::PatField>(); }
+  | pat_fields { $$ = $1; }
+  ;
+
+pat_fields
+  : pat_fields ',' pat_field { $$ = vec_push($1, $3); }
+  | pat_fields ',' { $$ = $1; }
+  | pat_field { $$ = vec1($1); }
+  ;
+
+pat_field
+  : IDENT ':' pattern { $$ = MK(cog::PatField, @$, cog::take_str($1), $3); }
+  ;
+
 %%
 
 int yyerror(const char* msg) {
-  parse_error(msg);
+  extern YYLTYPE yylloc;
+  if (!cog::g_parse_state) return 0;
+  cog::push_error(SPAN(yylloc), msg);
   return 0;
 }

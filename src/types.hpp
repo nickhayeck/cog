@@ -1,0 +1,118 @@
+#pragma once
+
+#include "ast.hpp"
+#include "diag.hpp"
+#include "resolve.hpp"
+
+#include <cstdint>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <unordered_map>
+#include <vector>
+
+namespace cog {
+
+using TypeId = std::uint32_t;
+
+enum class IntKind : std::uint8_t {
+  I8,
+  I16,
+  I32,
+  I64,
+  I128,
+  Isize,
+  U8,
+  U16,
+  U32,
+  U64,
+  U128,
+  Usize,
+};
+
+enum class TypeKind : std::uint8_t {
+  Error,
+  Unit,
+  Bool,
+  Int,
+  TypeType,
+  Ptr,
+  Slice,
+  Array,
+  Tuple,
+  Struct,
+  Enum,
+  DynTrait,
+  Self,
+};
+
+struct TypeData {
+  TypeKind kind = TypeKind::Error;
+
+  // Int
+  IntKind int_kind{};
+
+  // Ptr
+  Mutability mutability{};
+  TypeId pointee = 0;
+
+  // Slice/Array
+  TypeId elem = 0;
+  const Expr* array_len_expr = nullptr;
+
+  // Tuple
+  std::vector<TypeId> tuple_elems{};
+
+  // Nominal
+  const ItemStruct* struct_def = nullptr;
+  const ItemEnum* enum_def = nullptr;
+  const ItemTrait* trait_def = nullptr;
+};
+
+class TypeStore {
+ public:
+  TypeStore() = default;
+
+  TypeId error();
+  TypeId unit();
+  TypeId bool_();
+  TypeId type_type();
+  TypeId self();
+
+  TypeId int_(IntKind k);
+  TypeId ptr(Mutability mut, TypeId pointee);
+  TypeId slice(TypeId elem);
+  TypeId array(TypeId elem, const Expr* len_expr);
+  TypeId tuple(std::vector<TypeId> elems);
+  TypeId struct_(const ItemStruct* def);
+  TypeId enum_(const ItemEnum* def);
+  TypeId dyn_trait(const ItemTrait* def);
+
+  const TypeData& get(TypeId id) const { return types_.at(static_cast<size_t>(id)); }
+
+  bool equal(TypeId a, TypeId b) const;
+  bool can_coerce(TypeId from, TypeId to) const;
+  bool is_sized(TypeId t) const;
+  bool is_copy(TypeId t) const;
+  std::string to_string(TypeId t) const;
+
+  std::optional<IntKind> parse_int_kind(std::string_view name) const;
+
+ private:
+  std::vector<TypeData> types_{};
+
+  std::optional<TypeId> cached_error_{};
+  std::optional<TypeId> cached_unit_{};
+  std::optional<TypeId> cached_bool_{};
+  std::optional<TypeId> cached_type_type_{};
+  std::optional<TypeId> cached_self_{};
+
+  std::unordered_map<IntKind, TypeId> cached_ints_{};
+  std::unordered_map<const ItemStruct*, TypeId> cached_structs_{};
+  std::unordered_map<const ItemEnum*, TypeId> cached_enums_{};
+  std::unordered_map<const ItemTrait*, TypeId> cached_dyn_traits_{};
+
+  TypeId make(TypeData d);
+};
+
+}  // namespace cog

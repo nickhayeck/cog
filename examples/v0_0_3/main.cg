@@ -1,0 +1,12 @@
+// v0.0.3: out-of-line modules + use trees.
+
+mod util;
+
+use util::{add as plus, sub};
+
+fn main() -> i32 {
+    let x: i32 = plus(40, 2);
+    let y: i32 = sub(x, 1);
+    y
+}
+

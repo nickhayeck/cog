@@ -32,9 +32,15 @@ ADD_FLEX_BISON_DEPENDENCY(CogLexer CogParser)
 add_executable(
   cogc
   src/ast.cpp
+  src/check.cpp
+  src/diag.cpp
   src/main.cpp
   src/parse.cpp
   src/parse_state.cpp
+  src/resolve.cpp
+  src/session.cpp
+  src/source.cpp
+  src/types.cpp
   ${BISON_CogParser_OUTPUTS}
   ${FLEX_CogLexer_OUTPUTS}
 )
@@ -50,3 +56,5 @@ endif()
 enable_testing()
 add_test(NAME parse_v0_0_1 COMMAND cogc ${CMAKE_CURRENT_SOURCE_DIR}/examples/v0_0_1.cg)
 add_test(NAME parse_v0_0_1_1 COMMAND cogc ${CMAKE_CURRENT_SOURCE_DIR}/examples/v0_0_1_1.cg)
+add_test(NAME parse_v0_0_3 COMMAND cogc ${CMAKE_CURRENT_SOURCE_DIR}/examples/v0_0_3/main.cg)
+add_test(NAME parse_v0_0_4 COMMAND cogc ${CMAKE_CURRENT_SOURCE_DIR}/examples/v0_0_4/main.cg)

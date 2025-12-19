@@ -1,6 +1,6 @@
 ---
 title: Cog Language Specification (Draft)
-version: 0.0.1-draft
+version: 0.0.4-draft
 edition: 2025
 status: living
 ---
@@ -34,8 +34,8 @@ This spec is intentionally split into:
 ## 2. Lexical structure
 
 ### 2.1 Tokens
-- Identifiers: `[_a-zA-Z][_a-zA-Z0-9]*` (Unicode identifier support is out of scope for v0.0.1)
-- Integer literals: decimal (v0.0.1); hex/binary/octal later
+- Identifiers: `[_a-zA-Z][_a-zA-Z0-9]*` (Unicode identifier support is out of scope for v0.0.x)
+- Integer literals: decimal-only (v0.0.x); hex/binary/octal later
 - String literals: `"..."`
 - Char literals: `'a'` (later)
 - Comments:
@@ -43,14 +43,16 @@ This spec is intentionally split into:
   - Block: `/* ... */`
 
 ### 2.2 Keywords (reserved)
-`fn struct enum trait impl type const static mod use pub as let if else while loop match return break continue comptime dyn Self mut const use_interop`
+`fn struct enum trait impl type const static mod use pub as let if else while loop match return break continue comptime dyn Self mut use_interop true false`
 
 ## 3. Modules, items, and visibility
 
 ### 3.1 Module system
 - A crate is a compilation unit.
+- Source files use the `.cg` extension.
 - `mod name { ... }` defines an inline module.
-- `mod name;` declares an out-of-line module (file-based resolution is compiler-defined for now).
+- `mod name;` declares an out-of-line module (file-based resolution):
+  - For a module declared in directory `D`, the compiler searches `D/name.cg` then `D/name/mod.cg`.
 - `use path;` imports an item into scope (details in name resolution).
 
 ### 3.2 Visibility
@@ -59,7 +61,7 @@ This spec is intentionally split into:
 
 ### 3.3 Attributes
 - `#[...]` attaches metadata to the following item.
-- For v0.0.1–v0.1, attributes are parsed and carried through the AST but semantics can be ignored unless explicitly implemented.
+- For v0.0.x, attributes are parsed and carried through the AST but semantics can be ignored unless explicitly implemented.
 
 ## 4. Types
 
@@ -103,7 +105,7 @@ Constraints (initial):
 - Methods may take `self` explicitly as `self: const* Self` or `self: mut* Self`.
 
 ### 4.5 Layout and `repr`
-Supported attributes (syntax-level in v0.0.1, semantics incrementally):
+Supported attributes (syntax-level in v0.0.x, semantics incrementally):
 - Default representation is `repr(C)` unless overridden by an explicit `#[repr(...)]`.
 - `#[repr(C)]`: C-compatible layout and field ordering
 - `#[repr(packed)]`: packed layout (alignment reduced)
@@ -202,7 +204,7 @@ Namespace and exact spelling are TBD; the prototype uses `builtin::...`:
 
 Cog’s long-term goal is “no-FFI” interop: C declarations are imported directly and used as if they were Cog declarations.
 
-v0.0.1 note: the prototype parser does not include `extern { ... }` blocks.
+Cog intentionally does **not** have `extern { ... }` blocks; the intent is to make header import the primary workflow.
 
 ### 10.1 ABI and layout
 - `#[repr(C)]` types are intended to match C struct layout rules for the target.
@@ -223,22 +225,25 @@ Exact checks are specified per operation (later).
 
 ## 12. Compiler roadmap
 
-### v0.0.1 (prototype parsing)
-- Flex/Bison lexer+parser for a Rust-like subset (no generics).
-- AST construction and pretty-printing for inspection.
+The prototype compiler roadmap lives in `roadmap.md`. Below is the current implementation status.
 
-### v0.1 (front-end)
-- Name resolution (`mod`/`use`, item namespaces).
-- Basic type checking for structs/enums, calls, `match`.
-- Method lookup in `impl` blocks.
-
-### v0.2 (traits + dyn)
-- Trait method resolution and `dyn` object typing.
-- Vtable lowering.
-
-### v0.3 (comptime)
-- Comptime interpreter for integers/control flow/struct+enum construction.
-- Comptime parameters specialization.
-
-### v0.4 (IR + LLVM)
-- Lowering to IR then LLVM, C ABI boundary, basic runtime prelude.
+### v0.0.4 prototype compiler status
+- Front-end only: parse → module/load + `use` resolution → type-check + local move-check; no IR/LLVM yet.
+- Parser:
+  - Flex/Bison lexer+parser (no generics) producing a typed AST with source spans.
+  - CLI flags: `cogc --dump-tokens <file.cg>`, `cogc --dump-ast <file.cg>`.
+- Modules + name resolution:
+  - Inline `mod name { ... }` and out-of-line `mod name;` with file mapping (`name.cg` or `name/mod.cg`).
+  - `use path;`, `use path as alias;`, and `use path::{a, b as c};`.
+  - Separate namespaces for modules/types/values; concrete diagnostics for missing items.
+  - Method indexing for inherent impls and trait impls.
+- Type + move checking (conservative, v0.0.4 scope):
+  - Nominal structs/enums, field access, struct literals, enum variants.
+  - Calls and method calls (inherent methods first, then in-scope traits with an impl).
+  - `match` typing with arm unification + guard type checking (`if guard` is `bool`).
+  - Pointer rules: implicit `mut* T` → `const* T`; `dyn Trait` and `[T]` must appear behind pointers.
+  - Local move checking rejects use-after-move; `Copy` modeled for primitives/pointers and compound aggregates of `Copy`.
+- Not yet implemented:
+  - Comptime evaluation (currently parsed + type-checked, but not executed).
+  - Dyn vtable lowering and codegen.
+  - Exhaustiveness checking for `match`.

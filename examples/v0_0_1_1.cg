@@ -1,4 +1,4 @@
-// v0.0.1.1 parser stress (still within v0.0.1 grammar).
+// v0.0.1.1 parser/typechecker stress (supported in v0.0.4).
 
 #[repr(packed)]
 pub struct PackedPair {
@@ -41,6 +41,7 @@ mod util {
 use util::Mode;
 use util::Buffer;
 use util::CounterSink;
+use util::Sink;
 
 const N: usize = comptime { 4 + 4 };
 
@@ -66,4 +67,3 @@ fn main() -> i32 {
         _ => 20,
     }
 }
-

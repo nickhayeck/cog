@@ -7,6 +7,12 @@ These are project-local instructions for working in this repo.
 - Prefer correctness and debuggability over cleverness.
 - Avoid “magic” build steps; everything should run via CMake.
 
+## Current compiler pipeline (v0.0.4)
+- `cogc <file.cg>` runs: parse → module loading + `use` resolution → type checking + local move checking.
+- Debug aids:
+  - `cogc --dump-tokens <file.cg>`
+  - `cogc --dump-ast <file.cg>` (after successful checking)
+
 ## Code style (C++)
 - Language: C++23.
 - Prefer simple `struct` data types, `std::unique_ptr`, and clear ownership.
@@ -18,16 +24,17 @@ These are project-local instructions for working in this repo.
 
 ## Layout
 - Source: `src/`
-- Tests: `test/` (only add if we create a test runner)
+- Tests: `ctest` currently runs `examples/*` as smoke tests; `test/` is reserved for a future harness.
 - Examples: `examples/`
 - Generated flex/bison outputs should go into the CMake build directory, not checked into git.
 
 ## Building
 - Configure: `cmake -S . -B build`
 - Build: `cmake --build build -j`
-- Run: `./build/cogc examples/v0_0_1.cg`
+- Run: `./build/cogc examples/v0_0_4/main.cg`
+- Test: `ctest --test-dir build --output-on-failure`
 
 ## Flex/Bison constraints
 - The macOS system `bison` may be old; keep the grammar compatible with GNU Bison 2.3.
-- Keep the lexer and parser “syntax-only” in early versions: parse into an AST and defer semantics.
-- Error messages should include at least line numbers (column support can come later).
+- Keep parsing and semantics split: parsing should build AST only; resolution/type checking should live in separate passes.
+- Error messages should include file + line + column where possible.
