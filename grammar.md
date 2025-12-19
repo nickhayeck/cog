@@ -1,12 +1,13 @@
-# Cog v0.0.4 grammar (draft)
+# Cog v0.0.6 grammar (draft)
 
-This is an **approximate** EBNF aligned with the v0.0.4 prototype parser (`src/parser.y` + `src/lexer.l`). It describes the subset that currently parses; it is not intended to be a complete Rust grammar.
+This is an **approximate** EBNF aligned with the v0.0.6 prototype parser (`src/parser.y` + `src/lexer.l`). It describes the subset that currently parses; it is not intended to be a complete Rust grammar.
 
 Notes:
 - No generics (types/items/traits).
 - Attributes are parsed as `#[path]` or `#[path(path)]` (argument is a path, not a full token tree yet).
 - To make `use a::{b,c};` parse reliably, the lexer emits a dedicated token for `::{` (`TOK_COLONCOLON_LBRACE` in the implementation).
 - Expression parsing is precedence-based: assignment, `||`, `&&`, equality, comparisons, `+/-`, `*//%`, `as`, unary, postfix.
+ - `builtin::...` names are ordinary paths syntactically; they are handled specially during type checking / comptime evaluation.
 
 ## Lexical notes
 - Identifiers: `[A-Za-z_][A-Za-z0-9_]*`

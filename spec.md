@@ -1,6 +1,6 @@
 ---
 title: Cog Language Specification (Draft)
-version: 0.0.4-draft
+version: 0.0.6-draft
 edition: 2025
 status: living
 ---
@@ -227,8 +227,8 @@ Exact checks are specified per operation (later).
 
 The prototype compiler roadmap lives in `roadmap.md`. Below is the current implementation status.
 
-### v0.0.4 prototype compiler status
-- Front-end only: parse → module/load + `use` resolution → type-check + local move-check; no IR/LLVM yet.
+### v0.0.6 prototype compiler status
+- Front-end only: parse → module/load + `use` resolution → type-check + local move-check + minimal comptime const-eval; no IR/LLVM yet.
 - Parser:
   - Flex/Bison lexer+parser (no generics) producing a typed AST with source spans.
   - CLI flags: `cogc --dump-tokens <file.cg>`, `cogc --dump-ast <file.cg>`.
@@ -237,13 +237,18 @@ The prototype compiler roadmap lives in `roadmap.md`. Below is the current imple
   - `use path;`, `use path as alias;`, and `use path::{a, b as c};`.
   - Separate namespaces for modules/types/values; concrete diagnostics for missing items.
   - Method indexing for inherent impls and trait impls.
-- Type + move checking (conservative, v0.0.4 scope):
+- Type + move checking (conservative, v0.0.6 scope):
   - Nominal structs/enums, field access, struct literals, enum variants.
   - Calls and method calls (inherent methods first, then in-scope traits with an impl).
+  - Dyn method calls on `* dyn Trait` using trait method sets (object-safety is enforced for dyn calls).
   - `match` typing with arm unification + guard type checking (`if guard` is `bool`).
   - Pointer rules: implicit `mut* T` → `const* T`; `dyn Trait` and `[T]` must appear behind pointers.
   - Local move checking rejects use-after-move; `Copy` modeled for primitives/pointers and compound aggregates of `Copy`.
+- Comptime (minimal in v0.0.6):
+  - The compiler evaluates `const` and `static` initializers at compile time using an interpreter.
+  - Array length expressions `[T; N]` are evaluated at compile time and must produce a non-negative `usize`.
+  - `builtin::compile_error("...")` triggers an error when executed at comptime.
 - Not yet implemented:
-  - Comptime evaluation (currently parsed + type-checked, but not executed).
+  - Comptime function calls, specialization, and reflection (`type` values are not first-class yet).
   - Dyn vtable lowering and codegen.
   - Exhaustiveness checking for `match`.

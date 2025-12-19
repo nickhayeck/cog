@@ -1,11 +1,13 @@
 #include "check.hpp"
 
+#include "comptime.hpp"
 #include "types.hpp"
 
 #include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -84,6 +86,16 @@ struct FnInfo {
   TypeId ret = 0;
 };
 
+struct TraitMethodInfo {
+  FnInfo sig{};
+  bool object_safe = false;
+};
+
+struct TraitMethodSet {
+  std::vector<std::string> order{};
+  std::unordered_map<std::string, TraitMethodInfo> methods{};
+};
+
 struct ExprResult {
   TypeId type = 0;
   bool diverged = false;
@@ -103,6 +115,8 @@ class Checker {
     predeclare_nominals();
     collect_type_layouts();
     collect_signatures();
+    check_trait_impls();
+    check_comptime();
     check_bodies();
     return !session_.has_errors();
   }
@@ -114,6 +128,7 @@ class Checker {
 
   std::unordered_map<const ItemStruct*, StructInfo> struct_info_{};
   std::unordered_map<const ItemEnum*, EnumInfo> enum_info_{};
+  std::unordered_map<const ItemTrait*, TraitMethodSet> trait_methods_{};
   std::unordered_map<const ItemConst*, TypeId> const_types_{};
   std::unordered_map<const ItemStatic*, TypeId> static_types_{};
   std::unordered_map<const ItemFn*, FnInfo> fn_info_{};
@@ -208,10 +223,7 @@ class Checker {
           }
           case AstNodeKind::ItemTrait: {
             auto* tr = static_cast<const ItemTrait*>(item);
-            for (const FnDecl* mdecl : tr->methods) {
-              if (!mdecl || !mdecl->sig) continue;
-              (void)lower_fn_sig(mid, mdecl->sig, std::nullopt, /*allow_self=*/true);
-            }
+            collect_trait_method_set(mid, tr);
             break;
           }
           case AstNodeKind::ItemImplInherent: {
@@ -228,6 +240,195 @@ class Checker {
           }
           default:
             break;
+        }
+      }
+    }
+  }
+
+  static std::string fmt_sig(const TypeStore& types, const FnInfo& f) {
+    std::string out{};
+    out += "(";
+    for (size_t i = 0; i < f.params.size(); i++) {
+      if (i) out += ", ";
+      out += types.to_string(f.params[i]);
+    }
+    out += ") -> ";
+    out += types.to_string(f.ret);
+    return out;
+  }
+
+  bool type_contains_self(TypeId t) const {
+    const TypeData& d = types_.get(t);
+    switch (d.kind) {
+      case TypeKind::Self:
+        return true;
+      case TypeKind::Ptr:
+        return type_contains_self(d.pointee);
+      case TypeKind::Slice:
+        return type_contains_self(d.elem);
+      case TypeKind::Array:
+        return type_contains_self(d.elem);
+      case TypeKind::Tuple:
+        for (TypeId e : d.tuple_elems) {
+          if (type_contains_self(e)) return true;
+        }
+        return false;
+      case TypeKind::Error:
+      case TypeKind::Unit:
+      case TypeKind::Bool:
+      case TypeKind::Int:
+      case TypeKind::TypeType:
+      case TypeKind::Struct:
+      case TypeKind::Enum:
+      case TypeKind::DynTrait:
+        return false;
+    }
+    return false;
+  }
+
+  TypeId substitute_self(TypeId t, TypeId self_ty) {
+    const TypeData& d = types_.get(t);
+    switch (d.kind) {
+      case TypeKind::Self:
+        return self_ty;
+      case TypeKind::Ptr:
+        return types_.ptr(d.mutability, substitute_self(d.pointee, self_ty));
+      case TypeKind::Slice:
+        return types_.slice(substitute_self(d.elem, self_ty));
+      case TypeKind::Array:
+        return types_.array(substitute_self(d.elem, self_ty), d.array_len_expr);
+      case TypeKind::Tuple: {
+        std::vector<TypeId> elems{};
+        elems.reserve(d.tuple_elems.size());
+        for (TypeId e : d.tuple_elems) elems.push_back(substitute_self(e, self_ty));
+        return types_.tuple(std::move(elems));
+      }
+      case TypeKind::Error:
+      case TypeKind::Unit:
+      case TypeKind::Bool:
+      case TypeKind::Int:
+      case TypeKind::TypeType:
+      case TypeKind::Struct:
+      case TypeKind::Enum:
+      case TypeKind::DynTrait:
+        return t;
+    }
+    return t;
+  }
+
+  void collect_trait_method_set(ModuleId mid, const ItemTrait* tr) {
+    if (!tr) return;
+    if (trait_methods_.contains(tr)) return;
+
+    TraitMethodSet set{};
+    std::unordered_set<std::string> seen{};
+
+    for (const FnDecl* decl : tr->methods) {
+      if (!decl || !decl->sig) continue;
+      if (seen.contains(decl->name)) {
+        error(decl->span, "duplicate method `" + decl->name + "` in trait `" + tr->name + "`");
+        continue;
+      }
+      seen.insert(decl->name);
+      set.order.push_back(decl->name);
+
+      FnInfo sig = lower_fn_sig(mid, decl->sig, std::nullopt, /*allow_self=*/true);
+
+      bool object_safe = true;
+      if (sig.params.empty()) {
+        object_safe = false;
+      } else {
+        const TypeData& self_param = types_.get(sig.params[0]);
+        if (self_param.kind != TypeKind::Ptr) {
+          object_safe = false;
+        } else if (types_.get(self_param.pointee).kind != TypeKind::Self) {
+          object_safe = false;
+        }
+      }
+      for (size_t i = 1; i < sig.params.size() && object_safe; i++) {
+        if (type_contains_self(sig.params[i])) object_safe = false;
+      }
+      if (object_safe && type_contains_self(sig.ret)) object_safe = false;
+
+      set.methods.insert({decl->name, TraitMethodInfo{.sig = std::move(sig), .object_safe = object_safe}});
+    }
+
+    trait_methods_.insert({tr, std::move(set)});
+  }
+
+  void check_trait_impls() {
+    for (ModuleId mid = 0; mid < crate_.modules.size(); mid++) {
+      const Module& m = crate_.modules[mid];
+      for (Item* item : m.items) {
+        if (!item) continue;
+        if (item->kind != AstNodeKind::ItemImplTrait) continue;
+        auto* impl = static_cast<const ItemImplTrait*>(item);
+
+        const Item* trait_item = resolve_type_item(mid, impl->trait_name);
+        if (!trait_item || trait_item->kind != AstNodeKind::ItemTrait) {
+          error(impl->trait_name ? impl->trait_name->span : impl->span, "unknown trait in impl");
+          continue;
+        }
+        auto* tr = static_cast<const ItemTrait*>(trait_item);
+        auto ts_it = trait_methods_.find(tr);
+        if (ts_it == trait_methods_.end()) continue;
+        const TraitMethodSet& tset = ts_it->second;
+
+        TypeId self_ty = lower_type_path(mid, impl->for_type_name, /*allow_unsized=*/false, std::nullopt, false);
+        const TypeData& sd = types_.get(self_ty);
+        if (sd.kind != TypeKind::Struct && sd.kind != TypeKind::Enum) {
+          error(impl->for_type_name ? impl->for_type_name->span : impl->span, "trait impl target must be a nominal type");
+          continue;
+        }
+
+        std::unordered_map<std::string, const ItemFn*> impl_methods{};
+        for (const ItemFn* mfn : impl->methods) {
+          if (!mfn || !mfn->decl) continue;
+          if (impl_methods.contains(mfn->decl->name)) {
+            error(mfn->span, "duplicate method `" + mfn->decl->name + "` in trait impl");
+            continue;
+          }
+          impl_methods.insert({mfn->decl->name, mfn});
+        }
+
+        // No extra methods.
+        for (const auto& [name, mfn] : impl_methods) {
+          if (!tset.methods.contains(name)) {
+            error(mfn->span, "method `" + name + "` is not a member of trait `" + tr->name + "`");
+          }
+        }
+
+        // All required methods.
+        for (const auto& [name, tm] : tset.methods) {
+          auto it = impl_methods.find(name);
+          if (it == impl_methods.end()) {
+            error(impl->span, "missing method `" + name + "` in impl of `" + tr->name + "`");
+            continue;
+          }
+
+          auto fi = fn_info_.find(it->second);
+          if (fi == fn_info_.end()) continue;
+          const FnInfo& impl_sig = fi->second;
+          const FnInfo& trait_sig = tm.sig;
+
+          if (impl_sig.params.size() != trait_sig.params.size()) {
+            error(it->second->span, "signature mismatch for `" + name + "`: expected " + fmt_sig(types_, trait_sig) + ", got " +
+                                       fmt_sig(types_, impl_sig));
+            continue;
+          }
+
+          bool ok = true;
+          for (size_t i = 0; i < impl_sig.params.size(); i++) {
+            TypeId expected = substitute_self(trait_sig.params[i], self_ty);
+            if (!types_.equal(impl_sig.params[i], expected)) ok = false;
+          }
+          TypeId expected_ret = substitute_self(trait_sig.ret, self_ty);
+          if (!types_.equal(impl_sig.ret, expected_ret)) ok = false;
+
+          if (!ok) {
+            error(it->second->span, "signature mismatch for `" + name + "`: expected " + fmt_sig(types_, trait_sig) + ", got " +
+                                       fmt_sig(types_, impl_sig));
+          }
         }
       }
     }
@@ -378,6 +579,164 @@ class Checker {
             break;
         }
       }
+    }
+  }
+
+  void check_comptime() {
+    if (session_.has_errors()) return;
+
+    ComptimeEvaluator eval(session_, crate_);
+
+    // Type-check and evaluate const/static initializers.
+    for (ModuleId mid = 0; mid < crate_.modules.size(); mid++) {
+      const Module& m = crate_.modules[mid];
+      for (Item* item : m.items) {
+        if (!item) continue;
+        switch (item->kind) {
+          case AstNodeKind::ItemConst: {
+            auto* c = static_cast<const ItemConst*>(item);
+            TypeId expected = const_types_.contains(c) ? const_types_.at(c) : types_.error();
+            Env env{};
+            TypeId got = check_expr(mid, c->value, env, expected).type;
+            if (!types_.can_coerce(got, expected)) {
+              error(c->span, "const initializer type mismatch: expected `" + types_.to_string(expected) + "`, got `" +
+                                 types_.to_string(got) + "`");
+            }
+            if (!session_.has_errors()) (void)eval.eval_const(c);
+            break;
+          }
+          case AstNodeKind::ItemStatic: {
+            auto* s = static_cast<const ItemStatic*>(item);
+            TypeId expected = static_types_.contains(s) ? static_types_.at(s) : types_.error();
+            Env env{};
+            TypeId got = check_expr(mid, s->value, env, expected).type;
+            if (!types_.can_coerce(got, expected)) {
+              error(s->span, "static initializer type mismatch: expected `" + types_.to_string(expected) + "`, got `" +
+                                 types_.to_string(got) + "`");
+            }
+            if (!session_.has_errors()) (void)eval.eval_static(s);
+            break;
+          }
+          default:
+            break;
+        }
+      }
+    }
+
+    // Evaluate array lengths that appear in item signatures and layouts.
+    for (ModuleId mid = 0; mid < crate_.modules.size(); mid++) {
+      const Module& m = crate_.modules[mid];
+      for (Item* item : m.items) {
+        if (!item) continue;
+        switch (item->kind) {
+          case AstNodeKind::ItemStruct: {
+            auto* s = static_cast<const ItemStruct*>(item);
+            for (const FieldDecl* f : s->fields) {
+              if (f) check_type_arrays(mid, f->type, eval);
+            }
+            break;
+          }
+          case AstNodeKind::ItemEnum: {
+            auto* e = static_cast<const ItemEnum*>(item);
+            for (const VariantDecl* v : e->variants) {
+              if (!v) continue;
+              for (const Type* t : v->payload) check_type_arrays(mid, t, eval);
+            }
+            break;
+          }
+          case AstNodeKind::ItemFn: {
+            auto* fn = static_cast<const ItemFn*>(item);
+            if (fn->decl && fn->decl->sig) {
+              for (const Param* p : fn->decl->sig->params) {
+                if (p) check_type_arrays(mid, p->type, eval);
+              }
+              if (fn->decl->sig->ret) check_type_arrays(mid, fn->decl->sig->ret, eval);
+            }
+            break;
+          }
+          case AstNodeKind::ItemTrait: {
+            auto* tr = static_cast<const ItemTrait*>(item);
+            for (const FnDecl* decl : tr->methods) {
+              if (!decl || !decl->sig) continue;
+              for (const Param* p : decl->sig->params) {
+                if (p) check_type_arrays(mid, p->type, eval);
+              }
+              if (decl->sig->ret) check_type_arrays(mid, decl->sig->ret, eval);
+            }
+            break;
+          }
+          case AstNodeKind::ItemImplInherent: {
+            auto* impl = static_cast<const ItemImplInherent*>(item);
+            for (const ItemFn* mfn : impl->methods) {
+              if (!mfn || !mfn->decl || !mfn->decl->sig) continue;
+              for (const Param* p : mfn->decl->sig->params) {
+                if (p) check_type_arrays(mid, p->type, eval);
+              }
+              if (mfn->decl->sig->ret) check_type_arrays(mid, mfn->decl->sig->ret, eval);
+            }
+            break;
+          }
+          case AstNodeKind::ItemImplTrait: {
+            auto* impl = static_cast<const ItemImplTrait*>(item);
+            for (const ItemFn* mfn : impl->methods) {
+              if (!mfn || !mfn->decl || !mfn->decl->sig) continue;
+              for (const Param* p : mfn->decl->sig->params) {
+                if (p) check_type_arrays(mid, p->type, eval);
+              }
+              if (mfn->decl->sig->ret) check_type_arrays(mid, mfn->decl->sig->ret, eval);
+            }
+            break;
+          }
+          case AstNodeKind::ItemConst: {
+            auto* c = static_cast<const ItemConst*>(item);
+            check_type_arrays(mid, c->type, eval);
+            break;
+          }
+          case AstNodeKind::ItemStatic: {
+            auto* s = static_cast<const ItemStatic*>(item);
+            check_type_arrays(mid, s->type, eval);
+            break;
+          }
+          case AstNodeKind::ItemTypeAlias: {
+            auto* ta = static_cast<const ItemTypeAlias*>(item);
+            check_type_arrays(mid, ta->aliased, eval);
+            break;
+          }
+          default:
+            break;
+        }
+      }
+    }
+  }
+
+  void check_type_arrays(ModuleId mid, const Type* ty, ComptimeEvaluator& eval) {
+    if (!ty) return;
+    switch (ty->kind) {
+      case AstNodeKind::TypeArray: {
+        auto* a = static_cast<const TypeArray*>(ty);
+        if (a->len) {
+          Env env{};
+          (void)check_expr(mid, a->len, env, types_.int_(IntKind::Usize));
+          if (!session_.has_errors()) (void)eval.eval_usize(mid, a->len);
+        }
+        check_type_arrays(mid, a->elem, eval);
+        return;
+      }
+      case AstNodeKind::TypePtr: {
+        auto* p = static_cast<const TypePtr*>(ty);
+        check_type_arrays(mid, p->pointee, eval);
+        return;
+      }
+      case AstNodeKind::TypeSlice:
+        check_type_arrays(mid, static_cast<const TypeSlice*>(ty)->elem, eval);
+        return;
+      case AstNodeKind::TypeTuple: {
+        auto* t = static_cast<const TypeTuple*>(ty);
+        for (const Type* e : t->elems) check_type_arrays(mid, e, eval);
+        return;
+      }
+      default:
+        return;
     }
   }
 
@@ -615,8 +974,7 @@ class Checker {
         return {.type = types_.int_(IntKind::I32)};
       }
       case AstNodeKind::ExprString:
-        // Not typed yet; treat as const* [u8] later.
-        return {.type = types_.error()};
+        return {.type = types_.ptr(Mutability::Const, types_.slice(types_.int_(IntKind::U8)))};
       case AstNodeKind::ExprBlock:
         return check_block(mid, static_cast<const ExprBlock*>(expr)->block, env, expected);
       case AstNodeKind::ExprComptime:
@@ -648,8 +1006,9 @@ class Checker {
       case AstNodeKind::ExprMatch:
         return check_match_expr(mid, static_cast<const ExprMatch*>(expr), env, expected);
       case AstNodeKind::ExprWhile:
+        return check_while_expr(mid, static_cast<const ExprWhile*>(expr), env);
       case AstNodeKind::ExprLoop:
-        return {.type = types_.unit()};
+        return check_loop_expr(mid, static_cast<const ExprLoop*>(expr), env);
       default:
         break;
     }
@@ -777,15 +1136,26 @@ class Checker {
     switch (e->kind) {
       case AstNodeKind::ExprPath: {
         auto* p = static_cast<const ExprPath*>(e);
-        if (!p->path || p->path->segments.size() != 1) break;
-        std::string_view name = p->path->segments[0]->text;
-        VarInfo* v = env.lookup(name);
-        if (!v) break;
-        if (!allow_reinit_local) {
-          if (v->state == VarState::Uninit) error(e->span, "use of uninitialized local `" + std::string(name) + "`");
-          if (v->state == VarState::Moved) error(e->span, "use after move of local `" + std::string(name) + "`");
+        if (!p->path || p->path->segments.empty()) break;
+
+        // Local lookup only for single-segment paths.
+        if (p->path->segments.size() == 1) {
+          std::string_view name = p->path->segments[0]->text;
+          VarInfo* v = env.lookup(name);
+          if (v) {
+            if (!allow_reinit_local) {
+              if (v->state == VarState::Uninit) error(e->span, "use of uninitialized local `" + std::string(name) + "`");
+              if (v->state == VarState::Moved) error(e->span, "use after move of local `" + std::string(name) + "`");
+            }
+            return {.type = v->type, .writable = v->is_mut, .root_local = std::string(name)};
+          }
         }
-        return {.type = v->type, .writable = v->is_mut, .root_local = std::string(name)};
+
+        // Const/static as a readable (non-writable) place.
+        if (auto t = resolve_value_path(mid, p->path)) {
+          return {.type = *t, .writable = false, .root_local = ""};
+        }
+        break;
       }
       case AstNodeKind::ExprField: {
         auto* f = static_cast<const ExprField*>(e);
@@ -942,6 +1312,21 @@ class Checker {
     const Path* callee = static_cast<const ExprPath*>(call->callee)->path;
     if (!callee) return {.type = types_.error()};
 
+    // Builtins (comptime).
+    if (callee->segments.size() == 2 && callee->segments[0]->text == "builtin" && callee->segments[1]->text == "compile_error") {
+      TypeId msg_ty = types_.ptr(Mutability::Const, types_.slice(types_.int_(IntKind::U8)));
+      if (call->args.size() != 1) {
+        error(call->span, "builtin::compile_error expects 1 argument");
+        return {.type = expected.value_or(types_.unit()), .diverged = true};
+      }
+      TypeId got = check_expr(mid, call->args[0], env, msg_ty).type;
+      if (!types_.can_coerce(got, msg_ty)) {
+        error(call->args[0]->span,
+              "argument type mismatch: expected `" + types_.to_string(msg_ty) + "`, got `" + types_.to_string(got) + "`");
+      }
+      return {.type = expected.value_or(types_.unit()), .diverged = true};
+    }
+
     // Try value call (free function) first.
     const ItemFn* fn = resolve_fn_path(mid, callee);
     if (fn) return check_direct_call(mid, fn, call->args, env, expected);
@@ -1043,6 +1428,67 @@ class Checker {
     const Item* def = nullptr;
     if (nd.kind == TypeKind::Struct) def = static_cast<const Item*>(nd.struct_def);
     if (nd.kind == TypeKind::Enum) def = static_cast<const Item*>(nd.enum_def);
+    if (nd.kind == TypeKind::DynTrait) {
+      if (!nd.trait_def) {
+        error(mc->span, "invalid `dyn` receiver type");
+        return {.type = types_.error()};
+      }
+      if (rd.kind != TypeKind::Ptr) {
+        error(mc->span, "calling methods on `dyn` requires a pointer receiver");
+        return {.type = types_.error()};
+      }
+
+      auto ts_it = trait_methods_.find(nd.trait_def);
+      if (ts_it == trait_methods_.end()) {
+        error(mc->span, "unknown trait in `dyn` receiver");
+        return {.type = types_.error()};
+      }
+      auto mi = ts_it->second.methods.find(mc->method);
+      if (mi == ts_it->second.methods.end()) {
+        error(mc->span, "cannot resolve method `" + mc->method + "` on `dyn " + nd.trait_def->name + "`");
+        return {.type = types_.error()};
+      }
+      const TraitMethodInfo& tm = mi->second;
+      const FnInfo& sig = tm.sig;
+      if (sig.params.empty()) {
+        error(mc->span, "trait method is missing a receiver parameter");
+        return {.type = sig.ret};
+      }
+      if (!tm.object_safe) {
+        error(mc->span, "method `" + mc->method + "` is not callable on `dyn " + nd.trait_def->name + "` (not object-safe)");
+        return {.type = sig.ret};
+      }
+
+      TypeId self_param = sig.params[0];
+      const TypeData& sp = types_.get(self_param);
+      if (sp.kind != TypeKind::Ptr || types_.get(sp.pointee).kind != TypeKind::Self) {
+        error(mc->span, "dyn-dispatchable methods must take `self: const* Self` or `self: mut* Self`");
+        return {.type = sig.ret};
+      }
+
+      TypeId expected_recv = types_.ptr(sp.mutability, nominal);
+      if (!types_.can_coerce(recv_ty, expected_recv)) {
+        error(mc->receiver->span,
+              "receiver type mismatch: expected `" + types_.to_string(expected_recv) + "`, got `" + types_.to_string(recv_ty) + "`");
+      }
+
+      if (mc->args.size() + 1 != sig.params.size()) {
+        error(mc->span, "method call arity mismatch");
+        return {.type = sig.ret};
+      }
+
+      for (size_t i = 0; i < mc->args.size(); i++) {
+        TypeId expected_arg = sig.params[i + 1];
+        TypeId got = check_expr(mid, mc->args[i], env, expected_arg).type;
+        if (!types_.can_coerce(got, expected_arg)) {
+          error(mc->args[i]->span,
+                "argument type mismatch: expected `" + types_.to_string(expected_arg) + "`, got `" + types_.to_string(got) + "`");
+        }
+      }
+
+      (void)expected;
+      return {.type = sig.ret};
+    }
     if (!def) {
       error(mc->span, "method calls require a nominal receiver type");
       return {.type = types_.error()};
@@ -1189,6 +1635,25 @@ class Checker {
 
     env = any_arm ? joined_env : env;
     return {.type = arm_type.value_or(types_.unit())};
+  }
+
+  ExprResult check_while_expr(ModuleId mid, const ExprWhile* wh, Env& env) {
+    if (!wh) return {.type = types_.unit()};
+    TypeId cond = check_expr(mid, wh->cond, env, types_.bool_()).type;
+    if (!types_.equal(cond, types_.bool_())) error(wh->cond->span, "while condition must be bool");
+
+    Env body_env = env;
+    (void)check_block(mid, wh->body, body_env, std::nullopt);
+    join_env(env, body_env);
+    return {.type = types_.unit()};
+  }
+
+  ExprResult check_loop_expr(ModuleId mid, const ExprLoop* lp, Env& env) {
+    if (!lp) return {.type = types_.unit()};
+    Env body_env = env;
+    (void)check_block(mid, lp->body, body_env, std::nullopt);
+    env = body_env;
+    return {.type = types_.unit()};
   }
 
   void check_pattern(ModuleId mid, const Pattern* pat, TypeId scrutinee, Env& env) {

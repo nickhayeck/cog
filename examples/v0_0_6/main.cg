@@ -1,0 +1,75 @@
+// v0.0.6: comptime evaluation for const/static initializers and array lengths.
+
+mod util;
+
+pub struct Table {
+    data: [u8; util::LEN],
+}
+
+pub struct Pair {
+    a: i32,
+    b: i32,
+}
+
+pub enum Mode {
+    Off,
+    On(i32),
+}
+
+const SHOULD_FAIL: bool = false;
+
+const SUM10: usize = {
+    let mut i: usize = 0;
+    let mut s: usize = 0;
+    while i < 10 {
+        s = s + i;
+        i = i + 1;
+    };
+    s
+};
+
+const EXTRA: usize = comptime { 1 + 2 + 3 };
+
+const OK: usize = if SHOULD_FAIL {
+    builtin::compile_error("SHOULD_FAIL was true")
+} else {
+    SUM10 + EXTRA
+};
+
+const LOOP_SUM: usize = {
+    let mut i: usize = 0;
+    let mut s: usize = 0;
+    loop {
+        if i == 5 {
+            break;
+        };
+        s = s + i;
+        i = i + 1;
+    };
+    s
+};
+
+const MODE: Mode = Mode::On(3);
+
+const CLASS: i32 = match MODE {
+    Mode::On(x) if x > 0 => x,
+    _ => 0,
+};
+
+const P: Pair = Pair { a: 1, b: 2 };
+
+const PA: i32 = P.a + P.b;
+
+static GLOBAL: usize = OK;
+
+fn main() -> i32 {
+    let _x: usize = GLOBAL;
+    let _y: usize = LOOP_SUM;
+    let _z: usize = util::LEN;
+
+    if CLASS == 3 {
+        PA
+    } else {
+        0
+    }
+}

@@ -7,8 +7,8 @@ These are project-local instructions for working in this repo.
 - Prefer correctness and debuggability over cleverness.
 - Avoid “magic” build steps; everything should run via CMake.
 
-## Current compiler pipeline (v0.0.4)
-- `cogc <file.cg>` runs: parse → module loading + `use` resolution → type checking + local move checking.
+## Current compiler pipeline (v0.0.6)
+- `cogc <file.cg>` runs: parse → module loading + `use` resolution → type checking + local move checking → comptime const-eval (for `const`/`static` and array lengths).
 - Debug aids:
   - `cogc --dump-tokens <file.cg>`
   - `cogc --dump-ast <file.cg>` (after successful checking)
@@ -31,8 +31,11 @@ These are project-local instructions for working in this repo.
 ## Building
 - Configure: `cmake -S . -B build`
 - Build: `cmake --build build -j`
-- Run: `./build/cogc examples/v0_0_4/main.cg`
+- Run: `./build/cogc examples/v0_0_6/main.cg`
 - Test: `ctest --test-dir build --output-on-failure`
+
+## Design notes
+- Long-form comptime plan: `comptime_design.md`
 
 ## Flex/Bison constraints
 - The macOS system `bison` may be old; keep the grammar compatible with GNU Bison 2.3.

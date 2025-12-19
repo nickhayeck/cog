@@ -2,7 +2,7 @@
 
 This roadmap focuses on reaching a usable compiler pipeline while staying aligned with the core constraints: **no borrow checker**, **no lifetimes**, **no generics**, **no noalias assumptions**.
 
-Status: **v0.0.4 is implemented** (front-end only: parse → resolve → type+move check). See `examples/v0_0_4/main.cg` for a representative program.
+Status: **v0.0.6 is implemented** (front-end + minimal comptime const-eval). See `examples/v0_0_6/main.cg` and `comptime_design.md`.
 
 ## Completed
 
@@ -30,23 +30,25 @@ Status: **v0.0.4 is implemented** (front-end only: parse → resolve → type+mo
   - assignment re-initializes locals
   - `Copy` modeled for primitives/pointers and aggregates of `Copy`
 
-## Next milestones
+### v0.0.5 — Trait objects + vtables (typing) (done)
+- Type-check `receiver.method(...)` where the receiver is `const* dyn Trait` / `mut* dyn Trait` using the trait method set.
+- Validate trait impls: no extra methods, no missing methods, and method signatures match (with `Self` substitution).
+- Object-safety (minimal): dyn-dispatchable methods must take `self: const* Self` or `self: mut* Self` and must not mention `Self` elsewhere.
+- Note: actual IR/LLVM lowering of dyn calls is deferred until the IR exists (see v0.0.7).
 
-### v0.0.5 — Trait objects + vtables (typing + lowering)
-- Finish type checking for calls on `* dyn Trait` (receiver dispatch through trait method set).
-- Define vtable layout and emit a vtable symbol per `(Trait, ConcreteType)` impl.
-- Lower `dyn` method calls into indirect calls via `(data_ptr, vtable_ptr)`.
-
-### v0.0.6 — Comptime interpreter (minimal, useful)
-- Define comptime-evaluable subset and implement an interpreter for:
-  - integer arithmetic + comparisons
-  - `if`, `while/loop` (with bounds), `match` on ints/enums
-  - struct/enum/array construction and indexing
-  - `builtin::compile_error`
+### v0.0.6 — Comptime interpreter (minimal, useful) (done)
+- Implement a minimal comptime interpreter for:
+  - integer/bool literals, arithmetic/comparisons, `if`, `while`, `loop`, `match` + guards
+  - struct/enum construction, tuple values, field access
+  - `builtin::compile_error` (emits an error when executed at comptime)
 - Wire comptime into:
-  - `const` / `static` initializers (where permitted)
-  - array lengths `[T; N]`
-  - (later) comptime parameters and specialization
+  - `const` / `static` initializers (all are evaluated in v0.0.6)
+  - array lengths `[T; N]` (length expressions are evaluated as `usize`)
+- Current limitations (planned extensions):
+  - comptime function calls and dyn/method calls are not supported
+  - comptime indexing/array literals are not supported yet
+
+## Next milestones
 
 ### v0.0.7 — IR + LLVM skeleton
 - Introduce a small explicit IR for locals, calls, branches, and struct/enum layouts (default `repr(C)`).

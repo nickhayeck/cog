@@ -1,0 +1,11 @@
+// v0.0.6: comptime evaluation in separate module.
+
+pub const LEN: usize = {
+    let mut i: usize = 0;
+    let mut out: usize = 0;
+    while i < 4 {
+        out = out + 2;
+        i = i + 1;
+    };
+    out
+};
