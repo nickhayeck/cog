@@ -1,0 +1,90 @@
+%option noyywrap nodefault yylineno
+
+%{
+#include "parse_state.hpp"
+#include "parser.hpp"
+
+#include <cstdlib>
+#include <cstring>
+
+static char* dup_yytext() {
+  size_t len = static_cast<size_t>(yyleng);
+  char* out = static_cast<char*>(std::malloc(len + 1));
+  if (!out) return nullptr;
+  std::memcpy(out, yytext, len);
+  out[len] = '\0';
+  return out;
+}
+
+static char* dup_string_literal() {
+  // yytext includes quotes; keep the raw bytes between them for v0.0.1.
+  size_t len = static_cast<size_t>(yyleng);
+  if (len < 2) return dup_yytext();
+  char* out = static_cast<char*>(std::malloc(len - 1));
+  if (!out) return nullptr;
+  std::memcpy(out, yytext + 1, len - 2);
+  out[len - 2] = '\0';
+  return out;
+}
+
+%}
+
+%x COMMENT
+
+%%
+
+[ \t\r]+                ;
+\n+                      ;
+
+"//".*                   ;
+"/*"                     { BEGIN(COMMENT); }
+<COMMENT>"*/"            { BEGIN(INITIAL); }
+<COMMENT>\n              ;
+<COMMENT>.               ;
+
+"::"                     { return TOK_COLONCOLON; }
+"->"                     { return TOK_ARROW; }
+"=>"                     { return TOK_FATARROW; }
+"=="                     { return TOK_EQEQ; }
+"!="                     { return TOK_NEQ; }
+"<="                     { return TOK_LE; }
+">="                     { return TOK_GE; }
+"&&"                     { return TOK_ANDAND; }
+"||"                     { return TOK_OROR; }
+
+"fn"                     { return KW_FN; }
+"struct"                 { return KW_STRUCT; }
+"enum"                   { return KW_ENUM; }
+"trait"                  { return KW_TRAIT; }
+"impl"                   { return KW_IMPL; }
+"for"                    { return KW_FOR; }
+"type"                   { return KW_TYPE; }
+"const"                  { return KW_CONST; }
+"static"                 { return KW_STATIC; }
+"mod"                    { return KW_MOD; }
+"use"                    { return KW_USE; }
+"pub"                    { return KW_PUB; }
+"as"                     { return KW_AS; }
+"let"                    { return KW_LET; }
+"mut"                    { return KW_MUT; }
+"if"                     { return KW_IF; }
+"else"                   { return KW_ELSE; }
+"while"                  { return KW_WHILE; }
+"loop"                   { return KW_LOOP; }
+"match"                  { return KW_MATCH; }
+"return"                 { return KW_RETURN; }
+"break"                  { return KW_BREAK; }
+"continue"               { return KW_CONTINUE; }
+"comptime"               { return KW_COMPTIME; }
+"dyn"                    { return KW_DYN; }
+"Self"                   { return KW_SELF_TYPE; }
+
+[0-9]+                   { yylval.int_val = std::atoll(yytext); return INT; }
+
+\"([^\"\\]|\\.)*\"       { yylval.str = dup_string_literal(); return STRING; }
+
+[_a-zA-Z][_a-zA-Z0-9]*   { yylval.str = dup_yytext(); return IDENT; }
+
+.                        { return static_cast<unsigned char>(yytext[0]); }
+
+%%
