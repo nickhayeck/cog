@@ -12,10 +12,10 @@ Status notes:
 
 Cog wants:
 - Rust-like surface syntax and item model.
-- Zig-like compile-time execution and specialization.
+- Zig-like compile-time execution and staged evaluation (partial evaluation).
 - No borrow checker/lifetimes and no generics (initially), but still high performance and good ergonomics.
 
-Comptime provides the missing piece: “generics without generics” (initially) by specializing functions and types based on compile-time parameters and type values.
+Comptime provides the missing piece: “generics without generics” (initially) by interpreting compile-time parameters and `type` values, then lowering a fully concrete residual program/IR with the comptime constructs erased.
 
 ---
 
@@ -31,7 +31,7 @@ Expressions must be compile-time-evaluable (CTE) in these contexts:
 - `static` initializers (subject to restrictions)
 - array lengths `[T; N]`
 - `comptime { ... }` blocks (in any context)
-- `comptime` parameters (specialization keys)
+- `comptime` parameters (staged evaluation inputs)
 
 ### 2.2 “CTE subset” philosophy
 The compiler should:
@@ -60,7 +60,7 @@ fn add(comptime T: type, a: T, b: T) -> T {
 }
 
 fn demo() -> i32 {
-    // Specializes add for T=i32.
+    // `T` is known at comptime; lowering produces concrete operations for `i32`.
     add(i32, 40, 2)
 }
 ```
@@ -83,41 +83,46 @@ Notes:
 
 ---
 
-## 4. Specialization and monomorphization
+## 4. Staged evaluation and residual IR
 
-### 4.1 What triggers specialization
-Cog specializes on:
-- `comptime` parameters (including `comptime T: type`)
-- explicit `comptime { ... }` arguments used for non-`comptime` parameters (future)
-- any argument proven to be compile-time constant when required (array lengths, etc.)
+Cog’s comptime model is not “template specialization” in the C++ sense. The semantics are:
+- The compiler interprets comptime-evaluable code (including control flow driven by comptime values).
+- The output of compilation is a *residual* lowered program/IR that contains only concrete runtime operations.
+- Comptime-only values/branches are erased; they do not exist at runtime.
 
-### 4.2 Specialization key
-Each instantiation is keyed by:
-- fully qualified function item identity
-- values of all `comptime` parameters (structural, canonical form)
+### 4.1 What triggers staged evaluation
+Staged evaluation occurs whenever a compile-time-only value is required:
+- `const`/`static` initializers
+- array lengths `[T; N]`
+- `comptime { ... }` blocks
+- calls with `comptime` parameters
 
-Example:
+### 4.2 Example: comptime parameter drives lowering
 ```cog
-fn repeat(comptime N: usize, x: i32) -> [i32; N] { ... }
+fn repeat(comptime N: usize, x: i32) -> [i32; N] {
+    // Conceptually, lowering sees `N` as a compile-time constant and emits IR
+    // where the array length is concrete (e.g. `N=4`).
+    builtin::compile_error("array construction not implemented yet");
+}
 
-repeat(4, 1)  // instance key: (repeat, N=4)
-repeat(8, 1)  // instance key: (repeat, N=8)
+fn demo() -> i32 {
+    // The call forces `N` to be known at compile time.
+    // After staged evaluation, the program contains only concrete ops for N=4.
+    0
+}
 ```
 
-### 4.3 Deduping and caching
-The compiler must intern/normalize comptime values used as keys:
-- integers: normalized by width/signedness and value
-- types: canonicalized (type identity)
-- structs/enums: structural values normalized with field order
+### 4.3 Memoization (compiler optimization)
+To avoid repeating work, the compiler may memoize the result of staged evaluation by:
+- fully qualified item identity + canonicalized comptime arguments
 
-Pitfall to avoid: using raw AST pointers as keys will cause unstable caching and duplicate specializations.
+Pitfall to avoid: using raw AST pointers as cache keys leads to unstable caching and redundant work across modules/files.
 
 ### 4.4 Limits
-To avoid compile-time blowups:
-- configurable max instantiations per function
-- configurable recursion depth
-- configurable instruction/step budget for comptime execution
-- diagnostics that point to the instantiation chain
+To keep compilation predictable:
+- step/instruction budget for comptime execution
+- recursion depth limit for comptime calls
+- diagnostics that print the call/evaluation stack on overflow
 
 ---
 
@@ -273,7 +278,7 @@ fn f(x: i32) -> i32 {
 ## 9. Interaction with traits and `dyn`
 
 Comptime is not limited to runtime values; it will be used to:
-- generate specialized implementations
+- generate concrete implementations (vtables, reflection-driven codegen)
 - generate vtables/registries
 - validate ABI/layout constraints
 
@@ -322,4 +327,3 @@ If you allow too much at comptime too early (I/O, raw pointers, etc.), you will 
 Guardrail:
 - grow from value-only → add memory model only when needed
 - keep builtins small and explicit
-

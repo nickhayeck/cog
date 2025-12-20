@@ -23,11 +23,11 @@ This spec is intentionally split into:
 - **No borrow checker** (by design): pointers are always “just pointers”.
 - **Move-by-default** with **use-after-move rejection** for locals via dataflow (like Rust, but without lifetime analysis).
 - **Traits** and **`dyn` trait objects** for dynamic dispatch.
-- **Zig-style comptime**: evaluate code at compile time; specialize on comptime parameters; treat `type` as a first-class value (future generics).
+- **Zig-style comptime**: evaluate code at compile time; erase comptime constructs by interpreting them and emitting only concrete residual operations; treat `type` as a first-class value (future parametric programming).
 
 ### 1.2 Non-goals (for early versions)
 - No lifetimes / regions.
-- No generics (parametric polymorphism) beyond **comptime specialization**.
+- No generics (parametric polymorphism) as a surface feature yet (future designs use `type` values + comptime evaluation to produce fully concrete IR).
 - No strict-aliasing / `noalias` assumptions: optimizer must assume pointers can alias.
 - No safety guarantees for pointer dereference; “unsafe” is required only for specific casts/conversions, not for deref itself.
 
@@ -171,17 +171,21 @@ Uses:
 - Array lengths `[T; N]` where `N` is comptime `usize`
 - Type aliases and, later, type-level computation
 
+Note: `const`/`static` initializers are inherently comptime contexts, so `comptime { ... }` is usually redundant there; it’s primarily useful to force compile-time evaluation inside non-comptime contexts (e.g. inside function bodies) once lowering/codegen is implemented.
+
 ### 9.2 Comptime functions
 - `comptime fn` (or later: `fn ...` callable in comptime contexts) can be executed by the comptime interpreter.
 - The interpreter is deterministic and side-effect constrained (I/O, syscalls, threads are disallowed in comptime).
 
-### 9.3 Comptime parameters (specialization)
+### 9.3 Comptime parameters (staged evaluation)
 Functions may declare comptime parameters:
 ```cog
 fn add(comptime T: type, a: T, b: T) -> T { a + b }
 fn repeat(comptime N: usize, x: i32) -> [i32; N] { ... }
 ```
-The compiler specializes (monomorphizes) based on comptime arguments.
+Comptime parameters are compile-time inputs to compilation: the compiler interprets comptime-dependent parts and lowers a fully concrete program/IR where the comptime parameters no longer exist at runtime.
+
+Implementation note: the compiler may memoize the resulting lowered form for a given set of comptime arguments to avoid repeating work, but this is not a language-level “template specialization” feature.
 
 ### 9.4 `type` as a value
 `type` is a comptime-only kind. Values of kind `type` can be passed, returned, and computed at comptime.
@@ -249,6 +253,6 @@ The prototype compiler roadmap lives in `roadmap.md`. Below is the current imple
   - Array length expressions `[T; N]` are evaluated at compile time and must produce a non-negative `usize`.
   - `builtin::compile_error("...")` triggers an error when executed at comptime.
 - Not yet implemented:
-  - Comptime function calls, specialization, and reflection (`type` values are not first-class yet).
+  - Comptime function calls and reflection (`type` values are not first-class yet).
   - Dyn vtable lowering and codegen.
   - Exhaustiveness checking for `match`.
