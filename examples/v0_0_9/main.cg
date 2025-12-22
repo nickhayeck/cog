@@ -1,0 +1,15 @@
+// v0.0.9 (early): LLVM IR emission smoke test.
+
+fn add(a: i32, b: i32) -> i32 {
+    a + b
+}
+
+fn main() -> i32 {
+    let x: i32 = add(40, 2);
+    if x == 42 {
+        x
+    } else {
+        0
+    }
+}
+

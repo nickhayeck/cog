@@ -3,6 +3,7 @@
 #include "ast.hpp"
 #include "resolve.hpp"
 #include "session.hpp"
+#include "types.hpp"
 
 #include <cstdint>
 #include <optional>
@@ -11,6 +12,9 @@
 #include <vector>
 
 namespace cog {
+
+class LayoutEngine;
+class TypeStore;
 
 struct ComptimeValue {
   enum class Kind : std::uint8_t {
@@ -60,7 +64,7 @@ struct ComptimeValue {
 
 class ComptimeEvaluator {
  public:
-  explicit ComptimeEvaluator(Session& session, const ResolvedCrate& crate);
+  explicit ComptimeEvaluator(Session& session, const ResolvedCrate& crate, TypeStore* types = nullptr, LayoutEngine* layout = nullptr);
 
   // Evaluate a const/static value. The defining module context is used for name resolution.
   std::optional<ComptimeValue> eval_const(const ItemConst* c);
@@ -75,6 +79,8 @@ class ComptimeEvaluator {
  private:
   Session& session_;
   const ResolvedCrate& crate_;
+  TypeStore* types_ = nullptr;
+  LayoutEngine* layout_ = nullptr;
 
   enum class CacheState : std::uint8_t { InProgress, Done };
 
@@ -137,7 +143,11 @@ class ComptimeEvaluator {
 
   bool bind_pattern(ModuleId mid, const Pattern* pat, const ComptimeValue& v, Env& env);
   bool match_pattern(ModuleId mid, const Pattern* pat, const ComptimeValue& v, Env& env);
+
+  // ---- Type lowering helpers (needed for size/align builtins) ----
+  TypeId lower_type(ModuleId mid, const Type* ty, bool allow_unsized);
+  TypeId lower_type_path(ModuleId mid, const Path* path, bool allow_unsized);
+  std::optional<TypeId> lower_type_value_expr(ModuleId mid, const Expr* expr);
 };
 
 }  // namespace cog
-

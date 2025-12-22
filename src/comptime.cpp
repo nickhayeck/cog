@@ -1,8 +1,11 @@
 #include "comptime.hpp"
 
 #include "diag.hpp"
+#include "layout.hpp"
+#include "types.hpp"
 
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -45,7 +48,106 @@ static bool pattern_has_binding(const Pattern* pat) {
 
 }  // namespace
 
-ComptimeEvaluator::ComptimeEvaluator(Session& session, const ResolvedCrate& crate) : session_(session), crate_(crate) {
+TypeId ComptimeEvaluator::lower_type(ModuleId mid, const Type* ty, bool allow_unsized) {
+  if (!types_) {
+    error(ty ? ty->span : Span{}, "internal error: type lowering is unavailable in this comptime context");
+    return 0;
+  }
+  if (!ty) return types_->error();
+  switch (ty->kind) {
+    case AstNodeKind::TypePath:
+      return lower_type_path(mid, static_cast<const TypePath*>(ty)->path, allow_unsized);
+    case AstNodeKind::TypeType:
+      return types_->type_type();
+    case AstNodeKind::TypeUnit:
+      return types_->unit();
+    case AstNodeKind::TypePtr: {
+      auto* p = static_cast<const TypePtr*>(ty);
+      return types_->ptr(p->mutability, lower_type(mid, p->pointee, /*allow_unsized=*/true));
+    }
+    case AstNodeKind::TypeSlice: {
+      if (!allow_unsized) {
+        error(ty->span, "unsized slice types are not allowed here");
+        return types_->error();
+      }
+      auto* s = static_cast<const TypeSlice*>(ty);
+      return types_->slice(lower_type(mid, s->elem, /*allow_unsized=*/false));
+    }
+    case AstNodeKind::TypeArray: {
+      auto* a = static_cast<const TypeArray*>(ty);
+      return types_->array(lower_type(mid, a->elem, /*allow_unsized=*/false), a->len);
+    }
+    case AstNodeKind::TypeTuple: {
+      auto* t = static_cast<const TypeTuple*>(ty);
+      std::vector<TypeId> elems{};
+      elems.reserve(t->elems.size());
+      for (const Type* e : t->elems) elems.push_back(lower_type(mid, e, /*allow_unsized=*/false));
+      return types_->tuple(std::move(elems));
+    }
+    case AstNodeKind::TypeDyn: {
+      if (!allow_unsized) {
+        error(ty->span, "unsized `dyn Trait` types are not allowed here");
+        return types_->error();
+      }
+      const Item* tr_item = resolve_type_item(mid, static_cast<const TypeDyn*>(ty)->trait);
+      if (!tr_item || tr_item->kind != AstNodeKind::ItemTrait) {
+        error(ty->span, "unknown trait in `dyn` type");
+        return types_->error();
+      }
+      return types_->dyn_trait(static_cast<const ItemTrait*>(tr_item));
+    }
+    default:
+      error(ty->span, "unsupported type at comptime");
+      return types_->error();
+  }
+}
+
+TypeId ComptimeEvaluator::lower_type_path(ModuleId mid, const Path* path, bool allow_unsized) {
+  if (!types_) {
+    error(path ? path->span : Span{}, "internal error: type lowering is unavailable in this comptime context");
+    return 0;
+  }
+  if (!path || path->segments.empty()) return types_->error();
+  if (path->segments.size() == 1) {
+    std::string_view name = path->segments[0]->text;
+    if (name == "bool") return types_->bool_();
+    if (auto ik = types_->parse_int_kind(name)) return types_->int_(*ik);
+  }
+  const Item* item = resolve_type_item(mid, path);
+  if (!item) {
+    error(path->span, "unknown type in comptime type expression");
+    return types_->error();
+  }
+  switch (item->kind) {
+    case AstNodeKind::ItemStruct:
+      return types_->struct_(static_cast<const ItemStruct*>(item));
+    case AstNodeKind::ItemEnum:
+      return types_->enum_(static_cast<const ItemEnum*>(item));
+    case AstNodeKind::ItemTypeAlias: {
+      auto* ta = static_cast<const ItemTypeAlias*>(item);
+      return lower_type(mid, ta->aliased, allow_unsized);
+    }
+    case AstNodeKind::ItemTrait:
+      error(path->span, "traits are only usable via `dyn Trait`");
+      return types_->error();
+    default:
+      break;
+  }
+  return types_->error();
+}
+
+std::optional<TypeId> ComptimeEvaluator::lower_type_value_expr(ModuleId mid, const Expr* expr) {
+  if (!expr) return std::nullopt;
+  if (expr->kind != AstNodeKind::ExprPath) {
+    error(expr->span, "expected a type value (path)");
+    return std::nullopt;
+  }
+  const Path* p = static_cast<const ExprPath*>(expr)->path;
+  return lower_type_path(mid, p, /*allow_unsized=*/false);
+}
+
+ComptimeEvaluator::ComptimeEvaluator(Session& session, const ResolvedCrate& crate, TypeStore* types, LayoutEngine* layout)
+    : session_(session), crate_(crate), types_(types), layout_(layout) {
   for (ModuleId mid = 0; mid < crate_.modules.size(); mid++) {
     const Module& m = crate_.modules[mid];
     for (const Item* item : m.items) {
@@ -597,6 +699,33 @@ std::optional<ComptimeEvaluator::Flow> ComptimeEvaluator::eval_expr_inner(Module
       const Path* callee = static_cast<const ExprPath*>(call->callee)->path;
       if (!callee) return std::nullopt;
 
+      if (path_is_builtin(callee, "size_of") || path_is_builtin(callee, "align_of")) {
+        if (call->args.size() != 1) {
+          error(expr->span, "builtin::size_of/align_of expects 1 argument");
+          return std::nullopt;
+        }
+        if (!types_ || !layout_) {
+          error(expr->span, "builtin::size_of/align_of are not available in this comptime context");
+          return std::nullopt;
+        }
+        auto ty = lower_type_value_expr(mid, call->args[0]);
+        if (!ty) return std::nullopt;
+        std::optional<std::uint64_t> v{};
+        if (path_is_builtin(callee, "size_of")) v = layout_->size_of(*ty, expr->span);
+        if (path_is_builtin(callee, "align_of")) v = layout_->align_of(*ty, expr->span);
+        if (!v) return std::nullopt;
+        if (*v > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) {
+          error(expr->span, "comptime integer overflow");
+          return std::nullopt;
+        }
+        return Flow{.control = Control::None, .value = ComptimeValue::int_(static_cast<std::int64_t>(*v))};
+      }
+
+      if (path_is_builtin(callee, "addr_of") || path_is_builtin(callee, "addr_of_mut")) {
+        error(expr->span, "builtin::addr_of is not supported at comptime yet");
+        return std::nullopt;
+      }
+
       if (path_is_builtin(callee, "compile_error")) {
         if (call->args.size() != 1) {
           error(expr->span, "builtin::compile_error expects 1 argument");
@@ -828,4 +957,3 @@ bool ComptimeEvaluator::match_pattern(ModuleId mid, const Pattern* pat, const Co
 }
 
 }  // namespace cog
-

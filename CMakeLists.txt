@@ -35,6 +35,8 @@ add_executable(
   src/check.cpp
   src/comptime.cpp
   src/diag.cpp
+  src/emit_llvm.cpp
+  src/layout.cpp
   src/main.cpp
   src/parse.cpp
   src/parse_state.cpp
@@ -61,3 +63,7 @@ add_test(NAME parse_v0_0_3 COMMAND cogc ${CMAKE_CURRENT_SOURCE_DIR}/examples/v0_
 add_test(NAME parse_v0_0_4 COMMAND cogc ${CMAKE_CURRENT_SOURCE_DIR}/examples/v0_0_4/main.cg)
 add_test(NAME parse_v0_0_5 COMMAND cogc ${CMAKE_CURRENT_SOURCE_DIR}/examples/v0_0_5/main.cg)
 add_test(NAME parse_v0_0_6 COMMAND cogc ${CMAKE_CURRENT_SOURCE_DIR}/examples/v0_0_6/main.cg)
+add_test(NAME parse_v0_0_9 COMMAND cogc ${CMAKE_CURRENT_SOURCE_DIR}/examples/v0_0_9/main.cg)
+add_test(NAME parse_v0_0_9_methods COMMAND cogc ${CMAKE_CURRENT_SOURCE_DIR}/examples/v0_0_9_methods/main.cg)
+add_test(NAME parse_v0_0_10 COMMAND cogc ${CMAKE_CURRENT_SOURCE_DIR}/examples/v0_0_10/main.cg)
+add_test(NAME parse_v0_0_11 COMMAND cogc ${CMAKE_CURRENT_SOURCE_DIR}/examples/v0_0_11/main.cg)

@@ -7,8 +7,11 @@ These are project-local instructions for working in this repo.
 - Prefer correctness and debuggability over cleverness.
 - Avoid “magic” build steps; everything should run via CMake.
 
-## Current compiler pipeline (v0.0.6)
+## Current compiler pipeline (v0.0.11)
 - `cogc <file.cg>` runs: parse → module loading + `use` resolution → type checking + local move checking → comptime const-eval (for `const`/`static` and array lengths).
+- Optional backends:
+  - `cogc --emit-llvm <out.ll> <file.cg>` emits LLVM IR.
+  - `cogc --emit-exe <out> <file.cg>` emits LLVM IR and links via system `clang`.
 - Debug aids:
   - `cogc --dump-tokens <file.cg>`
   - `cogc --dump-ast <file.cg>` (after successful checking)
@@ -31,7 +34,8 @@ These are project-local instructions for working in this repo.
 ## Building
 - Configure: `cmake -S . -B build`
 - Build: `cmake --build build -j`
-- Run: `./build/cogc examples/v0_0_6/main.cg`
+- Run (check-only): `./build/cogc examples/v0_0_11/main.cg`
+- Run (end-to-end): `./build/cogc --emit-exe build/out examples/v0_0_11/main.cg && ./build/out`
 - Test: `ctest --test-dir build --output-on-failure`
 
 ## Design notes

@@ -1,0 +1,31 @@
+// v0.0.11 (early): LLVM codegen for `while`/`loop` + `break`/`continue` and `match` on enums.
+
+pub enum Mode {
+    Off,
+    On(i32),
+}
+
+fn main() -> i32 {
+    let mut i: i32 = 0;
+    let mut sum: i32 = 0;
+
+    loop {
+        if i == 10 {
+            break;
+        };
+        if i == 5 {
+            i = i + 1;
+            continue;
+        };
+        sum = sum + i;
+        i = i + 1;
+    };
+
+    let m: Mode = if sum == 40 { Mode::On(sum) } else { Mode::Off };
+
+    match m {
+        Mode::On(x) if x == 40 => 42,
+        _ => 0,
+    }
+}
+

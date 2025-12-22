@@ -1,0 +1,15 @@
+pub struct Counter {
+    pub n: i32,
+}
+
+impl Counter {
+    fn inc(self: mut* Self, x: i32) -> () {
+        self.n = self.n + x;
+        ()
+    }
+
+    fn get(self: const* Self) -> i32 {
+        self.n
+    }
+}
+

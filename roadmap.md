@@ -2,7 +2,7 @@
 
 This roadmap focuses on reaching a usable compiler pipeline while staying aligned with the core constraints: **no borrow checker**, **no lifetimes**, **no generics**, **no noalias assumptions**.
 
-Status: **v0.0.6 is implemented** (front-end + minimal comptime const-eval). See `examples/v0_0_6/main.cg` and `comptime_design.md`.
+Status: **v0.0.11 is implemented** (front-end + layout + LLVM codegen + dyn trait objects). See `examples/v0_0_11/main.cg` and `comptime_design.md`.
 
 ## Completed
 
@@ -34,7 +34,7 @@ Status: **v0.0.6 is implemented** (front-end + minimal comptime const-eval). See
 - Type-check `receiver.method(...)` where the receiver is `const* dyn Trait` / `mut* dyn Trait` using the trait method set.
 - Validate trait impls: no extra methods, no missing methods, and method signatures match (with `Self` substitution).
 - Object-safety (minimal): dyn-dispatchable methods must take `self: const* Self` or `self: mut* Self` and must not mention `Self` elsewhere.
-- Note: actual IR/LLVM lowering of dyn calls is deferred until the IR exists (see v0.0.7).
+- Note: v0.0.10 implements LLVM lowering for dyn calls (vtables + indirect dispatch).
 
 ### v0.0.6 — Comptime interpreter (minimal, useful) (done)
 - Implement a minimal comptime interpreter for:
@@ -45,71 +45,43 @@ Status: **v0.0.6 is implemented** (front-end + minimal comptime const-eval). See
   - `const` / `static` initializers (all are evaluated in v0.0.6)
   - array lengths `[T; N]` (length expressions are evaluated as `usize`)
 - Current limitations (planned extensions):
-  - comptime function calls and dyn/method calls are not supported
+  - comptime function calls and comptime method/dyn calls are not supported
   - comptime indexing/array literals are not supported yet
+
+## Completed (continued)
+
+### v0.0.7 — Layout engine + layout builtins (done)
+- Layout engine (`src/layout.hpp`, `src/layout.cpp`) for primitives, pointers (incl. fat pointers), tuples, arrays, structs, and enums.
+- Default `repr(C)` model; `#[repr(packed)]` supported for struct layout (alignment reduced to 1).
+- `builtin::size_of(T)` and `builtin::align_of(T)` type-check and evaluate at comptime using the layout engine.
+
+### v0.0.9 — LLVM backend + executable driver (done)
+- Direct AST→LLVM emission (no IR yet) for a small but runnable subset.
+- CLI:
+  - `cogc --emit-llvm <out.ll> <file.cg>`
+  - `cogc --emit-exe <out> <file.cg>` (links via system `clang`)
+- Emits: ints/bools, blocks + tail expr, `if/else`, `let` + assignment, struct literals + field access, pointer deref, direct calls, method calls, and `builtin::addr_of(_mut)`.
+
+### v0.0.10 — Trait objects lowering (vtables + dyn coercions) (done)
+- `* dyn Trait` lowered to `{ data_ptr, vtable_ptr }` with typed vtable structs per trait.
+- Vtables generated for each `(Trait, ConcreteType)` impl with wrapper thunks (`i8* self` erasure).
+- Dyn coercion implemented as explicit cast: `mut* T as mut* dyn Trait` (and const variants).
+- Dyn method calls lowered to vtable loads + indirect calls.
+
+### v0.0.11 — Enums + match/loops (LLVM) (done)
+- LLVM codegen for `while`/`loop` + `break`/`continue`.
+- LLVM codegen for `match` on ints/bools/enums (ordered decision chain) with basic bindings and guards.
+- LLVM representation for enums (tag + payload) and runtime constructors (including unit variants as values).
+
+## Deferred refactors
+
+### HIR/MIR lowering boundary (deferred)
+- The original HIR/MIR plan still stands, but v0.0.9+ uses a direct AST→LLVM emitter to unblock runnable examples early.
+- Once the surface subset stabilizes, introduce a small IR to simplify control-flow lowering, optimization, and better diagnostics.
 
 ## Next milestones
 
-### v0.0.7 — HIR + layout engine (front-end → lowering boundary)
-Goal: establish a stable “lowering boundary” so codegen and comptime can share a single notion of types/layout.
-
-- Introduce a lowered representation (HIR) with:
-  - resolved references (e.g. `ModuleId`/`Item*` or stable `ItemId`s) instead of raw `Path*`
-  - desugared constructs where useful (e.g. `if` as expression with explicit blocks)
-  - explicit “place vs value” nodes to support loads/stores cleanly
-- Implement a target-dependent layout engine:
-  - sizes/alignments for primitives
-  - `repr(C)` struct layout + field offsets
-  - enum layout strategy (tag + payload; start simple and deterministic)
-  - layout queries usable by both comptime (`size_of`, `align_of`) and codegen
-- Define canonical runtime representations (even before LLVM exists):
-  - pointers (`const* T` / `mut* T`)
-  - slices as fat pointers (`{ data_ptr, len }`)
-  - `dyn Trait` as fat pointers (`{ data_ptr, vtable_ptr }`)
-
-### v0.0.8 — IR (MIR) + lowering (HIR → IR)
-Goal: convert expression-oriented syntax into explicit control flow suitable for optimization and codegen.
-
-- Build a small explicit IR with:
-  - basic blocks + terminators (`br`, `cond_br`, `switch`/`match`, `return`)
-  - locals, temporaries, and “places” (`local`, `field`, `index`, `deref`)
-  - rvalues (`const`, `load`, `binop`, `call`, `addr_of`, `cast`)
-- Lower core constructs:
-  - `let`, assignment, field/index access
-  - `if/else`, `while`, `loop`, `break`/`continue`
-  - `match` lowering to `switch`/decision tree (start with ints + enums)
-- Define and enforce expression typing rules that IR needs:
-  - `loop` as an expression (type from `break expr`) or unit if no value (decide and document)
-  - consistent “never”/divergence handling in the IR
-
-### v0.0.9 — LLVM backend + executable driver (first runnable programs)
-Goal: compile and run real programs end-to-end.
-
-- Emit LLVM IR for:
-  - functions, calls, returns
-  - arithmetic/comparisons for ints/bools
-  - control flow blocks + PHI where needed
-  - struct field access via GEP using the layout engine offsets
-  - enum construction + pattern-match lowering (start minimal)
-- Add an output pipeline:
-  - emit `.ll` / `.o`
-  - link an executable using the system toolchain (e.g. `clang`/`lld`), without requiring network access
-- Define the “language ABI” for v0.1:
-  - calling convention for Cog functions
-  - `repr(C)` interop baseline (struct layout + integer widths)
-
-### v0.0.10 — Trait objects lowering (vtables + dyn coercions)
-Goal: make `dyn Trait` usable without “magic casts”.
-
-- Generate vtables for each `(Trait, ConcreteType)` impl:
-  - method function pointers ordered by the trait method set
-  - (optional) type metadata (size/align/drop fn) later
-- Implement coercions:
-  - `mut* T` → `mut* dyn Trait` (and const variants) when `T: Trait`
-  - store `{ data_ptr, vtable_ptr }` in the dyn fat pointer
-- Lower dyn method calls into vtable loads + indirect calls.
-
-### v0.0.11 — Comptime functions + staged evaluation (comptime parameters)
+### v0.0.12 — Comptime functions + staged evaluation (comptime parameters)
 Goal: unlock parametric programming via comptime.
 
 - Allow comptime function calls in the interpreter (bounded recursion).
@@ -117,9 +89,7 @@ Goal: unlock parametric programming via comptime.
   - a call with comptime arguments is interpreted/partially evaluated until only runtime operations remain
   - lowering produces concrete IR (no comptime parameters exist at runtime)
   - memoize results by canonicalized comptime values (compiler optimization, not a language feature)
-- Add initial builtins backed by the layout engine:
-  - `builtin::size_of(type)`
-  - `builtin::align_of(type)`
+- Add more builtins backed by the layout engine:
   - `builtin::type_info(type)`
   - `builtin::type_of(type)`
 

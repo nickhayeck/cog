@@ -1,0 +1,21 @@
+pub trait Sink {
+    fn write(self: mut* Self, b: u8) -> ();
+}
+
+pub struct Counter {
+    pub n: i32,
+}
+
+impl Counter {
+    fn get(self: const* Self) -> i32 {
+        self.n
+    }
+}
+
+impl Sink for Counter {
+    fn write(self: mut* Self, b: u8) -> () {
+        self.n = self.n + (b as i32);
+        ()
+    }
+}
+

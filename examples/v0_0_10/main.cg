@@ -1,0 +1,17 @@
+// v0.0.10 (early): dyn trait objects + vtable dispatch in LLVM codegen.
+
+mod util;
+
+use util::{Counter, Sink};
+
+fn main() -> i32 {
+    let mut c: Counter = Counter { n: 0 };
+    let cp: mut* Counter = builtin::addr_of_mut(c);
+    let ds: mut* dyn Sink = cp as mut* dyn Sink;
+
+    ds.write(5 as u8);
+    ds.write(37 as u8);
+
+    c.get()
+}
+

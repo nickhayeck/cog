@@ -3,7 +3,7 @@
 This document is a forward-looking design for Cog’s compile-time execution system (“comptime”). It is intentionally more detailed than the current implementation status and is meant to guide early compiler architecture to avoid dead ends.
 
 Status notes:
-- v0.0.6 implements a **small** subset (integer/bool const-eval, basic control flow, `builtin::compile_error`, wiring for `const`/`static` initializers and array lengths). See `roadmap.md`.
+- v0.0.11 implements a **small** subset (integer/bool const-eval, basic control flow, `builtin::compile_error`, `builtin::size_of`/`builtin::align_of`, wiring for `const`/`static` initializers and array lengths). See `roadmap.md`.
 - Everything else in this document is **planned** and may evolve, but the *interfaces* and *staging model* should remain stable.
 
 ---

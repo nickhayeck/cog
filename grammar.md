@@ -1,6 +1,6 @@
-# Cog v0.0.6 grammar (draft)
+# Cog v0.0.11 grammar (draft)
 
-This is an **approximate** EBNF aligned with the v0.0.6 prototype parser (`src/parser.y` + `src/lexer.l`). It describes the subset that currently parses; it is not intended to be a complete Rust grammar.
+This is an **approximate** EBNF aligned with the v0.0.11 prototype parser (`src/parser.y` + `src/lexer.l`). It describes the subset that currently parses; it is not intended to be a complete Rust grammar.
 
 Notes:
 - No generics (types/items/traits).

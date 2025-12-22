@@ -1,6 +1,8 @@
 #include "check.hpp"
 
 #include "comptime.hpp"
+#include "layout.hpp"
+#include "sem.hpp"
 #include "types.hpp"
 
 #include <optional>
@@ -68,34 +70,6 @@ static void join_env(Env& into, const Env& other) {
   }
 }
 
-struct StructInfo {
-  std::unordered_map<std::string, TypeId> fields{};
-};
-
-struct VariantInfo {
-  const VariantDecl* ast = nullptr;
-  std::vector<TypeId> payload{};
-};
-
-struct EnumInfo {
-  std::unordered_map<std::string, VariantInfo> variants{};
-};
-
-struct FnInfo {
-  std::vector<TypeId> params{};
-  TypeId ret = 0;
-};
-
-struct TraitMethodInfo {
-  FnInfo sig{};
-  bool object_safe = false;
-};
-
-struct TraitMethodSet {
-  std::vector<std::string> order{};
-  std::unordered_map<std::string, TraitMethodInfo> methods{};
-};
-
 struct ExprResult {
   TypeId type = 0;
   bool diverged = false;
@@ -121,6 +95,20 @@ class Checker {
     return !session_.has_errors();
   }
 
+  CheckedCrate finish() && {
+    CheckedCrate out{};
+    out.types = std::move(types_);
+    out.struct_info = std::move(struct_info_);
+    out.enum_info = std::move(enum_info_);
+    out.trait_methods = std::move(trait_methods_);
+    out.const_types = std::move(const_types_);
+    out.static_types = std::move(static_types_);
+    out.fn_info = std::move(fn_info_);
+    out.expr_types = std::move(expr_types_);
+    out.array_lens = std::move(array_lens_);
+    return out;
+  }
+
  private:
   Session& session_;
   const ResolvedCrate& crate_;
@@ -132,6 +120,8 @@ class Checker {
   std::unordered_map<const ItemConst*, TypeId> const_types_{};
   std::unordered_map<const ItemStatic*, TypeId> static_types_{};
   std::unordered_map<const ItemFn*, FnInfo> fn_info_{};
+  std::unordered_map<const Expr*, TypeId> expr_types_{};
+  std::unordered_map<const Expr*, std::uint64_t> array_lens_{};
 
   void error(Span span, std::string message) {
     session_.diags.push_back(Diagnostic{.severity = Severity::Error, .span = span, .message = std::move(message)});
@@ -174,6 +164,7 @@ class Checker {
         continue;
       }
       TypeId ty = lower_type(mid, f->type, /*allow_unsized=*/false, std::nullopt, /*allow_self=*/false);
+      info.fields_in_order.push_back(StructInfo::Field{.name = f->name, .type = ty});
       info.fields.insert({f->name, ty});
     }
     struct_info_.insert({s, std::move(info)});
@@ -188,6 +179,7 @@ class Checker {
         error(v->span, "duplicate variant `" + v->name + "` in enum `" + e->name + "`");
         continue;
       }
+      info.variants_in_order.push_back(v->name);
       VariantInfo vi{};
       vi.ast = v;
       for (const Type* pt : v->payload) {
@@ -554,6 +546,16 @@ class Checker {
     return types_.error();
   }
 
+  std::optional<TypeId> lower_type_value_expr(ModuleId mid, const Expr* e) {
+    if (!e) return std::nullopt;
+    if (e->kind != AstNodeKind::ExprPath) {
+      error(e->span, "expected a type value (path)");
+      return std::nullopt;
+    }
+    const Path* p = static_cast<const ExprPath*>(e)->path;
+    return lower_type_path(mid, p, /*allow_unsized=*/false, std::nullopt, /*allow_self=*/false);
+  }
+
   void check_bodies() {
     for (ModuleId mid = 0; mid < crate_.modules.size(); mid++) {
       const Module& m = crate_.modules[mid];
@@ -585,43 +587,8 @@ class Checker {
   void check_comptime() {
     if (session_.has_errors()) return;
 
-    ComptimeEvaluator eval(session_, crate_);
-
-    // Type-check and evaluate const/static initializers.
-    for (ModuleId mid = 0; mid < crate_.modules.size(); mid++) {
-      const Module& m = crate_.modules[mid];
-      for (Item* item : m.items) {
-        if (!item) continue;
-        switch (item->kind) {
-          case AstNodeKind::ItemConst: {
-            auto* c = static_cast<const ItemConst*>(item);
-            TypeId expected = const_types_.contains(c) ? const_types_.at(c) : types_.error();
-            Env env{};
-            TypeId got = check_expr(mid, c->value, env, expected).type;
-            if (!types_.can_coerce(got, expected)) {
-              error(c->span, "const initializer type mismatch: expected `" + types_.to_string(expected) + "`, got `" +
-                                 types_.to_string(got) + "`");
-            }
-            if (!session_.has_errors()) (void)eval.eval_const(c);
-            break;
-          }
-          case AstNodeKind::ItemStatic: {
-            auto* s = static_cast<const ItemStatic*>(item);
-            TypeId expected = static_types_.contains(s) ? static_types_.at(s) : types_.error();
-            Env env{};
-            TypeId got = check_expr(mid, s->value, env, expected).type;
-            if (!types_.can_coerce(got, expected)) {
-              error(s->span, "static initializer type mismatch: expected `" + types_.to_string(expected) + "`, got `" +
-                                 types_.to_string(got) + "`");
-            }
-            if (!session_.has_errors()) (void)eval.eval_static(s);
-            break;
-          }
-          default:
-            break;
-        }
-      }
-    }
+    LayoutEngine layout(session_, types_, struct_info_, enum_info_, array_lens_);
+    ComptimeEvaluator eval(session_, crate_, &types_, &layout);
 
     // Evaluate array lengths that appear in item signatures and layouts.
     for (ModuleId mid = 0; mid < crate_.modules.size(); mid++) {
@@ -707,6 +674,43 @@ class Checker {
         }
       }
     }
+    if (session_.has_errors()) return;
+
+    // Type-check and evaluate const/static initializers.
+    for (ModuleId mid = 0; mid < crate_.modules.size(); mid++) {
+      const Module& m = crate_.modules[mid];
+      for (Item* item : m.items) {
+        if (!item) continue;
+        switch (item->kind) {
+          case AstNodeKind::ItemConst: {
+            auto* c = static_cast<const ItemConst*>(item);
+            TypeId expected = const_types_.contains(c) ? const_types_.at(c) : types_.error();
+            Env env{};
+            TypeId got = check_expr(mid, c->value, env, expected).type;
+            if (!types_.can_coerce(got, expected)) {
+              error(c->span, "const initializer type mismatch: expected `" + types_.to_string(expected) + "`, got `" +
+                                 types_.to_string(got) + "`");
+            }
+            if (!session_.has_errors()) (void)eval.eval_const(c);
+            break;
+          }
+          case AstNodeKind::ItemStatic: {
+            auto* s = static_cast<const ItemStatic*>(item);
+            TypeId expected = static_types_.contains(s) ? static_types_.at(s) : types_.error();
+            Env env{};
+            TypeId got = check_expr(mid, s->value, env, expected).type;
+            if (!types_.can_coerce(got, expected)) {
+              error(s->span, "static initializer type mismatch: expected `" + types_.to_string(expected) + "`, got `" +
+                                 types_.to_string(got) + "`");
+            }
+            if (!session_.has_errors()) (void)eval.eval_static(s);
+            break;
+          }
+          default:
+            break;
+        }
+      }
+    }
   }
 
   void check_type_arrays(ModuleId mid, const Type* ty, ComptimeEvaluator& eval) {
@@ -717,7 +721,9 @@ class Checker {
         if (a->len) {
           Env env{};
           (void)check_expr(mid, a->len, env, types_.int_(IntKind::Usize));
-          if (!session_.has_errors()) (void)eval.eval_usize(mid, a->len);
+          if (!session_.has_errors()) {
+            if (auto v = eval.eval_usize(mid, a->len)) array_lens_[a->len] = *v;
+          }
         }
         check_type_arrays(mid, a->elem, eval);
         return;
@@ -964,55 +970,82 @@ class Checker {
 
   ExprResult check_expr(ModuleId mid, const Expr* expr, Env& env, std::optional<TypeId> expected) {
     if (!expr) return {.type = types_.error()};
+    ExprResult r{.type = types_.error()};
     switch (expr->kind) {
       case AstNodeKind::ExprUnit:
-        return {.type = types_.unit()};
+        r = {.type = types_.unit()};
+        break;
       case AstNodeKind::ExprBool:
-        return {.type = types_.bool_()};
+        r = {.type = types_.bool_()};
+        break;
       case AstNodeKind::ExprInt: {
-        if (expected && types_.get(*expected).kind == TypeKind::Int) return {.type = *expected};
-        return {.type = types_.int_(IntKind::I32)};
+        if (expected && types_.get(*expected).kind == TypeKind::Int) {
+          r = {.type = *expected};
+        } else {
+          r = {.type = types_.int_(IntKind::I32)};
+        }
+        break;
       }
       case AstNodeKind::ExprString:
-        return {.type = types_.ptr(Mutability::Const, types_.slice(types_.int_(IntKind::U8)))};
+        r = {.type = types_.ptr(Mutability::Const, types_.slice(types_.int_(IntKind::U8)))};
+        break;
       case AstNodeKind::ExprBlock:
-        return check_block(mid, static_cast<const ExprBlock*>(expr)->block, env, expected);
+        r = check_block(mid, static_cast<const ExprBlock*>(expr)->block, env, expected);
+        break;
       case AstNodeKind::ExprComptime:
-        return check_block(mid, static_cast<const ExprComptime*>(expr)->block, env, expected);
+        r = check_block(mid, static_cast<const ExprComptime*>(expr)->block, env, expected);
+        break;
       case AstNodeKind::ExprPath:
-        return check_path_expr(mid, static_cast<const ExprPath*>(expr)->path, env, /*as_value=*/true);
+        r = check_path_expr(mid, static_cast<const ExprPath*>(expr)->path, env, /*as_value=*/true);
+        break;
       case AstNodeKind::ExprStructLit:
-        return check_struct_lit(mid, static_cast<const ExprStructLit*>(expr), env, expected);
+        r = check_struct_lit(mid, static_cast<const ExprStructLit*>(expr), env, expected);
+        break;
       case AstNodeKind::ExprTuple:
-        return check_tuple_expr(mid, static_cast<const ExprTuple*>(expr), env, expected);
+        r = check_tuple_expr(mid, static_cast<const ExprTuple*>(expr), env, expected);
+        break;
       case AstNodeKind::ExprField:
-        return check_field_expr(mid, static_cast<const ExprField*>(expr), env);
+        r = check_field_expr(mid, static_cast<const ExprField*>(expr), env);
+        break;
       case AstNodeKind::ExprIndex:
-        return check_index_expr(mid, static_cast<const ExprIndex*>(expr), env);
+        r = check_index_expr(mid, static_cast<const ExprIndex*>(expr), env);
+        break;
       case AstNodeKind::ExprAssign:
-        return check_assign_expr(mid, static_cast<const ExprAssign*>(expr), env);
+        r = check_assign_expr(mid, static_cast<const ExprAssign*>(expr), env);
+        break;
       case AstNodeKind::ExprUnary:
-        return check_unary_expr(mid, static_cast<const ExprUnary*>(expr), env, expected);
+        r = check_unary_expr(mid, static_cast<const ExprUnary*>(expr), env, expected);
+        break;
       case AstNodeKind::ExprBinary:
-        return check_binary_expr(mid, static_cast<const ExprBinary*>(expr), env, expected);
+        r = check_binary_expr(mid, static_cast<const ExprBinary*>(expr), env, expected);
+        break;
       case AstNodeKind::ExprCast:
-        return check_cast_expr(mid, static_cast<const ExprCast*>(expr), env);
+        r = check_cast_expr(mid, static_cast<const ExprCast*>(expr), env);
+        break;
       case AstNodeKind::ExprCall:
-        return check_call_expr(mid, static_cast<const ExprCall*>(expr), env, expected);
+        r = check_call_expr(mid, static_cast<const ExprCall*>(expr), env, expected);
+        break;
       case AstNodeKind::ExprMethodCall:
-        return check_method_call(mid, static_cast<const ExprMethodCall*>(expr), env, expected);
+        r = check_method_call(mid, static_cast<const ExprMethodCall*>(expr), env, expected);
+        break;
       case AstNodeKind::ExprIf:
-        return check_if_expr(mid, static_cast<const ExprIf*>(expr), env, expected);
+        r = check_if_expr(mid, static_cast<const ExprIf*>(expr), env, expected);
+        break;
       case AstNodeKind::ExprMatch:
-        return check_match_expr(mid, static_cast<const ExprMatch*>(expr), env, expected);
+        r = check_match_expr(mid, static_cast<const ExprMatch*>(expr), env, expected);
+        break;
       case AstNodeKind::ExprWhile:
-        return check_while_expr(mid, static_cast<const ExprWhile*>(expr), env);
+        r = check_while_expr(mid, static_cast<const ExprWhile*>(expr), env);
+        break;
       case AstNodeKind::ExprLoop:
-        return check_loop_expr(mid, static_cast<const ExprLoop*>(expr), env);
+        r = check_loop_expr(mid, static_cast<const ExprLoop*>(expr), env);
+        break;
       default:
+        r = {.type = types_.error()};
         break;
     }
-    return {.type = types_.error()};
+    expr_types_[expr] = r.type;
+    return r;
   }
 
   ExprResult check_path_expr(ModuleId mid, const Path* path, Env& env, bool as_value) {
@@ -1160,6 +1193,7 @@ class Checker {
       case AstNodeKind::ExprField: {
         auto* f = static_cast<const ExprField*>(e);
         Place base = check_place(mid, f->base, env);
+        if (f->base) expr_types_[f->base] = base.type;
         TypeId bty = base.type;
         // Auto-deref pointers.
         const TypeData& td = types_.get(bty);
@@ -1178,6 +1212,7 @@ class Checker {
       case AstNodeKind::ExprIndex: {
         auto* ix = static_cast<const ExprIndex*>(e);
         Place base = check_place(mid, ix->base, env);
+        if (ix->base) expr_types_[ix->base] = base.type;
         TypeId bty = base.type;
         const TypeData& bd = types_.get(bty);
         if (bd.kind == TypeKind::Array) {
@@ -1219,6 +1254,7 @@ class Checker {
 
   ExprResult check_assign_expr(ModuleId mid, const ExprAssign* a, Env& env) {
     Place lhs = check_place(mid, a->lhs, env, /*allow_reinit_local=*/true);
+    if (a->lhs) expr_types_[a->lhs] = lhs.type;
     if (!lhs.writable) error(a->lhs->span, "assignment target is not writable");
     TypeId rhs = check_expr(mid, a->rhs, env, lhs.type).type;
     if (!types_.can_coerce(rhs, lhs.type)) {
@@ -1313,6 +1349,43 @@ class Checker {
     if (!callee) return {.type = types_.error()};
 
     // Builtins (comptime).
+    if (callee->segments.size() == 2 && callee->segments[0]->text == "builtin" && callee->segments[1]->text == "size_of") {
+      if (call->args.size() != 1) {
+        error(call->span, "builtin::size_of expects 1 argument");
+        return {.type = types_.int_(IntKind::Usize)};
+      }
+      auto ty = lower_type_value_expr(mid, call->args[0]);
+      if (ty && !types_.is_sized(*ty)) error(call->args[0]->span, "builtin::size_of requires a sized type");
+      return {.type = types_.int_(IntKind::Usize)};
+    }
+    if (callee->segments.size() == 2 && callee->segments[0]->text == "builtin" && callee->segments[1]->text == "align_of") {
+      if (call->args.size() != 1) {
+        error(call->span, "builtin::align_of expects 1 argument");
+        return {.type = types_.int_(IntKind::Usize)};
+      }
+      auto ty = lower_type_value_expr(mid, call->args[0]);
+      if (ty && !types_.is_sized(*ty)) error(call->args[0]->span, "builtin::align_of requires a sized type");
+      return {.type = types_.int_(IntKind::Usize)};
+    }
+    if (callee->segments.size() == 2 && callee->segments[0]->text == "builtin" && callee->segments[1]->text == "addr_of") {
+      if (call->args.size() != 1) {
+        error(call->span, "builtin::addr_of expects 1 argument");
+        return {.type = types_.error()};
+      }
+      Place p = check_place(mid, call->args[0], env);
+      if (!types_.is_sized(p.type)) error(call->args[0]->span, "builtin::addr_of requires a sized place");
+      return {.type = types_.ptr(Mutability::Const, p.type)};
+    }
+    if (callee->segments.size() == 2 && callee->segments[0]->text == "builtin" && callee->segments[1]->text == "addr_of_mut") {
+      if (call->args.size() != 1) {
+        error(call->span, "builtin::addr_of_mut expects 1 argument");
+        return {.type = types_.error()};
+      }
+      Place p = check_place(mid, call->args[0], env);
+      if (!p.writable) error(call->args[0]->span, "builtin::addr_of_mut requires a mutable place");
+      if (!types_.is_sized(p.type)) error(call->args[0]->span, "builtin::addr_of_mut requires a sized place");
+      return {.type = types_.ptr(Mutability::Mut, p.type)};
+    }
     if (callee->segments.size() == 2 && callee->segments[0]->text == "builtin" && callee->segments[1]->text == "compile_error") {
       TypeId msg_ty = types_.ptr(Mutability::Const, types_.slice(types_.int_(IntKind::U8)));
       if (call->args.size() != 1) {
@@ -1415,6 +1488,7 @@ class Checker {
     TypeId recv_ty = 0;
     if (mc->receiver && mc->receiver->kind == AstNodeKind::ExprPath) {
       recv_ty = check_path_expr(mid, static_cast<const ExprPath*>(mc->receiver)->path, env, /*as_value=*/false).type;
+      expr_types_[mc->receiver] = recv_ty;
     } else {
       recv_ty = check_expr(mid, mc->receiver, env, std::nullopt).type;
     }
@@ -1685,8 +1759,10 @@ class Checker {
 
 }  // namespace
 
-bool check_crate(Session& session, const ResolvedCrate& crate) {
-  return Checker(session, crate).run();
+std::optional<CheckedCrate> check_crate(Session& session, const ResolvedCrate& crate) {
+  Checker checker(session, crate);
+  if (!checker.run()) return std::nullopt;
+  return std::move(checker).finish();
 }
 
 }  // namespace cog
