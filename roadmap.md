@@ -48,8 +48,6 @@ Status: **v0.0.11 is implemented** (front-end + layout + LLVM codegen + dyn trai
   - comptime function calls and comptime method/dyn calls are not supported
   - comptime indexing/array literals are not supported yet
 
-## Completed (continued)
-
 ### v0.0.7 — Layout engine + layout builtins (done)
 - Layout engine (`src/layout.hpp`, `src/layout.cpp`) for primitives, pointers (incl. fat pointers), tuples, arrays, structs, and enums.
 - Default `repr(C)` model; `#[repr(packed)]` supported for struct layout (alignment reduced to 1).

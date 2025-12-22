@@ -5,6 +5,8 @@ pub enum Mode {
     On(i32),
 }
 
+fn thing(m: Mode) -> () {}
+
 fn main() -> i32 {
     let mut i: i32 = 0;
     let mut sum: i32 = 0;
@@ -21,6 +23,11 @@ fn main() -> i32 {
         i = i + 1;
     };
 
+    // test move-semantics
+    let m2: Mode = Mode::Off;
+    thing(m2);
+    // thing(m2); // fails to compile if this is uncommented!
+
     let m: Mode = if sum == 40 { Mode::On(sum) } else { Mode::Off };
 
     match m {
@@ -28,4 +35,3 @@ fn main() -> i32 {
         _ => 0,
     }
 }
-
