@@ -48,7 +48,7 @@ Status: **v0.0.11 is implemented** (front-end + layout + LLVM codegen + dyn trai
 
 ### v0.0.7 — Layout engine + layout builtins (done)
 - Layout engine (`src/layout.hpp`, `src/layout.cpp`) for primitives, pointers (incl. fat pointers), tuples, arrays, structs, and enums.
-- Default `repr(C)` model; `#[repr(packed)]` supported for struct layout (alignment reduced to 1).
+- Default `#[repr(cog)]` model (currently source-order layout); `#[repr(packed)]` is implemented and `#[repr(C)]` is reserved for stable C interop layout.
 - `builtin::size_of(T)` and `builtin::align_of(T)` type-check and evaluate at comptime using the layout engine.
 
 ### v0.0.9 — LLVM backend + executable driver (done)
@@ -85,32 +85,8 @@ Goal: unlock parametric programming via comptime.
 v0.1.0 should be the first “useful” release: you can compile and run small programs, and the surface subset is stable enough to build examples against.
 
 **v0.1.0 exit criteria (must-have)**
-- End-to-end pipeline: `cogc` compiles and links an executable for a relatively stable skeleton of the language.
-- Answer remaining design questions
-    - what do we do about C enum compatibility?
-    - should we implement unions?
-    - how should we do C ABI exports? `extern` or `export`? imports?
-    - define `repr(cog)` precisely
-    - is `#[]` really the best compiler tagging convention?
-    - what are traits actually for? do we need them?
-    - what set of builtins do we need to create to fully support type-parametric programming?
-        - reflection (e.g. `type_of(...)` `type_info(...)`)
-        - metacoding (e.g. `builtins::new_struct(name: *const char, fields: Fields)`)
-    - how should we design the allocation API?
-        - dont want to fall for the zig meme of passing around an allocator everywhere
-        - also dont want to fall for the rust meme of "good luck controlling what allocator gets used"
-        - maybe a decent middle ground is to provide types that do both `std::Vec` and `std::custom_alloc::Vec`?
-        - we should try to have it give explicit errors in debug mode and be silent in release mode
-    - variadic arguments?
-    - test module? test keyword?
-- Skeleton of type system complete
-    - further primitive types
-        - floating point support: f16, f32, f64, and f128
-        - arbitrary bit-width integers, i.e. u1, u2, ..., u128 and i1, i2, ..., i128, (thus obviating the need for bitfield support)
-    - `&` operator for taking "address of" => `T` to `*const T` and `&mut` to `*mut T`
-    - full support for type aliases.
-- HIR/MIR: relatively simple IR to make type checking, move semantics, and LLVM generation simpler (v0.0.9+ uses a direct AST→LLVM emitter to unblock runnable examples early).
-- Better documentation across the repo
+- End-to-end pipeline: `cogc` compiles and links an executable for a stable subset.
+- Docs: a stable `SPEC.md` for the subset + a practical `README.md`.
 - Stable subset support:
   - modules (`mod` inline/out-of-line) + `use` trees
   - structs/enums + `match` (at least ints + enums)
@@ -118,10 +94,10 @@ v0.1.0 should be the first “useful” release: you can compile and run small p
   - traits + static dispatch (in-scope traits)
   - `dyn Trait` objects with working vtables + dyn calls
   - `const`/`static` + array lengths with deterministic comptime evaluation
-- Coherent ABI story:
-  - `repr(cog)` default is enforced by a real layout engine
+- ABI story:
+  - `#[repr(cog)]` default is implemented (layout is implementation-defined)
+  - `#[repr(C)]` structs for C interop are supported
   - pointer/slice/dyn object representations are specified and implemented
-  - other representation: `repr(packed)`, `repr(C)`
 - Diagnostics and stability:
   - no crashes on malformed programs; clear span-based errors
   - basic test coverage (smoke tests + a few negative tests)
@@ -131,7 +107,19 @@ v0.1.0 should be the first “useful” release: you can compile and run small p
 - Better `match` checking (exhaustiveness + unreachable arms) for small domains.
 - A tiny “prelude” module (core integer ops + a couple of builtins).
 
-## C interop track (ongoing; ideas here are very much subject to revision)
-- Parse `use_interop "header.h";` as a placeholder item and plumb it through name resolution.
-- Decide mapping of C declarations into Cog items (types, functions, constants).
+**Open design questions (non-gating)**
+- C enums: representation + casts (`#[repr(i32)]` and friends).
+- Unions: do we want them, and how do they interact with `match`/pattern syntax?
+- C ABI surface syntax: `extern` / `export` keywords vs attributes.
+- `#[repr(cog)]` policy boundaries: what is guaranteed vs compiler-defined?
+- Attributes: keep `#[...]` or adopt a different tagging convention?
+- Traits: role in the long-term design (esp. without “Rust-style” safety features).
+- Meta-typing + builtins for type-parametric programming (reflection and type construction).
+- Allocation API direction.
+- Variadic arguments.
+- Testing story (built-in test runner vs library/framework).
+
+## C interop track (ongoing; subject to revision)
+- Decide the surface syntax for declaring/importing C ABI items (`extern`/`export`, link names, calling conventions).
+- Define `#[repr(C)]` coverage (structs first; fieldless enums via `#[repr(<int>)]`).
 - Add symbol/link control attributes (e.g. `#[link_name="..."]`, `#[link(lib="...")]`).
