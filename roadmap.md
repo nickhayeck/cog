@@ -1,7 +1,5 @@
 # Cog compiler roadmap
 
-This roadmap focuses on reaching a usable compiler pipeline while staying aligned with the core constraints: **no borrow checker**, **no lifetimes**, **no generics**, **no noalias assumptions**.
-
 Status: **v0.0.11 is implemented** (front-end + layout + LLVM codegen + dyn trait objects). See `examples/v0_0_11/main.cg` and `comptime_design.md`.
 
 ## Completed
@@ -71,12 +69,6 @@ Status: **v0.0.11 is implemented** (front-end + layout + LLVM codegen + dyn trai
 - LLVM codegen for `match` on ints/bools/enums (ordered decision chain) with basic bindings and guards.
 - LLVM representation for enums (tag + payload) and runtime constructors (including unit variants as values).
 
-## Deferred refactors
-
-### HIR/MIR lowering boundary (deferred)
-- The original HIR/MIR plan still stands, but v0.0.9+ uses a direct AST→LLVM emitter to unblock runnable examples early.
-- Once the surface subset stabilizes, introduce a small IR to simplify control-flow lowering, optimization, and better diagnostics.
-
 ## Next milestones
 
 ### v0.0.12 — Comptime functions + staged evaluation (comptime parameters)
@@ -87,15 +79,38 @@ Goal: unlock parametric programming via comptime.
   - a call with comptime arguments is interpreted/partially evaluated until only runtime operations remain
   - lowering produces concrete IR (no comptime parameters exist at runtime)
   - memoize results by canonicalized comptime values (compiler optimization, not a language feature)
-- Add more builtins backed by the layout engine:
-  - `builtin::type_info(type)`
-  - `builtin::type_of(type)`
+- Add `builtin::type_info(type)` builtin backed by the layout engine.
 
 ## Release target: v0.1.0
 v0.1.0 should be the first “useful” release: you can compile and run small programs, and the surface subset is stable enough to build examples against.
 
 **v0.1.0 exit criteria (must-have)**
-- End-to-end pipeline: `cogc` compiles and links an executable for a small subset.
+- End-to-end pipeline: `cogc` compiles and links an executable for a relatively stable skeleton of the language.
+- Answer remaining design questions
+    - what do we do about C enum compatibility?
+    - should we implement unions?
+    - how should we do C ABI exports? `extern` or `export`? imports?
+    - define `repr(cog)` precisely
+    - is `#[]` really the best compiler tagging convention?
+    - what are traits actually for? do we need them?
+    - what set of builtins do we need to create to fully support type-parametric programming?
+        - reflection (e.g. `type_of(...)` `type_info(...)`)
+        - metacoding (e.g. `builtins::new_struct(name: *const char, fields: Fields)`)
+    - how should we design the allocation API?
+        - dont want to fall for the zig meme of passing around an allocator everywhere
+        - also dont want to fall for the rust meme of "good luck controlling what allocator gets used"
+        - maybe a decent middle ground is to provide types that do both `std::Vec` and `std::custom_alloc::Vec`?
+        - we should try to have it give explicit errors in debug mode and be silent in release mode
+    - variadic arguments?
+    - test module? test keyword?
+- Skeleton of type system complete
+    - further primitive types
+        - floating point support: f16, f32, f64, and f128
+        - arbitrary bit-width integers, i.e. u1, u2, ..., u128 and i1, i2, ..., i128, (thus obviating the need for bitfield support)
+    - `&` operator for taking "address of" => `T` to `*const T` and `&mut` to `*mut T`
+    - full support for type aliases.
+- HIR/MIR: relatively simple IR to make type checking, move semantics, and LLVM generation simpler (v0.0.9+ uses a direct AST→LLVM emitter to unblock runnable examples early).
+- Better documentation across the repo
 - Stable subset support:
   - modules (`mod` inline/out-of-line) + `use` trees
   - structs/enums + `match` (at least ints + enums)
@@ -103,9 +118,10 @@ v0.1.0 should be the first “useful” release: you can compile and run small p
   - traits + static dispatch (in-scope traits)
   - `dyn Trait` objects with working vtables + dyn calls
   - `const`/`static` + array lengths with deterministic comptime evaluation
-- A coherent ABI story:
-  - `repr(C)` default is enforced by a real layout engine
+- Coherent ABI story:
+  - `repr(cog)` default is enforced by a real layout engine
   - pointer/slice/dyn object representations are specified and implemented
+  - other representation: `repr(packed)`, `repr(C)`
 - Diagnostics and stability:
   - no crashes on malformed programs; clear span-based errors
   - basic test coverage (smoke tests + a few negative tests)
@@ -115,7 +131,7 @@ v0.1.0 should be the first “useful” release: you can compile and run small p
 - Better `match` checking (exhaustiveness + unreachable arms) for small domains.
 - A tiny “prelude” module (core integer ops + a couple of builtins).
 
-## C interop track (ongoing)
+## C interop track (ongoing; ideas here are very much subject to revision)
 - Parse `use_interop "header.h";` as a placeholder item and plumb it through name resolution.
 - Decide mapping of C declarations into Cog items (types, functions, constants).
 - Add symbol/link control attributes (e.g. `#[link_name="..."]`, `#[link(lib="...")]`).

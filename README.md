@@ -7,7 +7,7 @@ status: living
 
 # Cog Language (draft spec)
 
-Cog is a Rust-syntax, low-latency systems language with Zig-style compile-time execution. Early editions target a C++ compiler implementation; bootstrapping is a long-term goal.
+Cog is a general purpose programming language that aims to combine the syntactic advantages of Rust with the metaprogramming advantages of Zig.
 
 This spec is intentionally split into:
 - **Surface syntax** (what parses)
@@ -200,18 +200,19 @@ Namespace and exact spelling are TBD; the prototype uses `builtin::...`:
 - `builtin::size_of(comptime T: type) -> usize`
 - `builtin::align_of(comptime T: type) -> usize`
 - `builtin::type_info(comptime T: type) -> TypeInfo`
+- `builtin::type_of(value: anytype) -> type`
 - `builtin::compile_error(msg: const* [u8]) -> !` (never returns)
 - `builtin::addr_of(x) -> const* T`
 - `builtin::addr_of_mut(x) -> mut* T`
 
 ## 10. C interop
 
-Cog’s long-term goal is “no-FFI” interop: C declarations are imported directly and used as if they were Cog declarations.
+Cog’s long-term goal is “thin-FFI” interop: C declarations are imported directly and used as if they were Cog declarations.
 
 Cog intentionally does **not** have `extern { ... }` blocks; the intent is to make header import the primary workflow.
 
 ### 10.1 ABI and layout
-- `#[repr(C)]` types are intended to match C struct layout rules for the target.
+- types with the representation `#[repr(C)]` (the default) are intended to match C struct layout rules for the target.
 - Integers use two’s complement; endianness is target-defined.
 
 ### 10.2 Header import (future)
