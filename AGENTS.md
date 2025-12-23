@@ -11,7 +11,9 @@ These are project-local instructions for working in this repo.
 - `cogc <file.cg>` runs: parse → module loading + `use` resolution → type checking + local move checking → comptime const-eval (for `const`/`static` and array lengths).
 - Optional backends:
   - `cogc --emit-llvm <out.ll> <file.cg>` emits LLVM IR.
-  - `cogc --emit-exe <out> <file.cg>` emits LLVM IR and links via system `clang`.
+  - `cogc --emit-bc <out.bc> <file.cg>` emits LLVM bitcode.
+  - `cogc --emit-obj <out.o> <file.cg>` emits an object file.
+  - `cogc --emit-exe <out> <file.cg>` emits an object file and links via system `clang`.
 - Debug aids:
   - `cogc --dump-tokens <file.cg>`
   - `cogc --dump-ast <file.cg>` (after successful checking)
@@ -33,6 +35,7 @@ These are project-local instructions for working in this repo.
 
 ## Building
 - Configure: `cmake -S . -B build`
+- If CMake can’t find LLVM: set `LLVM_DIR=/opt/homebrew/opt/llvm/lib/cmake/llvm`
 - Build: `cmake --build build -j`
 - Run (check-only): `./build/cogc examples/v0_0_11/main.cg`
 - Run (end-to-end): `./build/cogc --emit-exe build/out examples/v0_0_11/main.cg && ./build/out`

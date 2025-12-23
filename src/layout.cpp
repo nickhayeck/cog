@@ -19,12 +19,14 @@ LayoutEngine::LayoutEngine(
     TypeStore& types,
     const std::unordered_map<const ItemStruct*, StructInfo>& struct_info,
     const std::unordered_map<const ItemEnum*, EnumInfo>& enum_info,
-    const std::unordered_map<const Expr*, std::uint64_t>& array_lens)
+    const std::unordered_map<const Expr*, std::uint64_t>& array_lens,
+    TargetLayout target)
     : session_(session),
       types_(types),
       struct_info_(struct_info),
       enum_info_(enum_info),
-      array_lens_(array_lens) {}
+      array_lens_(array_lens),
+      target_(target) {}
 
 void LayoutEngine::error(Span span, std::string message) {
   session_.diags.push_back(Diagnostic{.severity = Severity::Error, .span = span, .message = std::move(message)});
@@ -38,11 +40,35 @@ std::uint64_t LayoutEngine::align_up(std::uint64_t x, std::uint64_t a) {
 }
 
 std::uint64_t LayoutEngine::pointer_size() const {
-  return static_cast<std::uint64_t>(sizeof(void*));
+  return target_.pointer_size;
 }
 
 std::uint64_t LayoutEngine::pointer_align() const {
-  return static_cast<std::uint64_t>(alignof(void*));
+  return target_.pointer_align;
+}
+
+std::uint64_t LayoutEngine::int_align(IntKind k) const {
+  switch (k) {
+    case IntKind::I8:
+    case IntKind::U8:
+      return target_.i8_align;
+    case IntKind::I16:
+    case IntKind::U16:
+      return target_.i16_align;
+    case IntKind::I32:
+    case IntKind::U32:
+      return target_.i32_align;
+    case IntKind::I64:
+    case IntKind::U64:
+      return target_.i64_align;
+    case IntKind::I128:
+    case IntKind::U128:
+      return target_.i128_align;
+    case IntKind::Isize:
+    case IntKind::Usize:
+      return target_.pointer_align;
+  }
+  return 1;
 }
 
 std::optional<std::uint64_t> LayoutEngine::array_len_value(const Expr* expr) const {
@@ -160,8 +186,7 @@ std::optional<Layout> LayoutEngine::compute_layout(TypeId ty, Span use_site) {
           size = pointer_size();
           break;
       }
-      std::uint64_t align = size == 0 ? 1 : size;
-      align = std::max<std::uint64_t>(align, 1);
+      std::uint64_t align = std::max<std::uint64_t>(int_align(d.int_kind), 1);
       return Layout{.size = size, .align = align, .sized = true};
     }
     case TypeKind::TypeType:
@@ -316,4 +341,3 @@ std::optional<EnumLayout> LayoutEngine::compute_enum_layout(const ItemEnum* def,
 }
 
 }  // namespace cog
-

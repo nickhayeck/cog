@@ -52,9 +52,11 @@ Status: **v0.0.11 is implemented** (front-end + layout + LLVM codegen + dyn trai
 - `builtin::size_of(T)` and `builtin::align_of(T)` type-check and evaluate at comptime using the layout engine.
 
 ### v0.0.9 — LLVM backend + executable driver (done)
-- Direct AST→LLVM emission (no IR yet) for a small but runnable subset.
+- Direct AST→LLVM emission (no IR yet) for a small but runnable subset, using LLVM’s C++ API.
 - CLI:
   - `cogc --emit-llvm <out.ll> <file.cg>`
+  - `cogc --emit-bc <out.bc> <file.cg>`
+  - `cogc --emit-obj <out.o> <file.cg>`
   - `cogc --emit-exe <out> <file.cg>` (links via system `clang`)
 - Emits: ints/bools, blocks + tail expr, `if/else`, `let` + assignment, struct literals + field access, pointer deref, direct calls, method calls, and `builtin::addr_of(_mut)`.
 

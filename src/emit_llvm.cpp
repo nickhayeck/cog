@@ -2,10 +2,31 @@
 
 #include "comptime.hpp"
 #include "layout.hpp"
+#include "target.hpp"
+
+#include <llvm/ADT/StringMap.h>
+#include <llvm/Bitcode/BitcodeWriter.h>
+#include <llvm/IR/Constants.h>
+#include <llvm/IR/DerivedTypes.h>
+#include <llvm/IR/IRBuilder.h>
+#include <llvm/IR/Instructions.h>
+#include <llvm/IR/LLVMContext.h>
+#include <llvm/IR/LegacyPassManager.h>
+#include <llvm/IR/Module.h>
+#include <llvm/IR/Verifier.h>
+#include <llvm/TargetParser/SubtargetFeature.h>
+#include <llvm/TargetParser/Triple.h>
+#include <llvm/MC/TargetRegistry.h>
+#include <llvm/Support/FileSystem.h>
+#include <llvm/Support/TargetSelect.h>
+#include <llvm/Support/raw_ostream.h>
+#include <llvm/Target/TargetMachine.h>
 
 #include <algorithm>
 #include <cstdint>
-#include <fstream>
+#include <cstdlib>
+#include <filesystem>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -17,10 +38,18 @@
 namespace cog {
 namespace {
 
-struct LlvmValue {
-  std::string ty{};
-  std::string v{};
-};
+// LLVM backend (early).
+//
+// This is a direct AST→LLVM IR emitter for the current v0.0.x subset; it is
+// intentionally simple and prioritizes debuggability over optimization.
+//
+// Key ABI notes (see SPEC.md for the language-level contract):
+// - Pointers are modeled as ordinary LLVM pointers (opaque `ptr`); we do not
+//   attach `noalias` and we assume pointers may alias freely.
+// - `*mut dyn Trait` / `*const dyn Trait` are lowered to `{ data_ptr, vtable_ptr }`
+//   where both fields are `ptr` and vtable slots are laid out in trait-decl order.
+// - Enums are lowered as `{ tag, payload_bytes }` where `payload_bytes` is an
+//   integer array sized/aligned by the layout engine.
 
 static bool is_signed_int(IntKind k) {
   switch (k) {
@@ -86,11 +115,26 @@ static std::string sanitize(std::string_view s) {
   return out;
 }
 
+static bool path_is_ident(const Path* p, std::string_view name) {
+  if (!p || p->segments.size() != 1) return false;
+  return p->segments[0]->text == name;
+}
+
+static bool is_packed(const std::vector<Attr*>& attrs) {
+  for (const Attr* a : attrs) {
+    if (!a || !a->name || !path_is_ident(a->name, "repr") || !a->arg) continue;
+    if (path_is_ident(a->arg, "packed")) return true;
+  }
+  return false;
+}
+
 struct ItemLocator {
   const ResolvedCrate& crate;
   std::unordered_map<const Item*, ModuleId> item_module{};
   std::unordered_map<const ItemFn*, std::string> fn_symbol{};
 
+  // Collects a stable mapping from AST items to their defining module, and
+  // precomputes mangled symbols for functions/methods.
   explicit ItemLocator(const ResolvedCrate& crate) : crate(crate) {
     for (ModuleId mid = 0; mid < crate.modules.size(); mid++) {
       for (const Item* item : crate.modules[mid].items) {
@@ -178,45 +222,48 @@ struct ItemLocator {
   }
 };
 
-class LlvmEmitter {
+struct CgValue {
+  TypeId type = 0;
+  llvm::Value* value = nullptr;  // null means "void" / unit
+};
+
+struct LocalSlot {
+  TypeId type = 0;
+  llvm::AllocaInst* alloca = nullptr;
+};
+
+class LlvmBackend {
  public:
-  LlvmEmitter(Session& session, const ResolvedCrate& crate, CheckedCrate& checked)
+  LlvmBackend(Session& session, const ResolvedCrate& crate, CheckedCrate& checked, const TargetSpec& target)
       : session_(session),
         crate_(crate),
         checked_(checked),
+        target_(target),
         locator_(crate),
-        layout_(session, checked.types, checked.struct_info, checked.enum_info, checked.array_lens),
-        eval_(session, crate, &checked.types, &layout_) {}
+        layout_(session, checked.types, checked.struct_info, checked.enum_info, checked.array_lens, target.layout),
+        eval_(session, crate, &checked.types, &layout_),
+        module_(std::make_unique<llvm::Module>("cog", ctx_)),
+        builder_(ctx_) {}
 
-  bool emit_to_file(const std::filesystem::path& out_ll, bool emit_main_wrapper) {
-    std::ofstream out(out_ll);
-    if (!out.is_open()) {
-      session_.diags.push_back(Diagnostic{
-          .severity = Severity::Error,
-          .span = Span{},
-          .message = "failed to open output file `" + out_ll.string() + "`",
-      });
-      return false;
-    }
+  bool run(const EmitLlvmOptions& opts) {
+    // NOTE: target selection and layout must be consistent across:
+    // - type checking / layout engine (for field offsets, enum layouts, etc)
+    // - the LLVM TargetMachine/DataLayout used here.
+    if (!create_target_machine()) return false;
 
-    build_struct_types();
-    build_enum_types();
+    module_->setTargetTriple(llvm::Triple(target_.triple));
+    module_->setDataLayout(target_machine_->createDataLayout());
+
+    build_nominal_types();
     build_trait_object_types();
-    build_trait_vtables();
     build_function_decls();
+    build_trait_vtables_and_wrappers();
+    build_function_bodies();
+    if (opts.emit_main_wrapper) emit_main_shim();
 
-    out << "; Cog (prototype) LLVM IR\n";
-    out << "target triple = \"" << target_triple() << "\"\n\n";
+    if (!verify_module()) return false;
 
-    for (const auto& line : type_defs_) out << line << "\n";
-    if (!type_defs_.empty()) out << "\n";
-
-    for (const auto& line : globals_) out << line << "\n";
-    if (!globals_.empty()) out << "\n";
-
-    for (auto& fn : functions_) out << fn << "\n\n";
-
-    if (emit_main_wrapper) emit_main_shim(out);
+    if (!write_outputs(opts)) return false;
     return !session_.has_errors();
   }
 
@@ -224,42 +271,125 @@ class LlvmEmitter {
   Session& session_;
   const ResolvedCrate& crate_;
   CheckedCrate& checked_;
+  const TargetSpec& target_;
   ItemLocator locator_;
 
   LayoutEngine layout_;
   ComptimeEvaluator eval_;
 
-  std::vector<std::string> type_defs_{};
-  std::vector<std::string> globals_{};
-  std::vector<std::string> functions_{};
+  llvm::LLVMContext ctx_{};
+  std::unique_ptr<llvm::Module> module_{};
+  llvm::IRBuilder<> builder_;
+  std::unique_ptr<llvm::TargetMachine> target_machine_{};
 
-  std::unordered_map<const ItemStruct*, std::string> struct_type_names_{};
-  std::unordered_map<const ItemEnum*, std::string> enum_type_names_{};
-  std::unordered_map<const ItemTrait*, std::string> dyn_type_names_{};
-  std::unordered_map<const ItemTrait*, std::string> vtable_type_names_{};
+  std::unordered_map<const ItemStruct*, llvm::StructType*> struct_types_{};
+  std::unordered_map<const ItemEnum*, llvm::StructType*> enum_types_{};
+  std::unordered_map<const ItemTrait*, llvm::StructType*> vtable_types_{};
+  std::unordered_map<const ItemTrait*, llvm::StructType*> dyn_types_{};
+
+  std::unordered_map<const ItemFn*, llvm::Function*> fn_decls_{};
+  std::unordered_map<std::string, llvm::Function*> dyn_wrappers_{};
   std::unordered_set<const ItemFn*> emitted_fns_{};
 
-  std::uint32_t ptr_bits() const { return static_cast<std::uint32_t>(sizeof(void*) * 8); }
-
-  std::string target_triple() const {
-#if defined(__APPLE__) && defined(__aarch64__)
-    return "arm64-apple-darwin";
-#elif defined(__APPLE__) && defined(__x86_64__)
-    return "x86_64-apple-darwin";
-#elif defined(__linux__) && defined(__x86_64__)
-    return "x86_64-unknown-linux-gnu";
-#else
-    return "unknown-unknown-unknown";
-#endif
+  void error(Span span, std::string message) {
+    session_.diags.push_back(Diagnostic{.severity = Severity::Error, .span = span, .message = std::move(message)});
   }
 
-  std::string llvm_int_type(IntKind k) const {
-    return "i" + std::to_string(int_bits(k, ptr_bits()));
+  static void ensure_llvm_target_init() {
+    static bool done = false;
+    if (done) return;
+    done = true;
+    llvm::InitializeAllTargetInfos();
+    llvm::InitializeAllTargets();
+    llvm::InitializeAllTargetMCs();
+    llvm::InitializeAllAsmParsers();
+    llvm::InitializeAllAsmPrinters();
+  }
+
+  bool create_target_machine() {
+    ensure_llvm_target_init();
+
+    std::string error_message{};
+    const llvm::Target* target = llvm::TargetRegistry::lookupTarget(target_.triple, error_message);
+    if (!target) {
+      error(Span{}, "LLVM target lookup failed for `" + target_.triple + "`: " + error_message);
+      return false;
+    }
+
+    llvm::TargetOptions opts{};
+    auto reloc = std::optional<llvm::Reloc::Model>{};
+    target_machine_ =
+        std::unique_ptr<llvm::TargetMachine>(target->createTargetMachine(llvm::Triple(target_.triple), target_.cpu, target_.features, opts, reloc));
+    if (!target_machine_) {
+      error(Span{}, "failed to create LLVM TargetMachine for `" + target_.triple + "`");
+      return false;
+    }
+    return true;
+  }
+
+  llvm::PointerType* ptr_ty() { return llvm::PointerType::get(ctx_, 0); }
+
+  std::uint32_t ptr_bits() const { return target_.layout.pointer_bits; }
+
+  llvm::Type* llvm_int_ty(IntKind k) { return llvm::IntegerType::get(ctx_, int_bits(k, ptr_bits())); }
+
+  llvm::Type* llvm_tag_int_bytes(std::uint64_t bytes) { return llvm::IntegerType::get(ctx_, static_cast<unsigned>(bytes * 8)); }
+
+  llvm::Type* llvm_type(TypeId ty) {
+    const TypeData& d = checked_.types.get(ty);
+    switch (d.kind) {
+      case TypeKind::Error:
+        return llvm::Type::getInt8Ty(ctx_);
+      case TypeKind::Unit:
+        return llvm::Type::getVoidTy(ctx_);
+      case TypeKind::Bool:
+        return llvm::Type::getInt1Ty(ctx_);
+      case TypeKind::Int:
+        return llvm_int_ty(d.int_kind);
+      case TypeKind::Ptr: {
+        const TypeData& pd = checked_.types.get(d.pointee);
+        if (pd.kind == TypeKind::DynTrait && pd.trait_def) {
+          return llvm_dyn_type(pd.trait_def);
+        }
+        return ptr_ty();
+      }
+      case TypeKind::Struct:
+        return llvm_struct_type(d.struct_def);
+      case TypeKind::Enum:
+        return llvm_enum_type(d.enum_def);
+      default:
+        error(Span{}, "unsupported type in LLVM backend: " + checked_.types.to_string(ty));
+        return llvm::Type::getInt8Ty(ctx_);
+    }
+  }
+
+  llvm::StructType* llvm_struct_type(const ItemStruct* s) {
+    if (!s) return nullptr;
+    auto it = struct_types_.find(s);
+    return it == struct_types_.end() ? nullptr : it->second;
+  }
+
+  llvm::StructType* llvm_enum_type(const ItemEnum* e) {
+    if (!e) return nullptr;
+    auto it = enum_types_.find(e);
+    return it == enum_types_.end() ? nullptr : it->second;
+  }
+
+  llvm::StructType* llvm_vtable_type(const ItemTrait* tr) {
+    if (!tr) return nullptr;
+    auto it = vtable_types_.find(tr);
+    return it == vtable_types_.end() ? nullptr : it->second;
+  }
+
+  llvm::StructType* llvm_dyn_type(const ItemTrait* tr) {
+    if (!tr) return nullptr;
+    auto it = dyn_types_.find(tr);
+    return it == dyn_types_.end() ? nullptr : it->second;
   }
 
   std::string llvm_struct_type_name(const ItemStruct* s) const {
     ModuleId mid = locator_.module_of(static_cast<const Item*>(s));
-    std::string name = "%struct";
+    std::string name = "struct";
     for (auto part : locator_.module_path(mid)) {
       name += ".";
       name += sanitize(part);
@@ -271,7 +401,7 @@ class LlvmEmitter {
 
   std::string llvm_enum_type_name(const ItemEnum* e) const {
     ModuleId mid = locator_.module_of(static_cast<const Item*>(e));
-    std::string name = "%enum";
+    std::string name = "enum";
     for (auto part : locator_.module_path(mid)) {
       name += ".";
       name += sanitize(part);
@@ -291,162 +421,6 @@ class LlvmEmitter {
     if (!suffix.empty()) suffix += ".";
     suffix += sanitize(tr ? tr->name : "<trait>");
     return suffix;
-  }
-
-  std::string llvm_vtable_type_name(const ItemTrait* tr) {
-    auto it = vtable_type_names_.find(tr);
-    if (it != vtable_type_names_.end()) return it->second;
-    std::string name = "%vtable." + llvm_trait_suffix(tr);
-    vtable_type_names_.insert({tr, name});
-    return name;
-  }
-
-  std::string llvm_dyn_type_name(const ItemTrait* tr) {
-    auto it = dyn_type_names_.find(tr);
-    if (it != dyn_type_names_.end()) return it->second;
-    std::string name = "%dyn." + llvm_trait_suffix(tr);
-    dyn_type_names_.insert({tr, name});
-    return name;
-  }
-
-  std::string llvm_type(TypeId ty) {
-    const TypeData& d = checked_.types.get(ty);
-    switch (d.kind) {
-      case TypeKind::Error:
-        return "i8";
-      case TypeKind::Unit:
-        return "void";
-      case TypeKind::Bool:
-        return "i1";
-      case TypeKind::Int:
-        return llvm_int_type(d.int_kind);
-      case TypeKind::Ptr:
-        if (checked_.types.get(d.pointee).kind == TypeKind::DynTrait) {
-          const TypeData& pd = checked_.types.get(d.pointee);
-          if (pd.trait_def) return llvm_dyn_type_name(pd.trait_def);
-        }
-        return llvm_type(d.pointee) + "*";
-      case TypeKind::Struct: {
-        if (!d.struct_def) return "i8";
-        auto it = struct_type_names_.find(d.struct_def);
-        if (it != struct_type_names_.end()) return it->second;
-        std::string name = llvm_struct_type_name(d.struct_def);
-        struct_type_names_.insert({d.struct_def, name});
-        return name;
-      }
-      case TypeKind::Enum: {
-        if (!d.enum_def) return "i8";
-        auto it = enum_type_names_.find(d.enum_def);
-        if (it != enum_type_names_.end()) return it->second;
-        std::string name = llvm_enum_type_name(d.enum_def);
-        enum_type_names_.insert({d.enum_def, name});
-        return name;
-      }
-      default:
-        session_.diags.push_back(Diagnostic{.severity = Severity::Error, .span = Span{}, .message = "unsupported type in LLVM emission"});
-        return "i8";
-    }
-  }
-
-  TypeId type_of(const Expr* e) const {
-    if (!e) return checked_.types.error();
-    auto it = checked_.expr_types.find(e);
-    if (it == checked_.expr_types.end()) return checked_.types.error();
-    return it->second;
-  }
-
-  std::string mangle_fn(const ItemFn* fn) const {
-    return locator_.symbol_for(fn);
-  }
-
-  void build_struct_types() {
-    for (ModuleId mid = 0; mid < crate_.modules.size(); mid++) {
-      for (const Item* item : crate_.modules[mid].items) {
-        if (!item) continue;
-        if (item->kind != AstNodeKind::ItemStruct) continue;
-        auto* s = static_cast<const ItemStruct*>(item);
-        std::string name = llvm_struct_type_name(s);
-        struct_type_names_[s] = name;
-      }
-    }
-
-    for (const auto& [s, name] : struct_type_names_) {
-      auto it = checked_.struct_info.find(s);
-      if (it == checked_.struct_info.end()) continue;
-      std::ostringstream def;
-      def << name << " = type { ";
-      for (size_t i = 0; i < it->second.fields_in_order.size(); i++) {
-        if (i) def << ", ";
-        def << llvm_type(it->second.fields_in_order[i].type);
-      }
-      def << " }";
-      type_defs_.push_back(def.str());
-    }
-  }
-
-  static std::string llvm_int_bytes(std::uint64_t bytes) {
-    return "i" + std::to_string(bytes * 8);
-  }
-
-  void build_enum_types() {
-    for (ModuleId mid = 0; mid < crate_.modules.size(); mid++) {
-      for (const Item* item : crate_.modules[mid].items) {
-        if (!item) continue;
-        if (item->kind != AstNodeKind::ItemEnum) continue;
-        auto* e = static_cast<const ItemEnum*>(item);
-        enum_type_names_[e] = llvm_enum_type_name(e);
-      }
-    }
-
-    for (const auto& [e, name] : enum_type_names_) {
-      if (!e) continue;
-      auto el = layout_.enum_layout(e, Span{});
-      if (!el) continue;
-
-      std::string tag_ty = llvm_int_bytes(el->tag_size);
-      if (el->payload_size == 0) {
-        type_defs_.push_back(name + " = type { " + tag_ty + " }");
-        continue;
-      }
-
-      std::uint64_t align = std::max<std::uint64_t>(el->payload_align, 1);
-      std::uint64_t words = el->payload_size / align;
-      std::string payload_elem_ty = llvm_int_bytes(align);
-      type_defs_.push_back(name + " = type { " + tag_ty + ", [" + std::to_string(words) + " x " + payload_elem_ty + "] }");
-    }
-  }
-
-  std::string llvm_trait_method_fnptr_type(const TraitMethodInfo& tm) {
-    const FnInfo& sig = tm.sig;
-    std::ostringstream out;
-    out << llvm_type(sig.ret) << " (i8*";
-    for (size_t i = 1; i < sig.params.size(); i++) out << ", " << llvm_type(sig.params[i]);
-    out << ")*";
-    return out.str();
-  }
-
-  void build_trait_object_types() {
-    for (const auto& [tr, set] : checked_.trait_methods) {
-      if (!tr) continue;
-      std::string vt_name = llvm_vtable_type_name(tr);
-      std::string dyn_name = llvm_dyn_type_name(tr);
-
-      std::ostringstream vt_def;
-      vt_def << vt_name << " = type { ";
-      for (size_t i = 0; i < set.order.size(); i++) {
-        if (i) vt_def << ", ";
-        auto it = set.methods.find(set.order[i]);
-        if (it == set.methods.end()) {
-          vt_def << "i8*";
-        } else {
-          vt_def << llvm_trait_method_fnptr_type(it->second);
-        }
-      }
-      vt_def << " }";
-      type_defs_.push_back(vt_def.str());
-
-      type_defs_.push_back(dyn_name + " = type { i8*, " + vt_name + "* }");
-    }
   }
 
   std::string type_suffix_for_item(const Item* item) const {
@@ -490,8 +464,161 @@ class LlvmEmitter {
         "dyncall" + trait_suffix_for_item(tr) + "$for" + type_suffix_for_item(type_item) + "$" + sanitize(method));
   }
 
-  void build_trait_vtables() {
-    std::unordered_set<std::string> emitted_wrappers{};
+  TypeId type_of(const Expr* e) const {
+    if (!e) return checked_.types.error();
+    auto it = checked_.expr_types.find(e);
+    if (it == checked_.expr_types.end()) return checked_.types.error();
+    return it->second;
+  }
+
+  void build_nominal_types() {
+    for (ModuleId mid = 0; mid < crate_.modules.size(); mid++) {
+      for (const Item* item : crate_.modules[mid].items) {
+        if (!item) continue;
+        if (item->kind == AstNodeKind::ItemStruct) {
+          auto* s = static_cast<const ItemStruct*>(item);
+          struct_types_.insert({s, llvm::StructType::create(ctx_, llvm_struct_type_name(s))});
+        } else if (item->kind == AstNodeKind::ItemEnum) {
+          auto* e = static_cast<const ItemEnum*>(item);
+          enum_types_.insert({e, llvm::StructType::create(ctx_, llvm_enum_type_name(e))});
+        }
+      }
+    }
+
+    // Fill bodies (after predecl so pointer recursion can work).
+    for (const auto& [s, st] : struct_types_) {
+      auto info_it = checked_.struct_info.find(s);
+      if (info_it == checked_.struct_info.end()) continue;
+      std::vector<llvm::Type*> elems{};
+      elems.reserve(info_it->second.fields_in_order.size());
+      for (const auto& fld : info_it->second.fields_in_order) elems.push_back(llvm_type(fld.type));
+      st->setBody(elems, is_packed(s->attrs));
+    }
+
+    for (const auto& [e, et] : enum_types_) {
+      auto enum_layout = layout_.enum_layout(e, Span{});
+      if (!enum_layout) continue;
+
+      llvm::Type* tag_ty = llvm_tag_int_bytes(enum_layout->tag_size);
+      if (enum_layout->payload_size == 0) {
+        et->setBody({tag_ty}, /*isPacked=*/false);
+        continue;
+      }
+
+      std::uint64_t align = std::max<std::uint64_t>(enum_layout->payload_align, 1);
+      std::uint64_t words = enum_layout->payload_size / align;
+      llvm::Type* payload_elem_ty = llvm_tag_int_bytes(align);
+      llvm::Type* payload_array_ty = llvm::ArrayType::get(payload_elem_ty, words);
+      et->setBody({tag_ty, payload_array_ty}, /*isPacked=*/false);
+    }
+  }
+
+  void build_trait_object_types() {
+    for (const auto& [tr, method_set] : checked_.trait_methods) {
+      if (!tr) continue;
+
+      std::string vt_name = "vtable." + llvm_trait_suffix(tr);
+      std::string dyn_name = "dyn." + llvm_trait_suffix(tr);
+
+      llvm::StructType* vt = llvm::StructType::create(ctx_, std::move(vt_name));
+      llvm::StructType* dyn = llvm::StructType::create(ctx_, std::move(dyn_name));
+      vtable_types_.insert({tr, vt});
+      dyn_types_.insert({tr, dyn});
+
+      std::vector<llvm::Type*> vt_fields(method_set.order.size(), ptr_ty());
+      vt->setBody(vt_fields, /*isPacked=*/false);
+
+      dyn->setBody({ptr_ty(), ptr_ty()}, /*isPacked=*/false);
+    }
+  }
+
+  llvm::FunctionType* llvm_fn_type(const FnInfo& sig) {
+    std::vector<llvm::Type*> params{};
+    params.reserve(sig.params.size());
+    for (TypeId p : sig.params) params.push_back(llvm_type(p));
+    llvm::Type* ret = llvm_type(sig.ret);
+    return llvm::FunctionType::get(ret, params, /*isVarArg=*/false);
+  }
+
+  llvm::FunctionType* llvm_dyn_method_type(const TraitMethodInfo& tm) {
+    // Vtable entry signature: ret (ptr self, arg1, arg2, ...)
+    std::vector<llvm::Type*> params{};
+    params.reserve(tm.sig.params.size());
+    params.push_back(ptr_ty());
+    for (size_t i = 1; i < tm.sig.params.size(); i++) params.push_back(llvm_type(tm.sig.params[i]));
+    llvm::Type* ret = llvm_type(tm.sig.ret);
+    return llvm::FunctionType::get(ret, params, /*isVarArg=*/false);
+  }
+
+  void build_function_decls() {
+    for (ModuleId mid = 0; mid < crate_.modules.size(); mid++) {
+      for (const Item* item : crate_.modules[mid].items) {
+        if (!item) continue;
+        if (item->kind == AstNodeKind::ItemFn) declare_function(static_cast<const ItemFn*>(item));
+        if (item->kind == AstNodeKind::ItemImplInherent) {
+          auto* impl = static_cast<const ItemImplInherent*>(item);
+          for (const ItemFn* m : impl->methods) declare_function(m);
+        }
+        if (item->kind == AstNodeKind::ItemImplTrait) {
+          auto* impl = static_cast<const ItemImplTrait*>(item);
+          for (const ItemFn* m : impl->methods) declare_function(m);
+        }
+      }
+    }
+  }
+
+  void declare_function(const ItemFn* fn) {
+    if (!fn || !fn->decl || !fn->decl->sig) return;
+    if (fn_decls_.contains(fn)) return;
+
+    auto sig_it = checked_.fn_info.find(fn);
+    if (sig_it == checked_.fn_info.end()) return;
+    llvm::FunctionType* fty = llvm_fn_type(sig_it->second);
+
+    const std::string symbol = locator_.symbol_for(fn);
+    llvm::Function* f = llvm::Function::Create(fty, llvm::GlobalValue::ExternalLinkage, symbol, module_.get());
+    fn_decls_.insert({fn, f});
+  }
+
+  llvm::Function* llvm_fn(const ItemFn* fn) {
+    auto it = fn_decls_.find(fn);
+    return it == fn_decls_.end() ? nullptr : it->second;
+  }
+
+  llvm::Function* get_or_create_dyn_wrapper(
+      const std::string& symbol,
+      const ItemFn* impl_fn,
+      const TraitMethodInfo& tm) {
+    if (auto it = dyn_wrappers_.find(symbol); it != dyn_wrappers_.end()) return it->second;
+
+    llvm::FunctionType* wrapper_ty = llvm_dyn_method_type(tm);
+    llvm::Function* wrapper = llvm::Function::Create(wrapper_ty, llvm::GlobalValue::InternalLinkage, symbol, module_.get());
+    dyn_wrappers_.insert({symbol, wrapper});
+
+    // Wrapper body: call the concrete impl with `self` forwarded (as ptr) and the remaining args.
+    llvm::BasicBlock* entry = llvm::BasicBlock::Create(ctx_, "entry", wrapper);
+    llvm::IRBuilder<> b(entry);
+
+    std::vector<llvm::Value*> args{};
+    args.reserve(wrapper->arg_size());
+    for (llvm::Argument& a : wrapper->args()) args.push_back(&a);
+
+    llvm::Function* callee = llvm_fn(impl_fn);
+    if (!callee) {
+      b.CreateUnreachable();
+      return wrapper;
+    }
+
+    llvm::CallInst* call = b.CreateCall(callee->getFunctionType(), callee, args);
+    if (call->getType()->isVoidTy()) {
+      b.CreateRetVoid();
+    } else {
+      b.CreateRet(call);
+    }
+    return wrapper;
+  }
+
+  void build_trait_vtables_and_wrappers() {
     std::unordered_set<std::string> emitted_vtables{};
 
     for (const auto& [key, impl_methods] : crate_.trait_impl_methods) {
@@ -508,88 +635,42 @@ class LlvmEmitter {
       if (emitted_vtables.contains(vt_sym)) continue;
       emitted_vtables.insert(vt_sym);
 
-      std::string vt_ty = llvm_vtable_type_name(key.trait);
-      std::ostringstream init;
-      init << "@" << vt_sym << " = constant " << vt_ty << " { ";
+      llvm::StructType* vt_ty = llvm_vtable_type(key.trait);
+      if (!vt_ty) continue;
 
-      for (size_t i = 0; i < set.order.size(); i++) {
-        if (i) init << ", ";
-        const std::string& mname = set.order[i];
-        auto mi = set.methods.find(mname);
+      std::vector<llvm::Constant*> fields{};
+      fields.reserve(set.order.size());
+
+      for (const std::string& method_name : set.order) {
+        auto mi = set.methods.find(method_name);
         if (mi == set.methods.end()) {
-          init << "i8* null";
+          fields.push_back(llvm::ConstantPointerNull::get(ptr_ty()));
           continue;
         }
         const TraitMethodInfo& tm = mi->second;
-        std::string fnptr_ty = llvm_trait_method_fnptr_type(tm);
         if (!tm.object_safe) {
-          init << fnptr_ty << " null";
+          fields.push_back(llvm::ConstantPointerNull::get(ptr_ty()));
           continue;
         }
-        auto impl_it = impl_methods.find(mname);
+        auto impl_it = impl_methods.find(method_name);
         if (impl_it == impl_methods.end() || !impl_it->second) {
-          init << fnptr_ty << " null";
+          fields.push_back(llvm::ConstantPointerNull::get(ptr_ty()));
           continue;
         }
+
         const ItemFn* impl_fn = impl_it->second;
-
-        std::string w_sym = wrapper_sym(key.trait, key.type, mname, mid);
-        init << fnptr_ty << " @" << w_sym;
-
-        if (!emitted_wrappers.contains(w_sym)) {
-          emitted_wrappers.insert(w_sym);
-          emit_dyn_wrapper(w_sym, key.trait, key.type, impl_fn, tm);
-        }
+        std::string w_sym = wrapper_sym(key.trait, key.type, method_name, mid);
+        llvm::Function* wrapper = get_or_create_dyn_wrapper(w_sym, impl_fn, tm);
+        fields.push_back(wrapper);
       }
 
-      init << " }";
-      globals_.push_back(init.str());
+      llvm::Constant* init = llvm::ConstantStruct::get(vt_ty, fields);
+      (void)new llvm::GlobalVariable(
+          *module_, vt_ty, /*isConstant=*/true, llvm::GlobalValue::InternalLinkage, init, vt_sym);
     }
   }
 
-  void emit_dyn_wrapper(
-      const std::string& sym,
-      const ItemTrait* tr,
-      const Item* type_item,
-      const ItemFn* impl_fn,
-      const TraitMethodInfo& tm) {
-    auto sig_it = checked_.fn_info.find(impl_fn);
-    if (sig_it == checked_.fn_info.end()) return;
-    const FnInfo& impl_sig = sig_it->second;
-    if (impl_sig.params.empty()) return;
-
-    std::string self_ll_ty = llvm_type(impl_sig.params[0]);
-    std::string ret_ty = llvm_type(tm.sig.ret);
-
-    std::ostringstream header;
-    header << "define " << ret_ty << " @" << sym << "(i8* %self";
-    for (size_t i = 1; i < tm.sig.params.size(); i++) {
-      header << ", " << llvm_type(tm.sig.params[i]) << " %arg" << (i - 1);
-    }
-    header << ") {\n";
-    header << "entry:\n";
-    header << "  %self_typed = bitcast i8* %self to " << self_ll_ty << "\n";
-
-    std::ostringstream args;
-    args << self_ll_ty << " %self_typed";
-    for (size_t i = 1; i < tm.sig.params.size(); i++) {
-      args << ", " << llvm_type(tm.sig.params[i]) << " %arg" << (i - 1);
-    }
-
-    if (ret_ty == "void") {
-      header << "  call void @" << mangle_fn(impl_fn) << "(" << args.str() << ")\n";
-      header << "  ret void\n";
-    } else {
-      header << "  %r = call " << ret_ty << " @" << mangle_fn(impl_fn) << "(" << args.str() << ")\n";
-      header << "  ret " << ret_ty << " %r\n";
-    }
-    header << "}";
-    functions_.push_back(header.str());
-    (void)tr;
-    (void)type_item;
-  }
-
-  void build_function_decls() {
+  void build_function_bodies() {
     for (ModuleId mid = 0; mid < crate_.modules.size(); mid++) {
       for (const Item* item : crate_.modules[mid].items) {
         if (!item) continue;
@@ -606,56 +687,25 @@ class LlvmEmitter {
     }
   }
 
-  struct LlvmBlock {
-    std::string label{};
-    std::vector<std::string> insts{};
-    std::optional<std::string> term{};
-  };
-
   struct FnCtx {
     ModuleId mid = 0;
     const ItemFn* fn = nullptr;
-    std::vector<std::string> entry_allocas{};
-    std::vector<LlvmBlock> blocks{};
-    size_t cur = 0;
-    std::uint64_t temp = 0;
-    std::vector<std::unordered_map<std::string, std::pair<TypeId, std::string>>> scopes{};
+    llvm::Function* llvm_fn = nullptr;
+    std::vector<std::unordered_map<std::string, LocalSlot>> scopes{};
     struct LoopTargets {
-      std::string break_label{};
-      std::string continue_label{};
+      llvm::BasicBlock* break_bb = nullptr;
+      llvm::BasicBlock* continue_bb = nullptr;
     };
     std::vector<LoopTargets> loops{};
-
-    void push_scope() { scopes.emplace_back(); }
-    void pop_scope() {
-      if (!scopes.empty()) scopes.pop_back();
-    }
   };
 
-  std::string new_temp(FnCtx& f) { return "%t" + std::to_string(++f.temp); }
+  void push_scope(FnCtx& f) { f.scopes.emplace_back(); }
 
-  LlvmBlock& cur_block(FnCtx& f) { return f.blocks[f.cur]; }
-
-  void emit_inst(FnCtx& f, std::string line) {
-    LlvmBlock& b = cur_block(f);
-    if (b.term) return;
-    b.insts.push_back(std::move(line));
+  void pop_scope(FnCtx& f) {
+    if (!f.scopes.empty()) f.scopes.pop_back();
   }
 
-  void emit_term(FnCtx& f, std::string line) {
-    LlvmBlock& b = cur_block(f);
-    if (b.term) return;
-    b.term = std::move(line);
-  }
-
-  size_t new_block(FnCtx& f, std::string label) {
-    f.blocks.push_back(LlvmBlock{.label = std::move(label)});
-    return f.blocks.size() - 1;
-  }
-
-  void set_block(FnCtx& f, size_t idx) { f.cur = idx; }
-
-  std::optional<std::pair<TypeId, std::string>> lookup_local(FnCtx& f, std::string_view name) {
+  std::optional<LocalSlot> lookup_local(const FnCtx& f, std::string_view name) const {
     for (auto it = f.scopes.rbegin(); it != f.scopes.rend(); ++it) {
       auto found = it->find(std::string(name));
       if (found != it->end()) return found->second;
@@ -663,9 +713,28 @@ class LlvmEmitter {
     return std::nullopt;
   }
 
-  void declare_local(FnCtx& f, std::string name, TypeId ty, std::string alloca_name) {
-    if (f.scopes.empty()) f.push_scope();
-    f.scopes.back().insert({std::move(name), {ty, std::move(alloca_name)}});
+  void declare_local(FnCtx& f, std::string name, LocalSlot slot) {
+    if (f.scopes.empty()) push_scope(f);
+    f.scopes.back().insert({std::move(name), slot});
+  }
+
+  llvm::AllocaInst* create_entry_alloca(llvm::Function* fn, llvm::Type* ty, std::string_view name) {
+    llvm::IRBuilder<> entry_builder(&fn->getEntryBlock(), fn->getEntryBlock().begin());
+    return entry_builder.CreateAlloca(ty, nullptr, llvm::StringRef(name.data(), name.size()));
+  }
+
+  llvm::Constant* zero_init(llvm::Type* ty) { return llvm::Constant::getNullValue(ty); }
+
+  llvm::Value* emit_load(TypeId ty, llvm::Value* ptr) {
+    llvm::Type* ll_ty = llvm_type(ty);
+    if (ll_ty->isVoidTy()) return nullptr;
+    return builder_.CreateLoad(ll_ty, ptr);
+  }
+
+  void emit_store(TypeId ty, llvm::Value* ptr, llvm::Value* value) {
+    llvm::Type* ll_ty = llvm_type(ty);
+    if (ll_ty->isVoidTy()) return;
+    (void)builder_.CreateStore(value, ptr);
   }
 
   std::optional<size_t> struct_field_index(const ItemStruct* def, std::string_view name) const {
@@ -697,225 +766,178 @@ class LlvmEmitter {
     return &vit->second;
   }
 
-  LlvmValue emit_enum_ctor(FnCtx& f, TypeId enum_ty, const ItemEnum* def, std::string_view variant, const std::vector<Expr*>& args) {
-    auto el = layout_.enum_layout(def, Span{});
-    if (!el) return LlvmValue{.ty = llvm_type(enum_ty), .v = "undef"};
+  llvm::Value* emit_enum_payload_base_i8(TypeId enum_ty, llvm::Value* enum_ptr, const EnumLayout& el) {
+    if (el.payload_size == 0) return nullptr;
+    llvm::StructType* ll_enum = llvm::cast<llvm::StructType>(llvm_type(enum_ty));
+    return builder_.CreateStructGEP(ll_enum, enum_ptr, 1);
+  }
 
-    auto vidx = enum_variant_index(def, variant);
-    const VariantInfo* vi = enum_variant_info(def, variant);
-    if (!vidx || !vi) return LlvmValue{.ty = llvm_type(enum_ty), .v = "undef"};
+  CgValue emit_enum_ctor(FnCtx& f, TypeId enum_ty, const ItemEnum* def, std::string_view variant, const std::vector<Expr*>& args) {
+    auto enum_layout = layout_.enum_layout(def, Span{});
+    if (!enum_layout) return CgValue{.type = enum_ty, .value = llvm::UndefValue::get(llvm_type(enum_ty))};
 
-    std::uint64_t id = ++f.temp;
-    std::string slot = "%e" + std::to_string(id);
-    std::string llty = llvm_type(enum_ty);
-    f.entry_allocas.push_back(slot + " = alloca " + llty);
+    auto variant_index = enum_variant_index(def, variant);
+    const VariantInfo* variant_info = enum_variant_info(def, variant);
+    if (!variant_index || !variant_info) return CgValue{.type = enum_ty, .value = llvm::UndefValue::get(llvm_type(enum_ty))};
 
-    std::string tag_ptr = new_temp(f);
-    std::string tag_ll_ty = llvm_int_bytes(el->tag_size);
-    emit_inst(f, tag_ptr + " = getelementptr inbounds " + llty + ", " + llty + "* " + slot + ", i32 0, i32 0");
-    emit_inst(f, "store " + tag_ll_ty + " " + std::to_string(*vidx) + ", " + tag_ll_ty + "* " + tag_ptr);
+    llvm::StructType* ll_enum = llvm::cast<llvm::StructType>(llvm_type(enum_ty));
+    llvm::AllocaInst* slot = create_entry_alloca(f.llvm_fn, ll_enum, "enum.tmp");
 
-    if (!vi->payload.empty()) {
-      if (args.size() != vi->payload.size()) {
-        session_.diags.push_back(Diagnostic{
-            .severity = Severity::Error,
-            .span = Span{},
-            .message = "enum constructor arity mismatch in codegen",
-        });
-      } else if (el->payload_size != 0) {
-        std::uint64_t payload_align = std::max<std::uint64_t>(el->payload_align, 1);
-        std::uint64_t payload_words = el->payload_size / payload_align;
-        std::string payload_elem_ty = llvm_int_bytes(payload_align);
-        std::string payload_field_ty =
-            "[" + std::to_string(payload_words) + " x " + payload_elem_ty + "]";
+    llvm::Value* tag_ptr = builder_.CreateStructGEP(ll_enum, slot, 0);
+    llvm::Type* tag_ty = llvm_tag_int_bytes(enum_layout->tag_size);
+    llvm::Value* tag_value = llvm::ConstantInt::get(tag_ty, *variant_index);
+    builder_.CreateStore(tag_value, tag_ptr);
 
-        std::string payload_ptr = new_temp(f);
-        emit_inst(
-            f,
-            payload_ptr + " = getelementptr inbounds " + llty + ", " + llty + "* " + slot + ", i32 0, i32 1");
-        std::string payload_i8 = new_temp(f);
-        emit_inst(f, payload_i8 + " = bitcast " + payload_field_ty + "* " + payload_ptr + " to i8*");
-
+    if (!variant_info->payload.empty() && enum_layout->payload_size != 0) {
+      if (args.size() != variant_info->payload.size()) {
+        error(Span{}, "enum constructor arity mismatch in codegen");
+      } else {
+        llvm::Value* payload_base = emit_enum_payload_base_i8(enum_ty, slot, *enum_layout);
         std::uint64_t off = 0;
         for (size_t i = 0; i < args.size(); i++) {
-          TypeId pt = vi->payload[i];
-          auto al = layout_.align_of(pt, Span{});
-          auto sz = layout_.size_of(pt, Span{});
-          if (!al || !sz) return LlvmValue{.ty = llvm_type(enum_ty), .v = "undef"};
+          TypeId payload_ty = variant_info->payload[i];
+          auto al = layout_.align_of(payload_ty, Span{});
+          auto sz = layout_.size_of(payload_ty, Span{});
+          if (!al || !sz) break;
           off = align_up(off, *al);
 
-          LlvmValue av = emit_expr(f, args[i]);
-          std::string gep = new_temp(f);
-          emit_inst(f, gep + " = getelementptr inbounds i8, i8* " + payload_i8 + ", i64 " + std::to_string(off));
-          std::string castp = new_temp(f);
-          emit_inst(f, castp + " = bitcast i8* " + gep + " to " + av.ty + "*");
-          emit_inst(f, "store " + av.ty + " " + av.v + ", " + av.ty + "* " + castp);
-
+          CgValue arg_v = emit_expr(f, args[i]);
+          llvm::Value* gep = builder_.CreateInBoundsGEP(llvm::Type::getInt8Ty(ctx_), payload_base, builder_.getInt64(off));
+          llvm::StoreInst* store = builder_.CreateStore(arg_v.value, gep);
+          store->setAlignment(llvm::Align(*al));
           off += *sz;
         }
       }
     }
 
-    return emit_load(f, enum_ty, slot);
+    llvm::Value* out = builder_.CreateLoad(ll_enum, slot);
+    return CgValue{.type = enum_ty, .value = out};
   }
 
-  std::optional<std::string> emit_enum_payload_base_i8(
-      FnCtx& f, TypeId enum_ty, const ItemEnum* def, std::string_view enum_ptr, const EnumLayout& el) {
-    if (!def) return std::nullopt;
-    if (el.payload_size == 0) return std::nullopt;
-
-    std::uint64_t payload_align = std::max<std::uint64_t>(el.payload_align, 1);
-    std::uint64_t payload_words = el.payload_size / payload_align;
-    std::string payload_elem_ty = llvm_int_bytes(payload_align);
-    std::string payload_field_ty =
-        "[" + std::to_string(payload_words) + " x " + payload_elem_ty + "]";
-
-    std::string llty = llvm_type(enum_ty);
-    std::string payload_ptr = new_temp(f);
-    emit_inst(f, payload_ptr + " = getelementptr inbounds " + llty + ", " + llty + "* " + std::string(enum_ptr) + ", i32 0, i32 1");
-    std::string payload_i8 = new_temp(f);
-    emit_inst(f, payload_i8 + " = bitcast " + payload_field_ty + "* " + payload_ptr + " to i8*");
-    return payload_i8;
-  }
-
-  LlvmValue emit_pat_test(FnCtx& f, const Pattern* pat, TypeId scrut_ty, std::string_view scrut_ptr) {
-    if (!pat) return emit_bool_const(true);
+  llvm::Value* emit_pat_test(FnCtx& f, const Pattern* pat, TypeId scrut_ty, llvm::Value* scrut_ptr) {
+    if (!pat) return builder_.getTrue();
 
     switch (pat->kind) {
       case AstNodeKind::PatWildcard:
-        return emit_bool_const(true);
       case AstNodeKind::PatBinding:
-        return emit_bool_const(true);
+        return builder_.getTrue();
       case AstNodeKind::PatInt: {
-        LlvmValue sv = emit_load(f, scrut_ty, scrut_ptr);
+        llvm::Value* scrut_val = emit_load(scrut_ty, scrut_ptr);
         auto* ip = static_cast<const PatInt*>(pat);
-        LlvmValue cv = emit_int_const(scrut_ty, ip->value);
-        std::string tmp = new_temp(f);
-        emit_inst(f, tmp + " = icmp eq " + sv.ty + " " + sv.v + ", " + cv.v);
-        return LlvmValue{.ty = "i1", .v = tmp};
+        llvm::Value* const_val = llvm::ConstantInt::get(llvm_type(scrut_ty), static_cast<std::uint64_t>(ip->value), /*isSigned=*/true);
+        return builder_.CreateICmpEQ(scrut_val, const_val);
       }
       case AstNodeKind::PatBool: {
-        LlvmValue sv = emit_load(f, scrut_ty, scrut_ptr);
+        llvm::Value* scrut_val = emit_load(scrut_ty, scrut_ptr);
         auto* bp = static_cast<const PatBool*>(pat);
-        std::string tmp = new_temp(f);
-        emit_inst(f, tmp + " = icmp eq i1 " + sv.v + ", " + std::string(bp->value ? "1" : "0"));
-        return LlvmValue{.ty = "i1", .v = tmp};
+        llvm::Value* const_val = llvm::ConstantInt::get(llvm::Type::getInt1Ty(ctx_), bp->value ? 1 : 0);
+        return builder_.CreateICmpEQ(scrut_val, const_val);
       }
       case AstNodeKind::PatOr: {
         auto* o = static_cast<const PatOr*>(pat);
-        LlvmValue lhs = emit_pat_test(f, o->lhs, scrut_ty, scrut_ptr);
-        LlvmValue rhs = emit_pat_test(f, o->rhs, scrut_ty, scrut_ptr);
-        std::string tmp = new_temp(f);
-        emit_inst(f, tmp + " = or i1 " + lhs.v + ", " + rhs.v);
-        return LlvmValue{.ty = "i1", .v = tmp};
+        llvm::Value* lhs = emit_pat_test(f, o->lhs, scrut_ty, scrut_ptr);
+        llvm::Value* rhs = emit_pat_test(f, o->rhs, scrut_ty, scrut_ptr);
+        return builder_.CreateOr(lhs, rhs);
       }
       case AstNodeKind::PatPath:
       case AstNodeKind::PatVariant: {
         const TypeData& td = checked_.types.get(scrut_ty);
         if (td.kind != TypeKind::Enum || !td.enum_def) {
-          session_.diags.push_back(Diagnostic{.severity = Severity::Error, .span = pat->span, .message = "enum pattern on non-enum in codegen"});
-          return emit_bool_const(false);
+          error(pat->span, "enum pattern on non-enum in codegen");
+          return builder_.getFalse();
         }
         const ItemEnum* def = td.enum_def;
-        auto el = layout_.enum_layout(def, Span{});
-        if (!el) return emit_bool_const(false);
+        auto enum_layout = layout_.enum_layout(def, Span{});
+        if (!enum_layout) return builder_.getFalse();
 
-        const Path* p = nullptr;
+        const Path* path = nullptr;
         const std::vector<Pattern*>* args = nullptr;
         if (pat->kind == AstNodeKind::PatPath) {
-          p = static_cast<const PatPath*>(pat)->path;
+          path = static_cast<const PatPath*>(pat)->path;
         } else {
           auto* vp = static_cast<const PatVariant*>(pat);
-          p = vp->path;
+          path = vp->path;
           args = &vp->args;
         }
-        if (!p || p->segments.empty()) return emit_bool_const(false);
-        std::string_view vname = p->segments.back()->text;
-        auto vidx = enum_variant_index(def, vname);
-        const VariantInfo* vi = enum_variant_info(def, vname);
-        if (!vidx || !vi) return emit_bool_const(false);
 
-        std::string llty = llvm_type(scrut_ty);
-        std::string tag_ptr = new_temp(f);
-        std::string tag_ll_ty = llvm_int_bytes(el->tag_size);
-        emit_inst(f, tag_ptr + " = getelementptr inbounds " + llty + ", " + llty + "* " + std::string(scrut_ptr) + ", i32 0, i32 0");
-        std::string tag = new_temp(f);
-        emit_inst(f, tag + " = load " + tag_ll_ty + ", " + tag_ll_ty + "* " + tag_ptr);
-        std::string tag_ok = new_temp(f);
-        emit_inst(f, tag_ok + " = icmp eq " + tag_ll_ty + " " + tag + ", " + std::to_string(*vidx));
+        if (!path || path->segments.empty()) return builder_.getFalse();
+        std::string_view variant_name = path->segments.back()->text;
+        auto variant_index = enum_variant_index(def, variant_name);
+        const VariantInfo* variant_info = enum_variant_info(def, variant_name);
+        if (!variant_index || !variant_info) return builder_.getFalse();
 
-        // Unit variant has no payload checks.
-        if (!args || args->empty()) return LlvmValue{.ty = "i1", .v = tag_ok};
+        llvm::StructType* ll_enum = llvm::cast<llvm::StructType>(llvm_type(scrut_ty));
+        llvm::Value* tag_ptr = builder_.CreateStructGEP(ll_enum, scrut_ptr, 0);
+        llvm::Type* tag_ty = llvm_tag_int_bytes(enum_layout->tag_size);
+        llvm::Value* tag_val = builder_.CreateLoad(tag_ty, tag_ptr);
+        llvm::Value* tag_ok = builder_.CreateICmpEQ(tag_val, llvm::ConstantInt::get(tag_ty, *variant_index));
 
-        if (args->size() != vi->payload.size()) {
-          session_.diags.push_back(Diagnostic{.severity = Severity::Error, .span = pat->span, .message = "variant pattern arity mismatch in codegen"});
-          return LlvmValue{.ty = "i1", .v = tag_ok};
-        }
+        if (!args || args->empty()) return tag_ok;
 
-        auto payload_base = emit_enum_payload_base_i8(f, scrut_ty, def, scrut_ptr, *el);
-        if (!payload_base) return LlvmValue{.ty = "i1", .v = tag_ok};
+        llvm::Value* payload_base = emit_enum_payload_base_i8(scrut_ty, scrut_ptr, *enum_layout);
+        if (!payload_base) return builder_.getFalse();
 
-        std::string cond = tag_ok;
+        llvm::Value* cond = tag_ok;
         std::uint64_t off = 0;
         for (size_t i = 0; i < args->size(); i++) {
-          const Pattern* ap = (*args)[i];
-          if (!ap) continue;
-          if (ap->kind == AstNodeKind::PatWildcard || ap->kind == AstNodeKind::PatBinding) {
-            auto al = layout_.align_of(vi->payload[i], Span{});
-            auto sz = layout_.size_of(vi->payload[i], Span{});
+          const Pattern* arg_pat = (*args)[i];
+          if (!arg_pat) {
+            auto al = layout_.align_of(variant_info->payload[i], Span{});
+            auto sz = layout_.size_of(variant_info->payload[i], Span{});
             if (!al || !sz) break;
             off = align_up(off, *al);
             off += *sz;
             continue;
           }
-          if (ap->kind != AstNodeKind::PatInt && ap->kind != AstNodeKind::PatBool) {
-            session_.diags.push_back(Diagnostic{
-                .severity = Severity::Error,
-                .span = ap->span,
-                .message = "unsupported nested pattern in enum match codegen",
-            });
-            return emit_bool_const(false);
+
+          if (arg_pat->kind == AstNodeKind::PatWildcard || arg_pat->kind == AstNodeKind::PatBinding) {
+            auto al = layout_.align_of(variant_info->payload[i], Span{});
+            auto sz = layout_.size_of(variant_info->payload[i], Span{});
+            if (!al || !sz) break;
+            off = align_up(off, *al);
+            off += *sz;
+            continue;
           }
 
-          TypeId pt = vi->payload[i];
-          auto al = layout_.align_of(pt, Span{});
-          auto sz = layout_.size_of(pt, Span{});
+          if (arg_pat->kind != AstNodeKind::PatInt && arg_pat->kind != AstNodeKind::PatBool) {
+            error(arg_pat->span, "unsupported nested pattern in enum match codegen");
+            return builder_.getFalse();
+          }
+
+          TypeId payload_ty = variant_info->payload[i];
+          auto al = layout_.align_of(payload_ty, Span{});
+          auto sz = layout_.size_of(payload_ty, Span{});
           if (!al || !sz) break;
           off = align_up(off, *al);
 
-          std::string gep = new_temp(f);
-          emit_inst(f, gep + " = getelementptr inbounds i8, i8* " + *payload_base + ", i64 " + std::to_string(off));
-          std::string castp = new_temp(f);
-          std::string pty = llvm_type(pt);
-          emit_inst(f, castp + " = bitcast i8* " + gep + " to " + pty + "*");
-          LlvmValue pv = emit_load(f, pt, castp);
+          llvm::Value* gep = builder_.CreateInBoundsGEP(llvm::Type::getInt8Ty(ctx_), payload_base, builder_.getInt64(off));
+          llvm::Value* pv = builder_.CreateLoad(llvm_type(payload_ty), gep);
 
-          std::string test = new_temp(f);
-          if (ap->kind == AstNodeKind::PatInt) {
-            auto* ip = static_cast<const PatInt*>(ap);
-            LlvmValue cv = emit_int_const(pt, ip->value);
-            emit_inst(f, test + " = icmp eq " + pv.ty + " " + pv.v + ", " + cv.v);
+          llvm::Value* test = builder_.getFalse();
+          if (arg_pat->kind == AstNodeKind::PatInt) {
+            auto* ip = static_cast<const PatInt*>(arg_pat);
+            llvm::Value* cv =
+                llvm::ConstantInt::get(llvm_type(payload_ty), static_cast<std::uint64_t>(ip->value), /*isSigned=*/true);
+            test = builder_.CreateICmpEQ(pv, cv);
           } else {
-            auto* bp = static_cast<const PatBool*>(ap);
-            emit_inst(f, test + " = icmp eq i1 " + pv.v + ", " + std::string(bp->value ? "1" : "0"));
+            auto* bp = static_cast<const PatBool*>(arg_pat);
+            llvm::Value* cv = llvm::ConstantInt::get(llvm::Type::getInt1Ty(ctx_), bp->value ? 1 : 0);
+            test = builder_.CreateICmpEQ(pv, cv);
           }
 
-          std::string both = new_temp(f);
-          emit_inst(f, both + " = and i1 " + cond + ", " + test);
-          cond = both;
-
+          cond = builder_.CreateAnd(cond, test);
           off += *sz;
         }
 
-        return LlvmValue{.ty = "i1", .v = cond};
+        return cond;
       }
       default:
-        session_.diags.push_back(Diagnostic{.severity = Severity::Error, .span = pat->span, .message = "unsupported pattern in codegen"});
-        return emit_bool_const(false);
+        error(pat->span, "unsupported pattern in codegen");
+        return builder_.getFalse();
     }
   }
 
-  void emit_pat_bindings(FnCtx& f, const Pattern* pat, TypeId scrut_ty, std::string_view scrut_ptr) {
+  void emit_pat_bindings(FnCtx& f, const Pattern* pat, TypeId scrut_ty, llvm::Value* scrut_ptr) {
     if (!pat) return;
     switch (pat->kind) {
       case AstNodeKind::PatWildcard:
@@ -926,12 +948,11 @@ class LlvmEmitter {
         return;
       case AstNodeKind::PatBinding: {
         auto* b = static_cast<const PatBinding*>(pat);
-        std::string slot = "%l" + std::to_string(++f.temp);
-        std::string lty = llvm_type(scrut_ty);
-        f.entry_allocas.push_back(slot + " = alloca " + lty);
-        LlvmValue v = emit_load(f, scrut_ty, scrut_ptr);
-        emit_store(f, scrut_ty, slot, v);
-        declare_local(f, b->name, scrut_ty, slot);
+        llvm::Type* ll_ty = llvm_type(scrut_ty);
+        llvm::AllocaInst* slot = create_entry_alloca(f.llvm_fn, ll_ty, "pat");
+        llvm::Value* v = emit_load(scrut_ty, scrut_ptr);
+        emit_store(scrut_ty, slot, v);
+        declare_local(f, b->name, LocalSlot{.type = scrut_ty, .alloca = slot});
         return;
       }
       case AstNodeKind::PatVariant: {
@@ -939,48 +960,38 @@ class LlvmEmitter {
         const TypeData& td = checked_.types.get(scrut_ty);
         if (td.kind != TypeKind::Enum || !td.enum_def) return;
         const ItemEnum* def = td.enum_def;
-        if (!vp->path || vp->path->segments.empty()) return;
-        std::string_view vname = vp->path->segments.back()->text;
-        const VariantInfo* vi = enum_variant_info(def, vname);
-        if (!vi) return;
-        if (vp->args.size() != vi->payload.size()) return;
 
-        auto el = layout_.enum_layout(def, Span{});
-        if (!el) return;
-        auto payload_base = emit_enum_payload_base_i8(f, scrut_ty, def, scrut_ptr, *el);
+        if (!vp->path || vp->path->segments.empty()) return;
+        std::string_view variant_name = vp->path->segments.back()->text;
+        const VariantInfo* variant_info = enum_variant_info(def, variant_name);
+        if (!variant_info) return;
+        if (vp->args.size() != variant_info->payload.size()) return;
+
+        auto enum_layout = layout_.enum_layout(def, Span{});
+        if (!enum_layout) return;
+        llvm::Value* payload_base = emit_enum_payload_base_i8(scrut_ty, scrut_ptr, *enum_layout);
         if (!payload_base) return;
 
         std::uint64_t off = 0;
         for (size_t i = 0; i < vp->args.size(); i++) {
-          TypeId pt = vi->payload[i];
-          auto al = layout_.align_of(pt, Span{});
-          auto sz = layout_.size_of(pt, Span{});
+          TypeId payload_ty = variant_info->payload[i];
+          auto al = layout_.align_of(payload_ty, Span{});
+          auto sz = layout_.size_of(payload_ty, Span{});
           if (!al || !sz) return;
           off = align_up(off, *al);
 
-          const Pattern* ap = vp->args[i];
-          if (ap) {
-            // Only bind `_`/ident patterns for now.
-            if (ap->kind == AstNodeKind::PatBinding) {
-              std::string gep = new_temp(f);
-              emit_inst(f, gep + " = getelementptr inbounds i8, i8* " + *payload_base + ", i64 " + std::to_string(off));
-              std::string castp = new_temp(f);
-              std::string pty = llvm_type(pt);
-              emit_inst(f, castp + " = bitcast i8* " + gep + " to " + pty + "*");
+          const Pattern* arg_pat = vp->args[i];
+          if (arg_pat && arg_pat->kind == AstNodeKind::PatBinding) {
+            llvm::Value* gep = builder_.CreateInBoundsGEP(llvm::Type::getInt8Ty(ctx_), payload_base, builder_.getInt64(off));
+            llvm::Value* v = builder_.CreateLoad(llvm_type(payload_ty), gep);
 
-              auto* b = static_cast<const PatBinding*>(ap);
-              std::string slot = "%l" + std::to_string(++f.temp);
-              f.entry_allocas.push_back(slot + " = alloca " + pty);
-              LlvmValue v = emit_load(f, pt, castp);
-              emit_store(f, pt, slot, v);
-              declare_local(f, b->name, pt, slot);
-            } else if (ap->kind != AstNodeKind::PatWildcard && ap->kind != AstNodeKind::PatInt && ap->kind != AstNodeKind::PatBool) {
-              session_.diags.push_back(Diagnostic{
-                  .severity = Severity::Error,
-                  .span = ap->span,
-                  .message = "unsupported nested binding pattern in enum match codegen",
-              });
-            }
+            auto* b = static_cast<const PatBinding*>(arg_pat);
+            llvm::AllocaInst* slot = create_entry_alloca(f.llvm_fn, llvm_type(payload_ty), b->name);
+            builder_.CreateStore(v, slot);
+            declare_local(f, b->name, LocalSlot{.type = payload_ty, .alloca = slot});
+          } else if (arg_pat && arg_pat->kind != AstNodeKind::PatWildcard && arg_pat->kind != AstNodeKind::PatInt &&
+                     arg_pat->kind != AstNodeKind::PatBool) {
+            error(arg_pat->span, "unsupported nested binding pattern in enum match codegen");
           }
 
           off += *sz;
@@ -988,179 +999,9 @@ class LlvmEmitter {
         return;
       }
       default:
-        session_.diags.push_back(Diagnostic{.severity = Severity::Error, .span = pat->span, .message = "unsupported binding pattern in codegen"});
+        error(pat->span, "unsupported binding pattern in codegen");
         return;
     }
-  }
-
-  LlvmValue emit_expr(FnCtx& f, const Expr* e);
-  void emit_stmt(FnCtx& f, const Stmt* s);
-  LlvmValue emit_block(FnCtx& f, const Block* b);
-
-  std::optional<std::pair<TypeId, std::string>> emit_place_ptr(FnCtx& f, const Expr* e) {
-    if (!e) return std::nullopt;
-    switch (e->kind) {
-      case AstNodeKind::ExprPath: {
-        auto* p = static_cast<const ExprPath*>(e);
-        if (!p->path || p->path->segments.size() != 1) return std::nullopt;
-        auto local = lookup_local(f, p->path->segments[0]->text);
-        if (!local) return std::nullopt;
-        return std::pair<TypeId, std::string>{local->first, local->second};
-      }
-      case AstNodeKind::ExprUnary: {
-        auto* u = static_cast<const ExprUnary*>(e);
-        if (u->op != UnaryOp::Deref) return std::nullopt;
-        TypeId pt = type_of(u->expr);
-        const TypeData& pd = checked_.types.get(pt);
-        if (pd.kind != TypeKind::Ptr) return std::nullopt;
-        LlvmValue pv = emit_expr(f, u->expr);
-        return std::pair<TypeId, std::string>{pd.pointee, pv.v};
-      }
-      case AstNodeKind::ExprField: {
-        auto* fe = static_cast<const ExprField*>(e);
-        TypeId base_ty = type_of(fe->base);
-        const TypeData& bd = checked_.types.get(base_ty);
-
-        const ItemStruct* sdef = nullptr;
-        TypeId struct_ty = base_ty;
-        std::string base_ptr{};
-
-        if (bd.kind == TypeKind::Ptr) {
-          struct_ty = bd.pointee;
-          const TypeData& sd = checked_.types.get(struct_ty);
-          if (sd.kind != TypeKind::Struct || !sd.struct_def) return std::nullopt;
-          sdef = sd.struct_def;
-          LlvmValue bp = emit_expr(f, fe->base);
-          base_ptr = bp.v;
-        } else if (bd.kind == TypeKind::Struct) {
-          sdef = bd.struct_def;
-          if (fe->base->kind == AstNodeKind::ExprPath) {
-            auto* p = static_cast<const ExprPath*>(fe->base);
-            if (p->path && p->path->segments.size() == 1) {
-              auto local = lookup_local(f, p->path->segments[0]->text);
-              if (local) base_ptr = local->second;
-            }
-          }
-          if (base_ptr.empty()) return std::nullopt;
-        } else {
-          return std::nullopt;
-        }
-
-        auto idx = struct_field_index(sdef, fe->field);
-        if (!idx) return std::nullopt;
-
-        TypeId field_ty = type_of(e);
-        std::string tmp = new_temp(f);
-        std::string st = llvm_type(struct_ty);
-        emit_inst(f, tmp + " = getelementptr inbounds " + st + ", " + st + "* " + base_ptr + ", i32 0, i32 " +
-                         std::to_string(*idx));
-        return std::pair<TypeId, std::string>{field_ty, tmp};
-      }
-      default:
-        break;
-    }
-    return std::nullopt;
-  }
-
-  LlvmValue emit_load(FnCtx& f, TypeId ty, std::string_view ptr) {
-    std::string tmp = new_temp(f);
-    std::string lty = llvm_type(ty);
-    emit_inst(f, tmp + " = load " + lty + ", " + lty + "* " + std::string(ptr));
-    return LlvmValue{.ty = lty, .v = tmp};
-  }
-
-  void emit_store(FnCtx& f, TypeId ty, std::string_view ptr, const LlvmValue& v) {
-    std::string lty = llvm_type(ty);
-    emit_inst(f, "store " + lty + " " + v.v + ", " + lty + "* " + std::string(ptr));
-  }
-
-  LlvmValue emit_int_const(TypeId ty, std::int64_t v) {
-    const TypeData& d = checked_.types.get(ty);
-    if (d.kind != TypeKind::Int) return LlvmValue{.ty = "i32", .v = "0"};
-    return LlvmValue{.ty = llvm_int_type(d.int_kind), .v = std::to_string(v)};
-  }
-
-  LlvmValue emit_bool_const(bool b) { return LlvmValue{.ty = "i1", .v = b ? "1" : "0"}; }
-
-  LlvmValue emit_cast(FnCtx& f, const LlvmValue& from, TypeId from_ty, TypeId to_ty) {
-    const TypeData& fd = checked_.types.get(from_ty);
-    const TypeData& td = checked_.types.get(to_ty);
-    std::string dst_ty = llvm_type(to_ty);
-
-    // Trait object unsizing cast: `*T as *dyn Trait`.
-    if (fd.kind == TypeKind::Ptr && td.kind == TypeKind::Ptr && checked_.types.get(td.pointee).kind == TypeKind::DynTrait) {
-      const TypeData& dyn_d = checked_.types.get(td.pointee);
-      const ItemTrait* tr = dyn_d.trait_def;
-      if (!tr) return LlvmValue{.ty = dst_ty, .v = "undef"};
-
-      const TypeData& from_pointee = checked_.types.get(fd.pointee);
-      const Item* type_item = nullptr;
-      if (from_pointee.kind == TypeKind::Struct) type_item = static_cast<const Item*>(from_pointee.struct_def);
-      if (from_pointee.kind == TypeKind::Enum) type_item = static_cast<const Item*>(from_pointee.enum_def);
-      if (!type_item) {
-        session_.diags.push_back(Diagnostic{.severity = Severity::Error, .span = Span{}, .message = "dyn cast requires a nominal source pointer"});
-        return LlvmValue{.ty = dst_ty, .v = "undef"};
-      }
-
-      TraitImplKey key{.trait = tr, .type = type_item};
-      auto impl_it = crate_.trait_impl_methods.find(key);
-      if (impl_it == crate_.trait_impl_methods.end()) {
-        session_.diags.push_back(Diagnostic{.severity = Severity::Error, .span = Span{}, .message = "no impl for dyn cast target trait"});
-        return LlvmValue{.ty = dst_ty, .v = "undef"};
-      }
-
-      ModuleId mid = 0;
-      if (!impl_it->second.empty() && impl_it->second.begin()->second) {
-        mid = locator_.module_of(static_cast<const Item*>(impl_it->second.begin()->second));
-      } else {
-        mid = locator_.module_of(type_item);
-      }
-      std::string vt_sym = vtable_global_sym(tr, type_item, mid);
-      std::string vt_ty = llvm_vtable_type_name(tr);
-
-      std::string data = new_temp(f);
-      emit_inst(f, data + " = bitcast " + from.ty + " " + from.v + " to i8*");
-
-      std::string agg1 = new_temp(f);
-      emit_inst(f, agg1 + " = insertvalue " + dst_ty + " undef, i8* " + data + ", 0");
-      std::string agg2 = new_temp(f);
-      emit_inst(f, agg2 + " = insertvalue " + dst_ty + " " + agg1 + ", " + vt_ty + "* @" + vt_sym + ", 1");
-      return LlvmValue{.ty = dst_ty, .v = agg2};
-    }
-
-    if (fd.kind == TypeKind::Int && td.kind == TypeKind::Int) {
-      std::uint32_t fb = int_bits(fd.int_kind, ptr_bits());
-      std::uint32_t tb = int_bits(td.int_kind, ptr_bits());
-      if (fb == tb) return LlvmValue{.ty = dst_ty, .v = from.v};
-      std::string tmp = new_temp(f);
-      bool sign = is_signed_int(fd.int_kind);
-      if (fb < tb) {
-        emit_inst(f, tmp + " = " + std::string(sign ? "sext" : "zext") + " " + from.ty + " " + from.v + " to " + dst_ty);
-      } else {
-        emit_inst(f, tmp + " = trunc " + from.ty + " " + from.v + " to " + dst_ty);
-      }
-      return LlvmValue{.ty = dst_ty, .v = tmp};
-    }
-
-    if (fd.kind == TypeKind::Int && td.kind == TypeKind::Ptr) {
-      std::string tmp = new_temp(f);
-      emit_inst(f, tmp + " = inttoptr " + from.ty + " " + from.v + " to " + dst_ty);
-      return LlvmValue{.ty = dst_ty, .v = tmp};
-    }
-
-    if (fd.kind == TypeKind::Ptr && td.kind == TypeKind::Int) {
-      std::string tmp = new_temp(f);
-      emit_inst(f, tmp + " = ptrtoint " + from.ty + " " + from.v + " to " + dst_ty);
-      return LlvmValue{.ty = dst_ty, .v = tmp};
-    }
-
-    if (fd.kind == TypeKind::Ptr && td.kind == TypeKind::Ptr) {
-      std::string tmp = new_temp(f);
-      emit_inst(f, tmp + " = bitcast " + from.ty + " " + from.v + " to " + dst_ty);
-      return LlvmValue{.ty = dst_ty, .v = tmp};
-    }
-
-    return LlvmValue{.ty = dst_ty, .v = from.v};
   }
 
   std::optional<const ItemFn*> resolve_fn_path(ModuleId mid, const Path* path) const {
@@ -1198,10 +1039,767 @@ class LlvmEmitter {
     return it->second;
   }
 
+  std::optional<std::pair<TypeId, llvm::Value*>> emit_place_ptr(FnCtx& f, const Expr* e) {
+    if (!e) return std::nullopt;
+
+    switch (e->kind) {
+      case AstNodeKind::ExprPath: {
+        auto* p = static_cast<const ExprPath*>(e);
+        if (!p->path || p->path->segments.size() != 1) return std::nullopt;
+        auto local = lookup_local(f, p->path->segments[0]->text);
+        if (!local || !local->alloca) return std::nullopt;
+        return std::pair<TypeId, llvm::Value*>{local->type, local->alloca};
+      }
+      case AstNodeKind::ExprUnary: {
+        auto* u = static_cast<const ExprUnary*>(e);
+        if (u->op != UnaryOp::Deref) return std::nullopt;
+        TypeId ptr_ty_id = type_of(u->expr);
+        const TypeData& ptr_td = checked_.types.get(ptr_ty_id);
+        if (ptr_td.kind != TypeKind::Ptr) return std::nullopt;
+        CgValue pv = emit_expr(f, u->expr);
+        if (!pv.value) return std::nullopt;
+        return std::pair<TypeId, llvm::Value*>{ptr_td.pointee, pv.value};
+      }
+      case AstNodeKind::ExprField: {
+        auto* fe = static_cast<const ExprField*>(e);
+        TypeId base_ty = type_of(fe->base);
+        const TypeData& bd = checked_.types.get(base_ty);
+
+        const ItemStruct* sdef = nullptr;
+        TypeId struct_ty = base_ty;
+        llvm::Value* base_ptr = nullptr;
+
+        if (bd.kind == TypeKind::Ptr) {
+          struct_ty = bd.pointee;
+          const TypeData& sd = checked_.types.get(struct_ty);
+          if (sd.kind != TypeKind::Struct || !sd.struct_def) return std::nullopt;
+          sdef = sd.struct_def;
+          CgValue bp = emit_expr(f, fe->base);
+          base_ptr = bp.value;
+        } else if (bd.kind == TypeKind::Struct) {
+          sdef = bd.struct_def;
+          if (fe->base->kind != AstNodeKind::ExprPath) return std::nullopt;
+          const Path* p = static_cast<const ExprPath*>(fe->base)->path;
+          if (!p || p->segments.size() != 1) return std::nullopt;
+          auto local = lookup_local(f, p->segments[0]->text);
+          if (!local || !local->alloca) return std::nullopt;
+          base_ptr = local->alloca;
+        } else {
+          return std::nullopt;
+        }
+
+        auto idx = struct_field_index(sdef, fe->field);
+        if (!idx) return std::nullopt;
+
+        llvm::StructType* ll_struct = llvm::cast<llvm::StructType>(llvm_type(struct_ty));
+        llvm::Value* field_ptr = builder_.CreateStructGEP(ll_struct, base_ptr, static_cast<unsigned>(*idx));
+        TypeId field_ty = type_of(e);
+        return std::pair<TypeId, llvm::Value*>{field_ty, field_ptr};
+      }
+      default:
+        return std::nullopt;
+    }
+  }
+
+  CgValue emit_cast([[maybe_unused]] FnCtx& f, const CgValue& from, TypeId to_ty) {
+    TypeId from_ty = from.type;
+    const TypeData& from_d = checked_.types.get(from_ty);
+    const TypeData& to_d = checked_.types.get(to_ty);
+
+    // Trait object unsizing cast: `*T as *dyn Trait`.
+    if (from_d.kind == TypeKind::Ptr && to_d.kind == TypeKind::Ptr && checked_.types.get(to_d.pointee).kind == TypeKind::DynTrait) {
+      const TypeData& dyn_d = checked_.types.get(to_d.pointee);
+      const ItemTrait* tr = dyn_d.trait_def;
+      if (!tr) return CgValue{.type = to_ty, .value = llvm::UndefValue::get(llvm_type(to_ty))};
+
+      const TypeData& from_pointee = checked_.types.get(from_d.pointee);
+      const Item* type_item = nullptr;
+      if (from_pointee.kind == TypeKind::Struct) type_item = static_cast<const Item*>(from_pointee.struct_def);
+      if (from_pointee.kind == TypeKind::Enum) type_item = static_cast<const Item*>(from_pointee.enum_def);
+      if (!type_item) {
+        error(Span{}, "dyn cast requires a nominal source pointer");
+        return CgValue{.type = to_ty, .value = llvm::UndefValue::get(llvm_type(to_ty))};
+      }
+
+      TraitImplKey key{.trait = tr, .type = type_item};
+      auto impl_it = crate_.trait_impl_methods.find(key);
+      if (impl_it == crate_.trait_impl_methods.end()) {
+        error(Span{}, "no impl for dyn cast target trait");
+        return CgValue{.type = to_ty, .value = llvm::UndefValue::get(llvm_type(to_ty))};
+      }
+
+      ModuleId mid = 0;
+      if (!impl_it->second.empty() && impl_it->second.begin()->second) {
+        mid = locator_.module_of(static_cast<const Item*>(impl_it->second.begin()->second));
+      } else {
+        mid = locator_.module_of(type_item);
+      }
+      std::string vt_sym = vtable_global_sym(tr, type_item, mid);
+      llvm::GlobalVariable* vtable = module_->getNamedGlobal(vt_sym);
+      if (!vtable) {
+        error(Span{}, "missing vtable global in dyn cast");
+        return CgValue{.type = to_ty, .value = llvm::UndefValue::get(llvm_type(to_ty))};
+      }
+
+      llvm::StructType* dyn_ty = llvm_dyn_type(tr);
+      llvm::Value* agg = llvm::UndefValue::get(dyn_ty);
+      agg = builder_.CreateInsertValue(agg, from.value, {0});
+      agg = builder_.CreateInsertValue(agg, vtable, {1});
+      return CgValue{.type = to_ty, .value = agg};
+    }
+
+    llvm::Type* dst_ll_ty = llvm_type(to_ty);
+    if (from_d.kind == TypeKind::Int && to_d.kind == TypeKind::Int) {
+      std::uint32_t from_bits = int_bits(from_d.int_kind, ptr_bits());
+      std::uint32_t to_bits = int_bits(to_d.int_kind, ptr_bits());
+      if (from_bits == to_bits) return CgValue{.type = to_ty, .value = from.value};
+      bool signed_from = is_signed_int(from_d.int_kind);
+      if (from_bits < to_bits) {
+        llvm::Value* out = signed_from ? builder_.CreateSExt(from.value, dst_ll_ty) : builder_.CreateZExt(from.value, dst_ll_ty);
+        return CgValue{.type = to_ty, .value = out};
+      }
+      return CgValue{.type = to_ty, .value = builder_.CreateTrunc(from.value, dst_ll_ty)};
+    }
+
+    if (from_d.kind == TypeKind::Int && to_d.kind == TypeKind::Ptr) {
+      return CgValue{.type = to_ty, .value = builder_.CreateIntToPtr(from.value, ptr_ty())};
+    }
+
+    if (from_d.kind == TypeKind::Ptr && to_d.kind == TypeKind::Int) {
+      return CgValue{.type = to_ty, .value = builder_.CreatePtrToInt(from.value, dst_ll_ty)};
+    }
+
+    if (from_d.kind == TypeKind::Ptr && to_d.kind == TypeKind::Ptr) {
+      // Opaque pointers make this a no-op; keep it explicit for readability in IR dumps.
+      return CgValue{.type = to_ty, .value = builder_.CreateBitCast(from.value, ptr_ty())};
+    }
+
+    return CgValue{.type = to_ty, .value = from.value};
+  }
+
+  CgValue emit_expr(FnCtx& f, const Expr* e) {
+    if (!e) return CgValue{.type = checked_.types.unit(), .value = nullptr};
+
+    TypeId ty = type_of(e);
+    const TypeData& td = checked_.types.get(ty);
+
+    switch (e->kind) {
+      case AstNodeKind::ExprUnit:
+        return CgValue{.type = ty, .value = nullptr};
+      case AstNodeKind::ExprBool: {
+        auto* b = static_cast<const ExprBool*>(e);
+        return CgValue{.type = ty, .value = llvm::ConstantInt::get(llvm::Type::getInt1Ty(ctx_), b->value ? 1 : 0)};
+      }
+      case AstNodeKind::ExprInt: {
+        auto* i = static_cast<const ExprInt*>(e);
+        llvm::Type* ll_ty = llvm_type(ty);
+        return CgValue{.type = ty, .value = llvm::ConstantInt::get(ll_ty, static_cast<std::uint64_t>(i->value), /*isSigned=*/true)};
+      }
+      case AstNodeKind::ExprStructLit: {
+        auto* sl = static_cast<const ExprStructLit*>(e);
+        if (td.kind != TypeKind::Struct || !td.struct_def) {
+          error(e->span, "struct literal has non-struct type");
+          return CgValue{.type = ty, .value = llvm::UndefValue::get(llvm_type(ty))};
+        }
+        auto info_it = checked_.struct_info.find(td.struct_def);
+        if (info_it == checked_.struct_info.end()) return CgValue{.type = ty, .value = llvm::UndefValue::get(llvm_type(ty))};
+
+        std::unordered_map<std::string_view, const Expr*> init_map{};
+        for (const FieldInit* fi : sl->inits) {
+          if (fi) init_map[fi->name] = fi->value;
+        }
+
+        llvm::Type* agg_ty = llvm_type(ty);
+        llvm::Value* agg = llvm::UndefValue::get(agg_ty);
+        for (size_t field_index = 0; field_index < info_it->second.fields_in_order.size(); field_index++) {
+          const auto& fld = info_it->second.fields_in_order[field_index];
+          auto init_it = init_map.find(fld.name);
+          if (init_it == init_map.end() || !init_it->second) {
+            error(e->span, "missing field initializer `" + fld.name + "` in codegen");
+            continue;
+          }
+          CgValue fv = emit_expr(f, init_it->second);
+          agg = builder_.CreateInsertValue(agg, fv.value, {static_cast<unsigned>(field_index)});
+        }
+        return CgValue{.type = ty, .value = agg};
+      }
+      case AstNodeKind::ExprPath: {
+        auto* p = static_cast<const ExprPath*>(e);
+        if (!p->path || p->path->segments.empty()) return CgValue{.type = ty, .value = zero_init(llvm_type(ty))};
+
+        if (p->path->segments.size() == 1) {
+          if (auto local = lookup_local(f, p->path->segments[0]->text)) {
+            llvm::Value* v = emit_load(local->type, local->alloca);
+            return CgValue{.type = local->type, .value = v};
+          }
+        }
+
+        if (const Item* item = resolve_value_item(f.mid, p->path)) {
+          if (item->kind == AstNodeKind::ItemConst) {
+            auto v = eval_.eval_const(static_cast<const ItemConst*>(item));
+            if (!v) return CgValue{.type = ty, .value = zero_init(llvm_type(ty))};
+            if (v->kind == ComptimeValue::Kind::Int) {
+              return CgValue{.type = ty, .value = llvm::ConstantInt::get(llvm_type(ty), static_cast<std::uint64_t>(v->int_value), true)};
+            }
+            if (v->kind == ComptimeValue::Kind::Bool) {
+              return CgValue{.type = ty, .value = llvm::ConstantInt::get(llvm::Type::getInt1Ty(ctx_), v->bool_value ? 1 : 0)};
+            }
+          }
+        }
+
+        // Enum unit variant value `Enum::Variant`.
+        if (td.kind == TypeKind::Enum && td.enum_def && p->path->segments.size() >= 2) {
+          std::string_view variant_name = p->path->segments.back()->text;
+          if (const VariantInfo* vi = enum_variant_info(td.enum_def, variant_name)) {
+            if (vi->payload.empty()) {
+              std::vector<Expr*> no_args{};
+              return emit_enum_ctor(f, ty, td.enum_def, variant_name, no_args);
+            }
+          }
+        }
+
+        error(e->span, "unsupported path expression in codegen");
+        return CgValue{.type = ty, .value = zero_init(llvm_type(ty))};
+      }
+      case AstNodeKind::ExprBlock:
+        return emit_block(f, static_cast<const ExprBlock*>(e)->block);
+      case AstNodeKind::ExprIf: {
+        auto* iff = static_cast<const ExprIf*>(e);
+        llvm::Value* cond = emit_expr(f, iff->cond).value;
+
+        llvm::Function* fn = builder_.GetInsertBlock()->getParent();
+        llvm::BasicBlock* then_bb = llvm::BasicBlock::Create(ctx_, "then", fn);
+        llvm::BasicBlock* else_bb = llvm::BasicBlock::Create(ctx_, "else", fn);
+        llvm::BasicBlock* end_bb = llvm::BasicBlock::Create(ctx_, "endif", fn);
+
+        llvm::AllocaInst* out_slot = nullptr;
+        llvm::Type* out_ty = llvm_type(ty);
+        if (!out_ty->isVoidTy()) out_slot = create_entry_alloca(fn, out_ty, "if.out");
+
+        builder_.CreateCondBr(cond, then_bb, else_bb);
+
+        builder_.SetInsertPoint(then_bb);
+        CgValue then_v = emit_block(f, iff->then_block);
+        if (!builder_.GetInsertBlock()->getTerminator()) {
+          if (out_slot) builder_.CreateStore(then_v.value, out_slot);
+          builder_.CreateBr(end_bb);
+        }
+
+        builder_.SetInsertPoint(else_bb);
+        CgValue else_v{.type = checked_.types.unit(), .value = nullptr};
+        if (iff->else_expr) else_v = emit_expr(f, iff->else_expr);
+        if (!builder_.GetInsertBlock()->getTerminator()) {
+          if (out_slot) {
+            llvm::Value* stored = else_v.value ? else_v.value : zero_init(out_ty);
+            builder_.CreateStore(stored, out_slot);
+          }
+          builder_.CreateBr(end_bb);
+        }
+
+        builder_.SetInsertPoint(end_bb);
+        if (!out_slot) return CgValue{.type = ty, .value = nullptr};
+        llvm::Value* loaded = builder_.CreateLoad(out_ty, out_slot);
+        return CgValue{.type = ty, .value = loaded};
+      }
+      case AstNodeKind::ExprWhile: {
+        auto* wh = static_cast<const ExprWhile*>(e);
+
+        llvm::Function* fn = builder_.GetInsertBlock()->getParent();
+        llvm::BasicBlock* cond_bb = llvm::BasicBlock::Create(ctx_, "while.cond", fn);
+        llvm::BasicBlock* body_bb = llvm::BasicBlock::Create(ctx_, "while.body", fn);
+        llvm::BasicBlock* end_bb = llvm::BasicBlock::Create(ctx_, "while.end", fn);
+
+        builder_.CreateBr(cond_bb);
+
+        builder_.SetInsertPoint(cond_bb);
+        llvm::Value* cond = emit_expr(f, wh->cond).value;
+        builder_.CreateCondBr(cond, body_bb, end_bb);
+
+        builder_.SetInsertPoint(body_bb);
+        f.loops.push_back(FnCtx::LoopTargets{.break_bb = end_bb, .continue_bb = cond_bb});
+        (void)emit_block(f, wh->body);
+        f.loops.pop_back();
+        if (!builder_.GetInsertBlock()->getTerminator()) builder_.CreateBr(cond_bb);
+
+        builder_.SetInsertPoint(end_bb);
+        return CgValue{.type = ty, .value = nullptr};
+      }
+      case AstNodeKind::ExprLoop: {
+        auto* lp = static_cast<const ExprLoop*>(e);
+
+        llvm::Function* fn = builder_.GetInsertBlock()->getParent();
+        llvm::BasicBlock* body_bb = llvm::BasicBlock::Create(ctx_, "loop.body", fn);
+        llvm::BasicBlock* end_bb = llvm::BasicBlock::Create(ctx_, "loop.end", fn);
+
+        builder_.CreateBr(body_bb);
+
+        builder_.SetInsertPoint(body_bb);
+        f.loops.push_back(FnCtx::LoopTargets{.break_bb = end_bb, .continue_bb = body_bb});
+        (void)emit_block(f, lp->body);
+        f.loops.pop_back();
+        if (!builder_.GetInsertBlock()->getTerminator()) builder_.CreateBr(body_bb);
+
+        builder_.SetInsertPoint(end_bb);
+        return CgValue{.type = ty, .value = nullptr};
+      }
+      case AstNodeKind::ExprMatch: {
+        auto* m = static_cast<const ExprMatch*>(e);
+        llvm::Function* fn = builder_.GetInsertBlock()->getParent();
+
+        llvm::BasicBlock* end_bb = llvm::BasicBlock::Create(ctx_, "match.end", fn);
+        llvm::BasicBlock* nomatch_bb = llvm::BasicBlock::Create(ctx_, "match.nomatch", fn);
+
+        TypeId scrut_ty = type_of(m->scrutinee);
+        llvm::Type* scrut_ll_ty = llvm_type(scrut_ty);
+        llvm::AllocaInst* scrut_slot = create_entry_alloca(fn, scrut_ll_ty, "match.scrut");
+        llvm::Value* scrut_val = emit_expr(f, m->scrutinee).value;
+        builder_.CreateStore(scrut_val, scrut_slot);
+
+        llvm::AllocaInst* out_slot = nullptr;
+        llvm::Type* out_ty = llvm_type(ty);
+        if (!out_ty->isVoidTy()) out_slot = create_entry_alloca(fn, out_ty, "match.out");
+
+        llvm::BasicBlock* cond_bb = builder_.GetInsertBlock();
+
+        for (size_t arm_index = 0; arm_index < m->arms.size(); arm_index++) {
+          const MatchArm* arm = m->arms[arm_index];
+          if (!arm) continue;
+
+          llvm::BasicBlock* arm_bb = llvm::BasicBlock::Create(ctx_, "match.arm", fn);
+          llvm::BasicBlock* next_bb = (arm_index + 1 < m->arms.size()) ? llvm::BasicBlock::Create(ctx_, "match.next", fn) : nomatch_bb;
+
+          builder_.SetInsertPoint(cond_bb);
+          llvm::Value* ok = emit_pat_test(f, arm->pat, scrut_ty, scrut_slot);
+          builder_.CreateCondBr(ok, arm_bb, next_bb);
+
+          builder_.SetInsertPoint(arm_bb);
+          push_scope(f);
+          emit_pat_bindings(f, arm->pat, scrut_ty, scrut_slot);
+
+          if (arm->guard) {
+            llvm::Value* guard = emit_expr(f, arm->guard).value;
+            llvm::BasicBlock* body_bb = llvm::BasicBlock::Create(ctx_, "match.body", fn);
+            builder_.CreateCondBr(guard, body_bb, next_bb);
+
+            builder_.SetInsertPoint(body_bb);
+            CgValue rv = emit_expr(f, arm->body);
+            if (!builder_.GetInsertBlock()->getTerminator()) {
+              if (out_slot) builder_.CreateStore(rv.value, out_slot);
+              builder_.CreateBr(end_bb);
+            }
+          } else {
+            CgValue rv = emit_expr(f, arm->body);
+            if (!builder_.GetInsertBlock()->getTerminator()) {
+              if (out_slot) builder_.CreateStore(rv.value, out_slot);
+              builder_.CreateBr(end_bb);
+            }
+          }
+
+          pop_scope(f);
+          cond_bb = next_bb;
+        }
+
+        builder_.SetInsertPoint(nomatch_bb);
+        if (!builder_.GetInsertBlock()->getTerminator()) builder_.CreateUnreachable();
+
+        builder_.SetInsertPoint(end_bb);
+        if (!out_slot) return CgValue{.type = ty, .value = nullptr};
+        llvm::Value* loaded = builder_.CreateLoad(out_ty, out_slot);
+        return CgValue{.type = ty, .value = loaded};
+      }
+      case AstNodeKind::ExprField: {
+        auto place = emit_place_ptr(f, e);
+        if (!place) {
+          error(e->span, "unsupported field access in codegen");
+          return CgValue{.type = ty, .value = zero_init(llvm_type(ty))};
+        }
+        llvm::Value* v = emit_load(place->first, place->second);
+        return CgValue{.type = place->first, .value = v};
+      }
+      case AstNodeKind::ExprAssign: {
+        auto* a = static_cast<const ExprAssign*>(e);
+        auto place = emit_place_ptr(f, a->lhs);
+        if (!place) {
+          error(e->span, "unsupported assignment target in codegen");
+          return CgValue{.type = checked_.types.unit(), .value = nullptr};
+        }
+        CgValue rv = emit_expr(f, a->rhs);
+        emit_store(place->first, place->second, rv.value);
+        return CgValue{.type = checked_.types.unit(), .value = nullptr};
+      }
+      case AstNodeKind::ExprUnary: {
+        auto* u = static_cast<const ExprUnary*>(e);
+        CgValue v = emit_expr(f, u->expr);
+        if (!v.value) return v;
+
+        if (u->op == UnaryOp::Neg) {
+          return CgValue{.type = ty, .value = builder_.CreateSub(llvm::ConstantInt::get(llvm_type(ty), 0), v.value)};
+        }
+        if (u->op == UnaryOp::Not) {
+          return CgValue{.type = ty, .value = builder_.CreateXor(v.value, llvm::ConstantInt::get(llvm::Type::getInt1Ty(ctx_), 1))};
+        }
+        if (u->op == UnaryOp::Deref) {
+          TypeId ptr_ty_id = type_of(u->expr);
+          const TypeData& pd = checked_.types.get(ptr_ty_id);
+          if (pd.kind != TypeKind::Ptr) return CgValue{.type = ty, .value = zero_init(llvm_type(ty))};
+          llvm::Value* loaded = emit_load(pd.pointee, v.value);
+          return CgValue{.type = pd.pointee, .value = loaded};
+        }
+        return v;
+      }
+      case AstNodeKind::ExprBinary: {
+        auto* b = static_cast<const ExprBinary*>(e);
+        CgValue lhs = emit_expr(f, b->lhs);
+        CgValue rhs = emit_expr(f, b->rhs);
+
+        TypeId lhs_ty = type_of(b->lhs);
+        const TypeData& lhs_td = checked_.types.get(lhs_ty);
+
+        switch (b->op) {
+          case BinaryOp::Add:
+            return CgValue{.type = ty, .value = builder_.CreateAdd(lhs.value, rhs.value)};
+          case BinaryOp::Sub:
+            return CgValue{.type = ty, .value = builder_.CreateSub(lhs.value, rhs.value)};
+          case BinaryOp::Mul:
+            return CgValue{.type = ty, .value = builder_.CreateMul(lhs.value, rhs.value)};
+          case BinaryOp::Div:
+            if (lhs_td.kind != TypeKind::Int) break;
+            return CgValue{.type = ty,
+                           .value = is_signed_int(lhs_td.int_kind) ? builder_.CreateSDiv(lhs.value, rhs.value)
+                                                                   : builder_.CreateUDiv(lhs.value, rhs.value)};
+          case BinaryOp::Mod:
+            if (lhs_td.kind != TypeKind::Int) break;
+            return CgValue{.type = ty,
+                           .value = is_signed_int(lhs_td.int_kind) ? builder_.CreateSRem(lhs.value, rhs.value)
+                                                                   : builder_.CreateURem(lhs.value, rhs.value)};
+          case BinaryOp::Eq:
+            return CgValue{.type = ty, .value = builder_.CreateICmpEQ(lhs.value, rhs.value)};
+          case BinaryOp::Ne:
+            return CgValue{.type = ty, .value = builder_.CreateICmpNE(lhs.value, rhs.value)};
+          case BinaryOp::Lt:
+          case BinaryOp::Le:
+          case BinaryOp::Gt:
+          case BinaryOp::Ge: {
+            if (lhs_td.kind == TypeKind::Int) {
+              bool sign = is_signed_int(lhs_td.int_kind);
+              llvm::CmpInst::Predicate pred = llvm::CmpInst::BAD_ICMP_PREDICATE;
+              if (b->op == BinaryOp::Lt) pred = sign ? llvm::CmpInst::ICMP_SLT : llvm::CmpInst::ICMP_ULT;
+              if (b->op == BinaryOp::Le) pred = sign ? llvm::CmpInst::ICMP_SLE : llvm::CmpInst::ICMP_ULE;
+              if (b->op == BinaryOp::Gt) pred = sign ? llvm::CmpInst::ICMP_SGT : llvm::CmpInst::ICMP_UGT;
+              if (b->op == BinaryOp::Ge) pred = sign ? llvm::CmpInst::ICMP_SGE : llvm::CmpInst::ICMP_UGE;
+              return CgValue{.type = ty, .value = builder_.CreateICmp(pred, lhs.value, rhs.value)};
+            }
+            if (lhs_td.kind == TypeKind::Bool) {
+              llvm::CmpInst::Predicate pred = llvm::CmpInst::BAD_ICMP_PREDICATE;
+              if (b->op == BinaryOp::Lt) pred = llvm::CmpInst::ICMP_ULT;
+              if (b->op == BinaryOp::Le) pred = llvm::CmpInst::ICMP_ULE;
+              if (b->op == BinaryOp::Gt) pred = llvm::CmpInst::ICMP_UGT;
+              if (b->op == BinaryOp::Ge) pred = llvm::CmpInst::ICMP_UGE;
+              return CgValue{.type = ty, .value = builder_.CreateICmp(pred, lhs.value, rhs.value)};
+            }
+            break;
+          }
+          case BinaryOp::And:
+            return CgValue{.type = ty, .value = builder_.CreateAnd(lhs.value, rhs.value)};
+          case BinaryOp::Or:
+            return CgValue{.type = ty, .value = builder_.CreateOr(lhs.value, rhs.value)};
+        }
+
+        error(e->span, "unsupported binary op in codegen");
+        return CgValue{.type = ty, .value = zero_init(llvm_type(ty))};
+      }
+      case AstNodeKind::ExprCast: {
+        auto* c = static_cast<const ExprCast*>(e);
+        CgValue from = emit_expr(f, c->value);
+        return emit_cast(f, from, ty);
+      }
+      case AstNodeKind::ExprMethodCall: {
+        auto* mc = static_cast<const ExprMethodCall*>(e);
+        if (!mc->receiver) return CgValue{.type = ty, .value = zero_init(llvm_type(ty))};
+
+        TypeId recv_ty = type_of(mc->receiver);
+        const TypeData& recv_td = checked_.types.get(recv_ty);
+
+        TypeId nominal = recv_ty;
+        if (recv_td.kind == TypeKind::Ptr) nominal = recv_td.pointee;
+        const TypeData& nominal_td = checked_.types.get(nominal);
+
+        // dyn Trait call.
+        if (nominal_td.kind == TypeKind::DynTrait && nominal_td.trait_def) {
+          const ItemTrait* tr = nominal_td.trait_def;
+          auto tset_it = checked_.trait_methods.find(tr);
+          if (tset_it == checked_.trait_methods.end()) {
+            error(e->span, "unknown trait in dyn call codegen");
+            return CgValue{.type = ty, .value = zero_init(llvm_type(ty))};
+          }
+          const TraitMethodSet& set = tset_it->second;
+          auto mi = set.methods.find(mc->method);
+          if (mi == set.methods.end()) {
+            error(e->span, "unknown dyn method in codegen");
+            return CgValue{.type = ty, .value = zero_init(llvm_type(ty))};
+          }
+          const TraitMethodInfo& tm = mi->second;
+          if (!tm.object_safe) {
+            error(e->span, "dyn call to non-object-safe method");
+            return CgValue{.type = ty, .value = zero_init(llvm_type(ty))};
+          }
+
+          size_t method_index = 0;
+          bool found = false;
+          for (size_t i = 0; i < set.order.size(); i++) {
+            if (set.order[i] == mc->method) {
+              method_index = i;
+              found = true;
+              break;
+            }
+          }
+          if (!found) return CgValue{.type = ty, .value = zero_init(llvm_type(ty))};
+
+          CgValue recv = emit_expr(f, mc->receiver);
+          llvm::Value* data_ptr = builder_.CreateExtractValue(recv.value, {0});
+          llvm::Value* vtable_ptr = builder_.CreateExtractValue(recv.value, {1});
+
+          llvm::StructType* vt_ty = llvm_vtable_type(tr);
+          llvm::Value* fn_ptr_ptr = builder_.CreateStructGEP(vt_ty, vtable_ptr, static_cast<unsigned>(method_index));
+          llvm::Value* fn_ptr = builder_.CreateLoad(ptr_ty(), fn_ptr_ptr);
+
+          std::vector<llvm::Value*> args{};
+          args.reserve(mc->args.size() + 1);
+          args.push_back(data_ptr);
+          for (Expr* arg_expr : mc->args) args.push_back(emit_expr(f, arg_expr).value);
+
+          llvm::FunctionType* callee_ty = llvm_dyn_method_type(tm);
+          llvm::CallInst* call = builder_.CreateCall(callee_ty, fn_ptr, args);
+          if (call->getType()->isVoidTy()) return CgValue{.type = checked_.types.unit(), .value = nullptr};
+          return CgValue{.type = tm.sig.ret, .value = call};
+        }
+
+        // Static dispatch (inherent or trait impl).
+        const Item* def = nullptr;
+        if (nominal_td.kind == TypeKind::Struct) def = static_cast<const Item*>(nominal_td.struct_def);
+        if (nominal_td.kind == TypeKind::Enum) def = static_cast<const Item*>(nominal_td.enum_def);
+        if (!def) {
+          error(e->span, "unsupported receiver type in method call codegen");
+          return CgValue{.type = ty, .value = zero_init(llvm_type(ty))};
+        }
+
+        const ItemFn* method = nullptr;
+        if (auto it = crate_.inherent_methods.find(def); it != crate_.inherent_methods.end()) {
+          if (auto mi = it->second.find(mc->method); mi != it->second.end()) method = mi->second;
+        }
+
+        if (!method) {
+          const Module& m = crate_.modules[f.mid];
+          for (const auto& [_, ty_item] : m.types) {
+            if (!ty_item || ty_item->kind != AstNodeKind::ItemTrait) continue;
+            TraitImplKey key{.trait = static_cast<const ItemTrait*>(ty_item), .type = def};
+            auto impl_it = crate_.trait_impl_methods.find(key);
+            if (impl_it == crate_.trait_impl_methods.end()) continue;
+            auto mi = impl_it->second.find(mc->method);
+            if (mi != impl_it->second.end()) {
+              method = mi->second;
+              break;
+            }
+          }
+        }
+
+        if (!method) {
+          error(e->span, "cannot resolve method in codegen");
+          return CgValue{.type = ty, .value = zero_init(llvm_type(ty))};
+        }
+
+        auto sig_it = checked_.fn_info.find(method);
+        if (sig_it == checked_.fn_info.end()) return CgValue{.type = ty, .value = zero_init(llvm_type(ty))};
+        const FnInfo& sig = sig_it->second;
+        if (sig.params.empty()) {
+          error(e->span, "method has no receiver param");
+          return CgValue{.type = ty, .value = zero_init(llvm_type(ty))};
+        }
+
+        TypeId self_param = sig.params[0];
+        const TypeData& sp = checked_.types.get(self_param);
+
+        llvm::Value* recv_arg = nullptr;
+        if (sp.kind == TypeKind::Ptr && recv_td.kind != TypeKind::Ptr) {
+          if (mc->receiver->kind != AstNodeKind::ExprPath) {
+            error(mc->receiver->span, "codegen v0 only supports implicit borrow from local paths");
+            return CgValue{.type = ty, .value = zero_init(llvm_type(ty))};
+          }
+          const Path* p = static_cast<const ExprPath*>(mc->receiver)->path;
+          if (!p || p->segments.size() != 1) return CgValue{.type = ty, .value = zero_init(llvm_type(ty))};
+          auto local = lookup_local(f, p->segments[0]->text);
+          if (!local || !local->alloca) return CgValue{.type = ty, .value = zero_init(llvm_type(ty))};
+          recv_arg = local->alloca;
+        } else {
+          recv_arg = emit_expr(f, mc->receiver).value;
+        }
+
+        std::vector<llvm::Value*> args{};
+        args.reserve(mc->args.size() + 1);
+        args.push_back(recv_arg);
+        for (Expr* arg_expr : mc->args) args.push_back(emit_expr(f, arg_expr).value);
+
+        llvm::Function* callee = llvm_fn(method);
+        if (!callee) return CgValue{.type = ty, .value = zero_init(llvm_type(ty))};
+        llvm::CallInst* call = builder_.CreateCall(callee->getFunctionType(), callee, args);
+        if (call->getType()->isVoidTy()) return CgValue{.type = checked_.types.unit(), .value = nullptr};
+        return CgValue{.type = sig.ret, .value = call};
+      }
+      case AstNodeKind::ExprCall: {
+        auto* call = static_cast<const ExprCall*>(e);
+        if (!call->callee || call->callee->kind != AstNodeKind::ExprPath) {
+          error(e->span, "unsupported call target in codegen");
+          return CgValue{.type = ty, .value = zero_init(llvm_type(ty))};
+        }
+        const Path* callee = static_cast<const ExprPath*>(call->callee)->path;
+        if (!callee) return CgValue{.type = ty, .value = zero_init(llvm_type(ty))};
+
+        if (callee->segments.size() == 2 && callee->segments[0]->text == "builtin" && callee->segments[1]->text == "size_of") {
+          auto v = eval_.eval_expr(f.mid, e);
+          if (v && v->kind == ComptimeValue::Kind::Int) {
+            return CgValue{.type = ty,
+                           .value = llvm::ConstantInt::get(llvm_type(ty), static_cast<std::uint64_t>(v->int_value), /*isSigned=*/true)};
+          }
+          return CgValue{.type = ty, .value = zero_init(llvm_type(ty))};
+        }
+
+        if (callee->segments.size() == 2 && callee->segments[0]->text == "builtin" && callee->segments[1]->text == "align_of") {
+          auto v = eval_.eval_expr(f.mid, e);
+          if (v && v->kind == ComptimeValue::Kind::Int) {
+            return CgValue{.type = ty,
+                           .value = llvm::ConstantInt::get(llvm_type(ty), static_cast<std::uint64_t>(v->int_value), /*isSigned=*/true)};
+          }
+          return CgValue{.type = ty, .value = zero_init(llvm_type(ty))};
+        }
+
+        if (callee->segments.size() == 2 && callee->segments[0]->text == "builtin" &&
+            (callee->segments[1]->text == "addr_of" || callee->segments[1]->text == "addr_of_mut")) {
+          if (call->args.size() != 1) return CgValue{.type = ty, .value = zero_init(llvm_type(ty))};
+          if (call->args[0]->kind == AstNodeKind::ExprPath) {
+            const Path* ap = static_cast<const ExprPath*>(call->args[0])->path;
+            if (ap && ap->segments.size() == 1) {
+              auto local = lookup_local(f, ap->segments[0]->text);
+              if (local && local->alloca) return CgValue{.type = ty, .value = local->alloca};
+            }
+          }
+          error(e->span, "builtin::addr_of requires a local path in codegen v0");
+          return CgValue{.type = ty, .value = zero_init(llvm_type(ty))};
+        }
+
+        if (auto fn_item = resolve_fn_path(f.mid, callee)) {
+          llvm::Function* callee_fn = llvm_fn(*fn_item);
+          if (!callee_fn) return CgValue{.type = ty, .value = zero_init(llvm_type(ty))};
+          std::vector<llvm::Value*> args{};
+          args.reserve(call->args.size());
+          for (Expr* arg_expr : call->args) args.push_back(emit_expr(f, arg_expr).value);
+          llvm::CallInst* call_inst = builder_.CreateCall(callee_fn->getFunctionType(), callee_fn, args);
+          if (call_inst->getType()->isVoidTy()) return CgValue{.type = checked_.types.unit(), .value = nullptr};
+          return CgValue{.type = type_of(e), .value = call_inst};
+        }
+
+        // Enum variant constructor `Enum::Variant(...)`.
+        if (td.kind == TypeKind::Enum && td.enum_def && callee->segments.size() >= 2) {
+          std::string_view variant_name = callee->segments.back()->text;
+          if (const VariantInfo* vi = enum_variant_info(td.enum_def, variant_name)) {
+            if (vi->payload.size() == call->args.size()) return emit_enum_ctor(f, ty, td.enum_def, variant_name, call->args);
+          }
+        }
+
+        error(e->span, "unresolved call in codegen");
+        return CgValue{.type = ty, .value = zero_init(llvm_type(ty))};
+      }
+      default:
+        error(e->span, "unsupported expression in codegen");
+        return CgValue{.type = ty, .value = zero_init(llvm_type(ty))};
+    }
+  }
+
+  void emit_stmt(FnCtx& f, const Stmt* s) {
+    if (!s) return;
+    if (builder_.GetInsertBlock()->getTerminator()) return;
+
+    switch (s->kind) {
+      case AstNodeKind::StmtLet: {
+        auto* ls = static_cast<const StmtLet*>(s);
+        if (!ls->pat || ls->pat->kind != AstNodeKind::PatBinding) {
+          error(s->span, "codegen only supports `let <ident>` patterns for now");
+          return;
+        }
+        auto* binding = static_cast<const PatBinding*>(ls->pat);
+        if (!ls->init) {
+          error(s->span, "codegen requires `let` initializers for now");
+          return;
+        }
+        TypeId local_ty = type_of(ls->init);
+        llvm::Type* ll_ty = llvm_type(local_ty);
+        llvm::AllocaInst* slot = create_entry_alloca(f.llvm_fn, ll_ty, binding->name);
+        declare_local(f, binding->name, LocalSlot{.type = local_ty, .alloca = slot});
+
+        CgValue init = emit_expr(f, ls->init);
+        emit_store(local_ty, slot, init.value);
+        return;
+      }
+      case AstNodeKind::StmtExpr: {
+        (void)emit_expr(f, static_cast<const StmtExpr*>(s)->expr);
+        return;
+      }
+      case AstNodeKind::StmtReturn: {
+        auto* r = static_cast<const StmtReturn*>(s);
+        TypeId ret_ty = checked_.fn_info.at(f.fn).ret;
+        llvm::Type* ll_ret = llvm_type(ret_ty);
+        if (ll_ret->isVoidTy()) {
+          builder_.CreateRetVoid();
+          return;
+        }
+        if (!r->value) {
+          builder_.CreateRet(zero_init(ll_ret));
+          return;
+        }
+        CgValue v = emit_expr(f, r->value);
+        builder_.CreateRet(v.value);
+        return;
+      }
+      case AstNodeKind::StmtBreak: {
+        if (f.loops.empty()) {
+          error(s->span, "`break` outside of a loop (codegen)");
+          builder_.CreateUnreachable();
+          return;
+        }
+        builder_.CreateBr(f.loops.back().break_bb);
+        return;
+      }
+      case AstNodeKind::StmtContinue: {
+        if (f.loops.empty()) {
+          error(s->span, "`continue` outside of a loop (codegen)");
+          builder_.CreateUnreachable();
+          return;
+        }
+        builder_.CreateBr(f.loops.back().continue_bb);
+        return;
+      }
+      default:
+        error(s->span, "unsupported statement in codegen");
+        return;
+    }
+  }
+
+  CgValue emit_block(FnCtx& f, const Block* b) {
+    if (!b) return CgValue{.type = checked_.types.unit(), .value = nullptr};
+    push_scope(f);
+    for (const Stmt* s : b->stmts) emit_stmt(f, s);
+    CgValue out{.type = checked_.types.unit(), .value = nullptr};
+    if (b->tail && !builder_.GetInsertBlock()->getTerminator()) out = emit_expr(f, b->tail);
+    pop_scope(f);
+    return out;
+  }
+
   void emit_function(const ItemFn* fn, ModuleId mid) {
     if (!fn || !fn->decl || !fn->decl->sig || !fn->body) return;
     if (emitted_fns_.contains(fn)) return;
     emitted_fns_.insert(fn);
+
+    llvm::Function* llvm_fn_ptr = llvm_fn(fn);
+    if (!llvm_fn_ptr) return;
 
     auto sig_it = checked_.fn_info.find(fn);
     if (sig_it == checked_.fn_info.end()) return;
@@ -1210,64 +1808,40 @@ class LlvmEmitter {
     FnCtx f{};
     f.mid = mid;
     f.fn = fn;
-    f.blocks.clear();
-    f.entry_allocas.clear();
-    f.temp = 0;
-    f.scopes.clear();
+    f.llvm_fn = llvm_fn_ptr;
 
-    size_t entry = new_block(f, "entry");
-    set_block(f, entry);
-    f.push_scope();
+    llvm::BasicBlock* entry = llvm::BasicBlock::Create(ctx_, "entry", llvm_fn_ptr);
+    builder_.SetInsertPoint(entry);
+    push_scope(f);
 
-    std::ostringstream header;
-    std::string ret_ty = llvm_type(sig.ret);
-    header << "define " << ret_ty << " @" << mangle_fn(fn) << "(";
-    for (size_t i = 0; i < sig.params.size(); i++) {
-      if (i) header << ", ";
-      header << llvm_type(sig.params[i]) << " %arg" << i;
-    }
-    header << ") {\n";
-
-    // Allocate slots for parameters and bind names (so we can treat params like locals).
-    size_t idx = 0;
+    // Parameters are stored into allocas so we can treat them like ordinary locals.
+    size_t param_index = 0;
     for (const Param* p : fn->decl->sig->params) {
       if (!p) continue;
-      TypeId pty = sig.params.at(idx);
-      std::string slot = "%p" + std::to_string(idx);
-      std::string lty = llvm_type(pty);
-      f.entry_allocas.push_back(slot + " = alloca " + lty);
-      emit_inst(f, "store " + lty + " %arg" + std::to_string(idx) + ", " + lty + "* " + slot);
-      declare_local(f, p->name, pty, slot);
-      idx++;
+      TypeId param_ty = sig.params.at(param_index);
+      llvm::Type* ll_ty = llvm_type(param_ty);
+      llvm::AllocaInst* slot = create_entry_alloca(llvm_fn_ptr, ll_ty, p->name);
+      builder_.CreateStore(llvm_fn_ptr->getArg(static_cast<unsigned>(param_index)), slot);
+      declare_local(f, p->name, LocalSlot{.type = param_ty, .alloca = slot});
+      param_index++;
     }
 
-    LlvmValue body = emit_block(f, fn->body);
+    CgValue body = emit_block(f, fn->body);
 
-    if (!cur_block(f).term) {
-      if (checked_.types.equal(sig.ret, checked_.types.unit())) {
-        emit_term(f, "ret void");
-      } else if (!body.v.empty()) {
-        emit_term(f, "ret " + body.ty + " " + body.v);
+    if (!builder_.GetInsertBlock()->getTerminator()) {
+      llvm::Type* ll_ret = llvm_type(sig.ret);
+      if (ll_ret->isVoidTy()) {
+        builder_.CreateRetVoid();
+      } else if (body.value) {
+        builder_.CreateRet(body.value);
       } else {
-        emit_term(f, "ret " + ret_ty + " 0");
+        builder_.CreateRet(zero_init(ll_ret));
       }
     }
-
-    std::ostringstream out;
-    out << header.str();
-    for (auto& b : f.blocks) {
-      out << b.label << ":\n";
-      if (b.label == "entry") {
-        for (auto& a : f.entry_allocas) out << "  " << a << "\n";
-      }
-      for (auto& i : b.insts) out << "  " << i << "\n";
-      out << "  " << b.term.value_or("ret void") << "\n";
-    }
-    out << "}";
-    functions_.push_back(out.str());
+    pop_scope(f);
   }
 
-  void emit_main_shim(std::ostream& out) {
+  void emit_main_shim() {
     const Module& root = crate_.modules[crate_.root];
     auto it = root.values.find("main");
     if (it == root.values.end() || !it->second || it->second->kind != AstNodeKind::ItemFn) return;
@@ -1278,711 +1852,108 @@ class LlvmEmitter {
     const FnInfo& sig = sig_it->second;
     if (!checked_.types.equal(sig.ret, checked_.types.int_(IntKind::I32)) || !sig.params.empty()) return;
 
-    out << "define i32 @main(i32 %argc, i8** %argv) {\n";
-    out << "entry:\n";
-    out << "  %r = call i32 @" << mangle_fn(main_fn) << "()\n";
-    out << "  ret i32 %r\n";
-    out << "}\n\n";
-    (void)out;
+    llvm::FunctionType* wrapper_ty =
+        llvm::FunctionType::get(llvm::Type::getInt32Ty(ctx_), {llvm::Type::getInt32Ty(ctx_), ptr_ty()}, /*isVarArg=*/false);
+    llvm::Function* wrapper = llvm::Function::Create(wrapper_ty, llvm::GlobalValue::ExternalLinkage, "main", module_.get());
+
+    llvm::BasicBlock* entry = llvm::BasicBlock::Create(ctx_, "entry", wrapper);
+    llvm::IRBuilder<> b(entry);
+
+    llvm::Function* callee = llvm_fn(main_fn);
+    if (!callee) {
+      b.CreateRet(llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx_), 1));
+      return;
+    }
+    llvm::CallInst* call = b.CreateCall(callee->getFunctionType(), callee, {});
+    b.CreateRet(call);
+  }
+
+  bool verify_module() {
+    std::string out{};
+    llvm::raw_string_ostream os(out);
+    if (!llvm::verifyModule(*module_, &os)) return true;
+    error(Span{}, "LLVM module verification failed:\n" + os.str());
+    return false;
+  }
+
+  bool write_ll(const std::filesystem::path& out_ll) {
+    std::error_code ec{};
+    llvm::raw_fd_ostream out(out_ll.string(), ec, llvm::sys::fs::OF_None);
+    if (ec) {
+      error(Span{}, "failed to open output file `" + out_ll.string() + "`: " + ec.message());
+      return false;
+    }
+    module_->print(out, nullptr);
+    return true;
+  }
+
+  bool write_bc(const std::filesystem::path& out_bc) {
+    std::error_code ec{};
+    llvm::raw_fd_ostream out(out_bc.string(), ec, llvm::sys::fs::OF_None);
+    if (ec) {
+      error(Span{}, "failed to open output file `" + out_bc.string() + "`: " + ec.message());
+      return false;
+    }
+    llvm::WriteBitcodeToFile(*module_, out);
+    return true;
+  }
+
+  bool write_obj(const std::filesystem::path& out_obj) {
+    std::error_code ec{};
+    llvm::raw_fd_ostream out(out_obj.string(), ec, llvm::sys::fs::OF_None);
+    if (ec) {
+      error(Span{}, "failed to open output file `" + out_obj.string() + "`: " + ec.message());
+      return false;
+    }
+
+    llvm::legacy::PassManager pm;
+    if (target_machine_->addPassesToEmitFile(pm, out, nullptr, llvm::CodeGenFileType::ObjectFile)) {
+      error(Span{}, "LLVM target does not support object emission");
+      return false;
+    }
+    pm.run(*module_);
+    return true;
+  }
+
+  bool link_exe(const std::filesystem::path& obj, const std::filesystem::path& out_exe) {
+    std::string cmd = "clang ";
+    if (!target_.triple.empty()) cmd += "-target " + target_.triple + " ";
+    cmd += "\"" + obj.string() + "\" -o \"" + out_exe.string() + "\"";
+    int rc = std::system(cmd.c_str());
+    if (rc != 0) {
+      error(Span{}, "clang failed: " + cmd);
+      return false;
+    }
+    return true;
+  }
+
+  bool write_outputs(const EmitLlvmOptions& opts) {
+    if (opts.out_ll && !write_ll(*opts.out_ll)) return false;
+    if (opts.out_bc && !write_bc(*opts.out_bc)) return false;
+
+    std::optional<std::filesystem::path> obj_path{};
+    if (opts.out_obj) obj_path = opts.out_obj;
+    if (!obj_path && opts.out_exe) obj_path = std::filesystem::path(opts.out_exe->string() + ".o");
+
+    if (obj_path && !write_obj(*obj_path)) return false;
+    if (opts.out_exe && obj_path && !link_exe(*obj_path, *opts.out_exe)) return false;
+    return true;
   }
 };
 
-LlvmValue LlvmEmitter::emit_expr(FnCtx& f, const Expr* e) {
-  if (!e) return LlvmValue{.ty = "void", .v = ""};
-  TypeId ty = type_of(e);
-  const TypeData& td = checked_.types.get(ty);
-
-  switch (e->kind) {
-    case AstNodeKind::ExprUnit:
-      return LlvmValue{.ty = "void", .v = ""};
-    case AstNodeKind::ExprBool:
-      return emit_bool_const(static_cast<const ExprBool*>(e)->value);
-    case AstNodeKind::ExprInt:
-      return emit_int_const(ty, static_cast<const ExprInt*>(e)->value);
-    case AstNodeKind::ExprStructLit: {
-      auto* sl = static_cast<const ExprStructLit*>(e);
-      if (td.kind != TypeKind::Struct || !td.struct_def) {
-        session_.diags.push_back(Diagnostic{.severity = Severity::Error, .span = e->span, .message = "struct literal has non-struct type"});
-        return LlvmValue{.ty = llvm_type(ty), .v = "undef"};
-      }
-      auto it = checked_.struct_info.find(td.struct_def);
-      if (it == checked_.struct_info.end()) return LlvmValue{.ty = llvm_type(ty), .v = "undef"};
-
-      std::unordered_map<std::string_view, const Expr*> init_map{};
-      for (const FieldInit* fi : sl->inits) {
-        if (fi) init_map[fi->name] = fi->value;
-      }
-
-      std::string agg = "undef";
-      std::string agg_ty = llvm_type(ty);
-      for (size_t i = 0; i < it->second.fields_in_order.size(); i++) {
-        const auto& fld = it->second.fields_in_order[i];
-        auto init_it = init_map.find(fld.name);
-        if (init_it == init_map.end() || !init_it->second) {
-          session_.diags.push_back(Diagnostic{
-              .severity = Severity::Error,
-              .span = e->span,
-              .message = "missing field initializer `" + fld.name + "` in codegen",
-          });
-          continue;
-        }
-        LlvmValue fv = emit_expr(f, init_it->second);
-        std::string tmp = new_temp(f);
-        emit_inst(f, tmp + " = insertvalue " + agg_ty + " " + agg + ", " + llvm_type(fld.type) + " " + fv.v + ", " +
-                         std::to_string(i));
-        agg = tmp;
-      }
-      return LlvmValue{.ty = agg_ty, .v = agg};
-    }
-    case AstNodeKind::ExprPath: {
-      auto* p = static_cast<const ExprPath*>(e);
-      if (!p->path || p->path->segments.empty()) return LlvmValue{.ty = "i8", .v = "0"};
-      if (p->path->segments.size() == 1) {
-        if (auto local = lookup_local(f, p->path->segments[0]->text)) {
-          return emit_load(f, local->first, local->second);
-        }
-      }
-      if (const Item* item = resolve_value_item(f.mid, p->path)) {
-        if (item->kind == AstNodeKind::ItemConst) {
-          auto v = eval_.eval_const(static_cast<const ItemConst*>(item));
-          if (!v) return LlvmValue{.ty = llvm_type(ty), .v = "0"};
-          if (v->kind == ComptimeValue::Kind::Int) return emit_int_const(ty, v->int_value);
-          if (v->kind == ComptimeValue::Kind::Bool) return emit_bool_const(v->bool_value);
-        }
-      }
-
-      // Enum unit variant value `Enum::Variant`.
-      const TypeData& td = checked_.types.get(ty);
-      if (td.kind == TypeKind::Enum && td.enum_def && p->path->segments.size() >= 2) {
-        std::string_view vname = p->path->segments.back()->text;
-        if (const VariantInfo* vi = enum_variant_info(td.enum_def, vname)) {
-          if (vi->payload.empty()) {
-            std::vector<Expr*> no_args{};
-            return emit_enum_ctor(f, ty, td.enum_def, vname, no_args);
-          }
-        }
-      }
-
-      session_.diags.push_back(Diagnostic{.severity = Severity::Error, .span = e->span, .message = "unsupported path expression in codegen"});
-      return LlvmValue{.ty = llvm_type(ty), .v = "0"};
-    }
-    case AstNodeKind::ExprBlock:
-      return emit_block(f, static_cast<const ExprBlock*>(e)->block);
-    case AstNodeKind::ExprIf: {
-      auto* iff = static_cast<const ExprIf*>(e);
-      LlvmValue cond = emit_expr(f, iff->cond);
-
-      std::uint64_t id = ++f.temp;
-      std::string then_label = "then" + std::to_string(id);
-      std::string else_label = "else" + std::to_string(id);
-      std::string end_label = "endif" + std::to_string(id);
-
-      size_t then_idx = new_block(f, then_label);
-      size_t else_idx = new_block(f, else_label);
-      size_t end_idx = new_block(f, end_label);
-
-      std::string out_ty = llvm_type(ty);
-      std::optional<std::string> out_slot{};
-      if (out_ty != "void") {
-        out_slot = "%if" + std::to_string(id);
-        f.entry_allocas.push_back(*out_slot + " = alloca " + out_ty);
-      }
-
-      emit_term(f, "br i1 " + cond.v + ", label %" + then_label + ", label %" + else_label);
-
-      set_block(f, then_idx);
-      LlvmValue tv = emit_block(f, iff->then_block);
-      if (!cur_block(f).term) {
-        if (out_slot) emit_inst(f, "store " + out_ty + " " + tv.v + ", " + out_ty + "* " + *out_slot);
-        emit_term(f, "br label %" + end_label);
-      }
-
-      set_block(f, else_idx);
-      LlvmValue ev{.ty = "void", .v = ""};
-      if (iff->else_expr) ev = emit_expr(f, iff->else_expr);
-      if (!cur_block(f).term) {
-        if (out_slot) emit_inst(f, "store " + out_ty + " " + ev.v + ", " + out_ty + "* " + *out_slot);
-        emit_term(f, "br label %" + end_label);
-      }
-
-      set_block(f, end_idx);
-      if (!out_slot) return LlvmValue{.ty = "void", .v = ""};
-      std::string tmp = new_temp(f);
-      emit_inst(f, tmp + " = load " + out_ty + ", " + out_ty + "* " + *out_slot);
-      return LlvmValue{.ty = out_ty, .v = tmp};
-    }
-    case AstNodeKind::ExprWhile: {
-      auto* wh = static_cast<const ExprWhile*>(e);
-      std::uint64_t id = ++f.temp;
-      std::string cond_label = "while.cond" + std::to_string(id);
-      std::string body_label = "while.body" + std::to_string(id);
-      std::string end_label = "while.end" + std::to_string(id);
-
-      size_t cond_idx = new_block(f, cond_label);
-      size_t body_idx = new_block(f, body_label);
-      size_t end_idx = new_block(f, end_label);
-
-      emit_term(f, "br label %" + cond_label);
-
-      set_block(f, cond_idx);
-      LlvmValue cond = emit_expr(f, wh->cond);
-      emit_term(f, "br i1 " + cond.v + ", label %" + body_label + ", label %" + end_label);
-
-      set_block(f, body_idx);
-      f.loops.push_back(FnCtx::LoopTargets{.break_label = end_label, .continue_label = cond_label});
-      (void)emit_block(f, wh->body);
-      f.loops.pop_back();
-      if (!cur_block(f).term) emit_term(f, "br label %" + cond_label);
-
-      set_block(f, end_idx);
-      return LlvmValue{.ty = "void", .v = ""};
-    }
-    case AstNodeKind::ExprLoop: {
-      auto* lp = static_cast<const ExprLoop*>(e);
-      std::uint64_t id = ++f.temp;
-      std::string body_label = "loop.body" + std::to_string(id);
-      std::string end_label = "loop.end" + std::to_string(id);
-
-      size_t body_idx = new_block(f, body_label);
-      size_t end_idx = new_block(f, end_label);
-
-      emit_term(f, "br label %" + body_label);
-
-      set_block(f, body_idx);
-      f.loops.push_back(FnCtx::LoopTargets{.break_label = end_label, .continue_label = body_label});
-      (void)emit_block(f, lp->body);
-      f.loops.pop_back();
-      if (!cur_block(f).term) emit_term(f, "br label %" + body_label);
-
-      set_block(f, end_idx);
-      return LlvmValue{.ty = "void", .v = ""};
-    }
-    case AstNodeKind::ExprMatch: {
-      auto* m = static_cast<const ExprMatch*>(e);
-
-      std::uint64_t id = ++f.temp;
-      std::string end_label = "match.end" + std::to_string(id);
-      std::string nomatch_label = "match.nomatch" + std::to_string(id);
-      size_t end_idx = new_block(f, end_label);
-      size_t nomatch_idx = new_block(f, nomatch_label);
-
-      TypeId scrut_ty = type_of(m->scrutinee);
-      std::string scrut_ll_ty = llvm_type(scrut_ty);
-      std::string scrut_slot = "%match.scrut" + std::to_string(id);
-      f.entry_allocas.push_back(scrut_slot + " = alloca " + scrut_ll_ty);
-      LlvmValue sv = emit_expr(f, m->scrutinee);
-      emit_inst(f, "store " + scrut_ll_ty + " " + sv.v + ", " + scrut_ll_ty + "* " + scrut_slot);
-
-      std::string out_ty = llvm_type(ty);
-      std::optional<std::string> out_slot{};
-      if (out_ty != "void") {
-        out_slot = "%match.out" + std::to_string(id);
-        f.entry_allocas.push_back(*out_slot + " = alloca " + out_ty);
-      }
-
-      size_t cond_idx = f.cur;
-      for (size_t i = 0; i < m->arms.size(); i++) {
-        const MatchArm* arm = m->arms[i];
-        if (!arm) continue;
-
-        std::string arm_label = "match.arm" + std::to_string(id) + "." + std::to_string(i);
-        size_t arm_idx = new_block(f, arm_label);
-
-        std::string next_label = (i + 1 < m->arms.size()) ? ("match.next" + std::to_string(id) + "." + std::to_string(i))
-                                                          : nomatch_label;
-        size_t next_idx = (i + 1 < m->arms.size()) ? new_block(f, next_label) : nomatch_idx;
-
-        set_block(f, cond_idx);
-        LlvmValue ok = emit_pat_test(f, arm->pat, scrut_ty, scrut_slot);
-        emit_term(f, "br i1 " + ok.v + ", label %" + arm_label + ", label %" + next_label);
-
-        set_block(f, arm_idx);
-        f.push_scope();
-        emit_pat_bindings(f, arm->pat, scrut_ty, scrut_slot);
-
-        if (arm->guard) {
-          LlvmValue gv = emit_expr(f, arm->guard);
-          std::string body_label = "match.body" + std::to_string(id) + "." + std::to_string(i);
-          size_t body_idx = new_block(f, body_label);
-          emit_term(f, "br i1 " + gv.v + ", label %" + body_label + ", label %" + next_label);
-
-          set_block(f, body_idx);
-          LlvmValue rv = emit_expr(f, arm->body);
-          if (!cur_block(f).term) {
-            if (out_slot) emit_inst(f, "store " + out_ty + " " + rv.v + ", " + out_ty + "* " + *out_slot);
-            emit_term(f, "br label %" + end_label);
-          }
-        } else {
-          LlvmValue rv = emit_expr(f, arm->body);
-          if (!cur_block(f).term) {
-            if (out_slot) emit_inst(f, "store " + out_ty + " " + rv.v + ", " + out_ty + "* " + *out_slot);
-            emit_term(f, "br label %" + end_label);
-          }
-        }
-
-        f.pop_scope();
-        cond_idx = next_idx;
-      }
-
-      set_block(f, nomatch_idx);
-      if (!cur_block(f).term) emit_term(f, "unreachable");
-
-      set_block(f, end_idx);
-      if (!out_slot) return LlvmValue{.ty = "void", .v = ""};
-      std::string tmp = new_temp(f);
-      emit_inst(f, tmp + " = load " + out_ty + ", " + out_ty + "* " + *out_slot);
-      return LlvmValue{.ty = out_ty, .v = tmp};
-    }
-    case AstNodeKind::ExprField: {
-      auto place = emit_place_ptr(f, e);
-      if (!place) {
-        session_.diags.push_back(Diagnostic{.severity = Severity::Error, .span = e->span, .message = "unsupported field access in codegen"});
-        return LlvmValue{.ty = llvm_type(ty), .v = "0"};
-      }
-      return emit_load(f, place->first, place->second);
-    }
-    case AstNodeKind::ExprAssign: {
-      auto* a = static_cast<const ExprAssign*>(e);
-      if (!a->lhs) return LlvmValue{.ty = "void", .v = ""};
-      auto place = emit_place_ptr(f, a->lhs);
-      if (!place) {
-        session_.diags.push_back(Diagnostic{.severity = Severity::Error, .span = e->span, .message = "unsupported assignment target in codegen"});
-        return LlvmValue{.ty = "void", .v = ""};
-      }
-      LlvmValue rv = emit_expr(f, a->rhs);
-      emit_store(f, place->first, place->second, rv);
-      return LlvmValue{.ty = "void", .v = ""};
-    }
-    case AstNodeKind::ExprUnary: {
-      auto* u = static_cast<const ExprUnary*>(e);
-      LlvmValue v = emit_expr(f, u->expr);
-      if (u->op == UnaryOp::Neg) {
-        std::string tmp = new_temp(f);
-        emit_inst(f, tmp + " = sub " + v.ty + " 0, " + v.v);
-        return LlvmValue{.ty = v.ty, .v = tmp};
-      }
-      if (u->op == UnaryOp::Not) {
-        std::string tmp = new_temp(f);
-        emit_inst(f, tmp + " = xor i1 " + v.v + ", 1");
-        return LlvmValue{.ty = "i1", .v = tmp};
-      }
-      if (u->op == UnaryOp::Deref) {
-        TypeId ptr_ty = type_of(u->expr);
-        const TypeData& pd = checked_.types.get(ptr_ty);
-        if (pd.kind != TypeKind::Ptr) return LlvmValue{.ty = llvm_type(ty), .v = "0"};
-        return emit_load(f, pd.pointee, v.v);
-      }
-      return v;
-    }
-    case AstNodeKind::ExprBinary: {
-      auto* b = static_cast<const ExprBinary*>(e);
-      LlvmValue lhs = emit_expr(f, b->lhs);
-      LlvmValue rhs = emit_expr(f, b->rhs);
-      std::string tmp = new_temp(f);
-      TypeId lhs_ty = type_of(b->lhs);
-      const TypeData& ld = checked_.types.get(lhs_ty);
-
-      switch (b->op) {
-        case BinaryOp::Add:
-        case BinaryOp::Sub:
-        case BinaryOp::Mul:
-        case BinaryOp::Div:
-        case BinaryOp::Mod: {
-          if (ld.kind != TypeKind::Int) break;
-          bool sign = is_signed_int(ld.int_kind);
-          switch (b->op) {
-            case BinaryOp::Add:
-              emit_inst(f, tmp + " = add " + lhs.ty + " " + lhs.v + ", " + rhs.v);
-              return LlvmValue{.ty = lhs.ty, .v = tmp};
-            case BinaryOp::Sub:
-              emit_inst(f, tmp + " = sub " + lhs.ty + " " + lhs.v + ", " + rhs.v);
-              return LlvmValue{.ty = lhs.ty, .v = tmp};
-            case BinaryOp::Mul:
-              emit_inst(f, tmp + " = mul " + lhs.ty + " " + lhs.v + ", " + rhs.v);
-              return LlvmValue{.ty = lhs.ty, .v = tmp};
-            case BinaryOp::Div:
-              emit_inst(f,
-                        tmp + " = " + std::string(sign ? "sdiv" : "udiv") + " " + lhs.ty + " " + lhs.v + ", " + rhs.v);
-              return LlvmValue{.ty = lhs.ty, .v = tmp};
-            case BinaryOp::Mod:
-              emit_inst(f,
-                        tmp + " = " + std::string(sign ? "srem" : "urem") + " " + lhs.ty + " " + lhs.v + ", " + rhs.v);
-              return LlvmValue{.ty = lhs.ty, .v = tmp};
-            default:
-              break;
-          }
-          break;
-        }
-        case BinaryOp::Eq:
-          emit_inst(f, tmp + " = icmp eq " + lhs.ty + " " + lhs.v + ", " + rhs.v);
-          return LlvmValue{.ty = "i1", .v = tmp};
-        case BinaryOp::Ne:
-          emit_inst(f, tmp + " = icmp ne " + lhs.ty + " " + lhs.v + ", " + rhs.v);
-          return LlvmValue{.ty = "i1", .v = tmp};
-        case BinaryOp::Lt:
-        case BinaryOp::Le:
-        case BinaryOp::Gt:
-        case BinaryOp::Ge: {
-          if (ld.kind == TypeKind::Int) {
-            bool sign = is_signed_int(ld.int_kind);
-            std::string pred{};
-            if (b->op == BinaryOp::Lt) pred = sign ? "slt" : "ult";
-            if (b->op == BinaryOp::Le) pred = sign ? "sle" : "ule";
-            if (b->op == BinaryOp::Gt) pred = sign ? "sgt" : "ugt";
-            if (b->op == BinaryOp::Ge) pred = sign ? "sge" : "uge";
-            emit_inst(f, tmp + " = icmp " + pred + " " + lhs.ty + " " + lhs.v + ", " + rhs.v);
-            return LlvmValue{.ty = "i1", .v = tmp};
-          }
-          if (ld.kind == TypeKind::Bool) {
-            std::string pred{};
-            if (b->op == BinaryOp::Lt) pred = "ult";
-            if (b->op == BinaryOp::Le) pred = "ule";
-            if (b->op == BinaryOp::Gt) pred = "ugt";
-            if (b->op == BinaryOp::Ge) pred = "uge";
-            emit_inst(f, tmp + " = icmp " + pred + " i1 " + lhs.v + ", " + rhs.v);
-            return LlvmValue{.ty = "i1", .v = tmp};
-          }
-          break;
-        }
-        case BinaryOp::And:
-          emit_inst(f, tmp + " = and i1 " + lhs.v + ", " + rhs.v);
-          return LlvmValue{.ty = "i1", .v = tmp};
-        case BinaryOp::Or:
-          emit_inst(f, tmp + " = or i1 " + lhs.v + ", " + rhs.v);
-          return LlvmValue{.ty = "i1", .v = tmp};
-      }
-
-      session_.diags.push_back(Diagnostic{.severity = Severity::Error, .span = e->span, .message = "unsupported binary op in codegen"});
-      return LlvmValue{.ty = llvm_type(ty), .v = "0"};
-    }
-    case AstNodeKind::ExprCast: {
-      auto* c = static_cast<const ExprCast*>(e);
-      TypeId from_ty = type_of(c->value);
-      LlvmValue from = emit_expr(f, c->value);
-      // Checker already computed the resulting expression type in `expr_types_`.
-      return emit_cast(f, from, from_ty, ty);
-    }
-    case AstNodeKind::ExprMethodCall: {
-      auto* mc = static_cast<const ExprMethodCall*>(e);
-      if (!mc->receiver) return LlvmValue{.ty = llvm_type(ty), .v = "0"};
-      TypeId recv_ty = type_of(mc->receiver);
-      const TypeData& rd = checked_.types.get(recv_ty);
-
-      TypeId nominal = recv_ty;
-      if (rd.kind == TypeKind::Ptr) nominal = rd.pointee;
-
-      const TypeData& nd = checked_.types.get(nominal);
-      if (nd.kind == TypeKind::DynTrait && nd.trait_def) {
-        const ItemTrait* tr = nd.trait_def;
-        auto tset_it = checked_.trait_methods.find(tr);
-        if (tset_it == checked_.trait_methods.end()) {
-          session_.diags.push_back(Diagnostic{.severity = Severity::Error, .span = e->span, .message = "unknown trait in dyn call codegen"});
-          return LlvmValue{.ty = llvm_type(ty), .v = "0"};
-        }
-        const TraitMethodSet& set = tset_it->second;
-        auto mi = set.methods.find(mc->method);
-        if (mi == set.methods.end()) {
-          session_.diags.push_back(Diagnostic{.severity = Severity::Error, .span = e->span, .message = "unknown dyn method in codegen"});
-          return LlvmValue{.ty = llvm_type(ty), .v = "0"};
-        }
-        const TraitMethodInfo& tm = mi->second;
-        if (!tm.object_safe) {
-          session_.diags.push_back(Diagnostic{.severity = Severity::Error, .span = e->span, .message = "dyn call to non-object-safe method"});
-          return LlvmValue{.ty = llvm_type(ty), .v = "0"};
-        }
-
-        size_t idx = 0;
-        bool found = false;
-        for (size_t i = 0; i < set.order.size(); i++) {
-          if (set.order[i] == mc->method) {
-            idx = i;
-            found = true;
-            break;
-          }
-        }
-        if (!found) return LlvmValue{.ty = llvm_type(ty), .v = "0"};
-
-        LlvmValue recv = emit_expr(f, mc->receiver);
-        std::string data = new_temp(f);
-        emit_inst(f, data + " = extractvalue " + recv.ty + " " + recv.v + ", 0");
-        std::string vt = new_temp(f);
-        emit_inst(f, vt + " = extractvalue " + recv.ty + " " + recv.v + ", 1");
-
-        std::string vt_ty = llvm_vtable_type_name(tr);
-        std::string fnptr_ty = llvm_trait_method_fnptr_type(tm);
-
-        std::string gep = new_temp(f);
-        emit_inst(f, gep + " = getelementptr inbounds " + vt_ty + ", " + vt_ty + "* " + vt + ", i32 0, i32 " + std::to_string(idx));
-        std::string fn = new_temp(f);
-        emit_inst(f, fn + " = load " + fnptr_ty + ", " + fnptr_ty + "* " + gep);
-
-        std::ostringstream args;
-        args << "i8* " << data;
-        for (size_t i = 0; i < mc->args.size(); i++) {
-          LlvmValue av = emit_expr(f, mc->args[i]);
-          args << ", " << av.ty << " " << av.v;
-        }
-
-        std::string ret_ty = llvm_type(tm.sig.ret);
-        if (ret_ty == "void") {
-          emit_inst(f, "call void " + fn + "(" + args.str() + ")");
-          return LlvmValue{.ty = "void", .v = ""};
-        }
-        std::string tmp = new_temp(f);
-        emit_inst(f, tmp + " = call " + ret_ty + " " + fn + "(" + args.str() + ")");
-        return LlvmValue{.ty = ret_ty, .v = tmp};
-      }
-
-      const Item* def = nullptr;
-      if (nd.kind == TypeKind::Struct) def = static_cast<const Item*>(nd.struct_def);
-      if (nd.kind == TypeKind::Enum) def = static_cast<const Item*>(nd.enum_def);
-      if (!def) {
-        session_.diags.push_back(Diagnostic{.severity = Severity::Error, .span = e->span, .message = "unsupported receiver type in method call codegen"});
-        return LlvmValue{.ty = llvm_type(ty), .v = "0"};
-      }
-
-      const ItemFn* method = nullptr;
-      if (auto it = crate_.inherent_methods.find(def); it != crate_.inherent_methods.end()) {
-        if (auto mi = it->second.find(mc->method); mi != it->second.end()) method = mi->second;
-      }
-
-      if (!method) {
-        const Module& m = crate_.modules[f.mid];
-        for (const auto& [_, ty_item] : m.types) {
-          if (!ty_item || ty_item->kind != AstNodeKind::ItemTrait) continue;
-          TraitImplKey key{.trait = static_cast<const ItemTrait*>(ty_item), .type = def};
-          auto impl_it = crate_.trait_impl_methods.find(key);
-          if (impl_it == crate_.trait_impl_methods.end()) continue;
-          auto mi = impl_it->second.find(mc->method);
-          if (mi != impl_it->second.end()) {
-            method = mi->second;
-            break;
-          }
-        }
-      }
-
-      if (!method) {
-        session_.diags.push_back(Diagnostic{.severity = Severity::Error, .span = e->span, .message = "cannot resolve method in codegen"});
-        return LlvmValue{.ty = llvm_type(ty), .v = "0"};
-      }
-
-      auto sig_it = checked_.fn_info.find(method);
-      if (sig_it == checked_.fn_info.end()) return LlvmValue{.ty = llvm_type(ty), .v = "0"};
-      const FnInfo& sig = sig_it->second;
-
-      if (sig.params.empty()) {
-        session_.diags.push_back(Diagnostic{.severity = Severity::Error, .span = e->span, .message = "method has no receiver param"});
-        return LlvmValue{.ty = llvm_type(ty), .v = "0"};
-      }
-
-      TypeId self_param = sig.params[0];
-      const TypeData& sp = checked_.types.get(self_param);
-
-      LlvmValue recv_arg{};
-      if (sp.kind == TypeKind::Ptr && rd.kind != TypeKind::Ptr) {
-        if (mc->receiver->kind != AstNodeKind::ExprPath) {
-          session_.diags.push_back(Diagnostic{
-              .severity = Severity::Error,
-              .span = mc->receiver->span,
-              .message = "codegen v0 only supports implicit borrow from local paths",
-          });
-          return LlvmValue{.ty = llvm_type(ty), .v = "0"};
-        }
-        const Path* p = static_cast<const ExprPath*>(mc->receiver)->path;
-        if (!p || p->segments.size() != 1) return LlvmValue{.ty = llvm_type(ty), .v = "0"};
-        auto local = lookup_local(f, p->segments[0]->text);
-        if (!local) return LlvmValue{.ty = llvm_type(ty), .v = "0"};
-        recv_arg = LlvmValue{.ty = llvm_type(self_param), .v = local->second};
-      } else {
-        recv_arg = emit_expr(f, mc->receiver);
-      }
-
-      std::ostringstream args;
-      args << recv_arg.ty << " " << recv_arg.v;
-      for (size_t i = 0; i < mc->args.size(); i++) {
-        LlvmValue av = emit_expr(f, mc->args[i]);
-        args << ", " << av.ty << " " << av.v;
-      }
-
-      std::string ret_ty = llvm_type(sig.ret);
-      if (ret_ty == "void") {
-        emit_inst(f, "call void @" + mangle_fn(method) + "(" + args.str() + ")");
-        return LlvmValue{.ty = "void", .v = ""};
-      }
-      std::string tmp = new_temp(f);
-      emit_inst(f, tmp + " = call " + ret_ty + " @" + mangle_fn(method) + "(" + args.str() + ")");
-      return LlvmValue{.ty = ret_ty, .v = tmp};
-    }
-    case AstNodeKind::ExprCall: {
-      auto* call = static_cast<const ExprCall*>(e);
-      if (!call->callee || call->callee->kind != AstNodeKind::ExprPath) {
-        session_.diags.push_back(Diagnostic{.severity = Severity::Error, .span = e->span, .message = "unsupported call target in codegen"});
-        return LlvmValue{.ty = llvm_type(ty), .v = "0"};
-      }
-      const Path* callee = static_cast<const ExprPath*>(call->callee)->path;
-      if (!callee) return LlvmValue{.ty = llvm_type(ty), .v = "0"};
-
-      if (callee->segments.size() == 2 && callee->segments[0]->text == "builtin" && callee->segments[1]->text == "size_of") {
-        if (call->args.size() != 1) return LlvmValue{.ty = llvm_type(ty), .v = "0"};
-        if (call->args[0]->kind != AstNodeKind::ExprPath) return LlvmValue{.ty = llvm_type(ty), .v = "0"};
-        auto* tp = static_cast<const ExprPath*>(call->args[0])->path;
-        TypeId t = const_cast<TypeStore&>(checked_.types).error();
-        if (tp) t = const_cast<TypeStore&>(checked_.types).error();
-        (void)t;
-        // Prefer comptime evaluator (it already knows how to lower).
-        auto v = eval_.eval_expr(f.mid, e);
-        if (v && v->kind == ComptimeValue::Kind::Int) return LlvmValue{.ty = llvm_type(ty), .v = std::to_string(v->int_value)};
-        return LlvmValue{.ty = llvm_type(ty), .v = "0"};
-      }
-
-      if (callee->segments.size() == 2 && callee->segments[0]->text == "builtin" && callee->segments[1]->text == "align_of") {
-        auto v = eval_.eval_expr(f.mid, e);
-        if (v && v->kind == ComptimeValue::Kind::Int) return LlvmValue{.ty = llvm_type(ty), .v = std::to_string(v->int_value)};
-        return LlvmValue{.ty = llvm_type(ty), .v = "0"};
-      }
-
-      if (callee->segments.size() == 2 && callee->segments[0]->text == "builtin" && (callee->segments[1]->text == "addr_of" ||
-                                                                                       callee->segments[1]->text == "addr_of_mut")) {
-        if (call->args.size() != 1) return LlvmValue{.ty = llvm_type(ty), .v = "0"};
-        if (call->args[0]->kind == AstNodeKind::ExprPath) {
-          auto* ap = static_cast<const ExprPath*>(call->args[0])->path;
-          if (ap && ap->segments.size() == 1) {
-            auto local = lookup_local(f, ap->segments[0]->text);
-            if (local) return LlvmValue{.ty = llvm_type(ty), .v = local->second};
-          }
-        }
-        session_.diags.push_back(Diagnostic{.severity = Severity::Error, .span = e->span, .message = "builtin::addr_of requires a local path in codegen v0"});
-        return LlvmValue{.ty = llvm_type(ty), .v = "0"};
-      }
-
-      if (auto fn = resolve_fn_path(f.mid, callee)) {
-        auto sig_it = checked_.fn_info.find(*fn);
-        if (sig_it == checked_.fn_info.end()) return LlvmValue{.ty = llvm_type(ty), .v = "0"};
-        const FnInfo& sig = sig_it->second;
-        std::ostringstream args;
-        for (size_t i = 0; i < call->args.size(); i++) {
-          LlvmValue av = emit_expr(f, call->args[i]);
-          if (i) args << ", ";
-          args << av.ty << " " << av.v;
-        }
-        std::string ret_ty = llvm_type(sig.ret);
-        if (ret_ty == "void") {
-          emit_inst(f, "call void @" + mangle_fn(*fn) + "(" + args.str() + ")");
-          return LlvmValue{.ty = "void", .v = ""};
-        }
-        std::string tmp = new_temp(f);
-        emit_inst(f, tmp + " = call " + ret_ty + " @" + mangle_fn(*fn) + "(" + args.str() + ")");
-        return LlvmValue{.ty = ret_ty, .v = tmp};
-      }
-
-      // Enum variant constructor `Enum::Variant(...)`.
-      const TypeData& td = checked_.types.get(ty);
-      if (td.kind == TypeKind::Enum && td.enum_def && callee->segments.size() >= 2) {
-        std::string_view vname = callee->segments.back()->text;
-        if (const VariantInfo* vi = enum_variant_info(td.enum_def, vname)) {
-          if (vi->payload.size() == call->args.size()) return emit_enum_ctor(f, ty, td.enum_def, vname, call->args);
-        }
-      }
-
-      session_.diags.push_back(Diagnostic{.severity = Severity::Error, .span = e->span, .message = "unresolved call in codegen"});
-      return LlvmValue{.ty = llvm_type(ty), .v = "0"};
-    }
-    default:
-      session_.diags.push_back(Diagnostic{.severity = Severity::Error, .span = e->span, .message = "unsupported expression in codegen"});
-      return LlvmValue{.ty = llvm_type(ty), .v = "0"};
-  }
-}
-
-void LlvmEmitter::emit_stmt(FnCtx& f, const Stmt* s) {
-  if (!s) return;
-  if (cur_block(f).term) return;
-  switch (s->kind) {
-    case AstNodeKind::StmtLet: {
-      auto* ls = static_cast<const StmtLet*>(s);
-      if (!ls->pat || ls->pat->kind != AstNodeKind::PatBinding) {
-        session_.diags.push_back(Diagnostic{.severity = Severity::Error, .span = s->span, .message = "codegen only supports `let <ident>` patterns for now"});
-        return;
-      }
-      auto* b = static_cast<const PatBinding*>(ls->pat);
-      TypeId ty = checked_.types.error();
-      if (ls->init) {
-        ty = type_of(ls->init);
-      } else {
-        session_.diags.push_back(Diagnostic{
-            .severity = Severity::Error,
-            .span = s->span,
-            .message = "codegen requires `let` initializers for now",
-        });
-      }
-      std::string slot = "%l" + std::to_string(++f.temp);
-      std::string lty = llvm_type(ty);
-      f.entry_allocas.push_back(slot + " = alloca " + lty);
-      declare_local(f, b->name, ty, slot);
-      if (ls->init) {
-        LlvmValue init = emit_expr(f, ls->init);
-        emit_store(f, ty, slot, init);
-      }
-      return;
-    }
-    case AstNodeKind::StmtExpr:
-      (void)emit_expr(f, static_cast<const StmtExpr*>(s)->expr);
-      return;
-    case AstNodeKind::StmtReturn: {
-      auto* r = static_cast<const StmtReturn*>(s);
-      TypeId ret_ty = checked_.fn_info.at(f.fn).ret;
-      if (checked_.types.equal(ret_ty, checked_.types.unit())) {
-        emit_term(f, "ret void");
-        return;
-      }
-      if (!r->value) {
-        emit_term(f, "ret " + llvm_type(ret_ty) + " 0");
-        return;
-      }
-      LlvmValue v = emit_expr(f, r->value);
-      emit_term(f, "ret " + v.ty + " " + v.v);
-      return;
-    }
-    case AstNodeKind::StmtBreak: {
-      auto* br = static_cast<const StmtBreak*>(s);
-      if (br->value) (void)emit_expr(f, br->value);
-      if (f.loops.empty()) {
-        session_.diags.push_back(Diagnostic{.severity = Severity::Error, .span = s->span, .message = "`break` outside of a loop (codegen)"});
-        emit_term(f, "unreachable");
-        return;
-      }
-      emit_term(f, "br label %" + f.loops.back().break_label);
-      return;
-    }
-    case AstNodeKind::StmtContinue: {
-      if (f.loops.empty()) {
-        session_.diags.push_back(Diagnostic{.severity = Severity::Error, .span = s->span, .message = "`continue` outside of a loop (codegen)"});
-        emit_term(f, "unreachable");
-        return;
-      }
-      emit_term(f, "br label %" + f.loops.back().continue_label);
-      return;
-    }
-    default:
-      session_.diags.push_back(Diagnostic{.severity = Severity::Error, .span = s->span, .message = "unsupported statement in codegen"});
-      return;
-  }
-}
-
-LlvmValue LlvmEmitter::emit_block(FnCtx& f, const Block* b) {
-  if (!b) return LlvmValue{.ty = "void", .v = ""};
-  f.push_scope();
-  for (const Stmt* s : b->stmts) emit_stmt(f, s);
-  LlvmValue out{.ty = "void", .v = ""};
-  if (b->tail && !cur_block(f).term) out = emit_expr(f, b->tail);
-  f.pop_scope();
-  return out;
-}
-
 }  // namespace
 
-bool emit_llvm_ir(Session& session, const ResolvedCrate& crate, CheckedCrate& checked, const EmitLlvmOptions& opts) {
-  LlvmEmitter emitter(session, crate, checked);
-  return emitter.emit_to_file(opts.out_ll, opts.emit_main_wrapper);
+bool emit_llvm(Session& session, const ResolvedCrate& crate, CheckedCrate& checked, const EmitLlvmOptions& opts) {
+  if (!opts.target) {
+    session.diags.push_back(Diagnostic{
+        .severity = Severity::Error,
+        .span = Span{},
+        .message = "internal error: missing target spec for LLVM backend",
+    });
+    return false;
+  }
+  LlvmBackend backend(session, crate, checked, *opts.target);
+  return backend.run(opts);
 }
 
 }  // namespace cog

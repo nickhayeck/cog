@@ -11,6 +11,8 @@
 
 namespace cog {
 
+struct TargetLayout;
+
 struct CheckedCrate {
   TypeStore types{};
 
@@ -26,6 +28,6 @@ struct CheckedCrate {
   std::unordered_map<const Expr*, std::uint64_t> array_lens{};
 };
 
-std::optional<CheckedCrate> check_crate(Session& session, const ResolvedCrate& crate);
+std::optional<CheckedCrate> check_crate(Session& session, const ResolvedCrate& crate, const TargetLayout& target_layout);
 
 }  // namespace cog

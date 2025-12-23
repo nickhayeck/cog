@@ -14,6 +14,14 @@ project(cog_lang)
 find_package(BISON REQUIRED)
 find_package(FLEX REQUIRED)
 
+# LLVM (required). Prefer the Homebrew install on macOS without requiring PATH changes.
+if(NOT LLVM_DIR AND EXISTS "/opt/homebrew/opt/llvm/lib/cmake/llvm/LLVMConfig.cmake")
+  set(LLVM_DIR "/opt/homebrew/opt/llvm/lib/cmake/llvm" CACHE PATH "LLVM CMake package directory")
+endif()
+find_package(LLVM REQUIRED CONFIG)
+message(STATUS "Found LLVM ${LLVM_PACKAGE_VERSION}")
+message(STATUS "Using LLVMConfig.cmake in: ${LLVM_DIR}")
+
 BISON_TARGET(
   CogParser
   ${CMAKE_CURRENT_SOURCE_DIR}/src/parser.y
@@ -44,11 +52,17 @@ add_executable(
   src/session.cpp
   src/source.cpp
   src/types.cpp
+  src/target.cpp
   ${BISON_CogParser_OUTPUTS}
   ${FLEX_CogLexer_OUTPUTS}
 )
 
 target_include_directories(cogc PRIVATE src ${CMAKE_CURRENT_BINARY_DIR})
+target_include_directories(cogc SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS})
+add_definitions(${LLVM_DEFINITIONS})
+
+# Homebrew LLVM is typically built as a single shared library target (LLVM).
+target_link_libraries(cogc PRIVATE LLVM)
 
 if(MSVC)
   target_compile_options(cogc PRIVATE /W4)

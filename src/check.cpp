@@ -3,6 +3,7 @@
 #include "comptime.hpp"
 #include "layout.hpp"
 #include "sem.hpp"
+#include "target.hpp"
 #include "types.hpp"
 
 #include <optional>
@@ -83,7 +84,8 @@ struct Place {
 
 class Checker {
  public:
-  Checker(Session& session, const ResolvedCrate& crate) : session_(session), crate_(crate) {}
+  Checker(Session& session, const ResolvedCrate& crate, const TargetLayout& target_layout)
+      : session_(session), crate_(crate), target_layout_(target_layout) {}
 
   bool run() {
     predeclare_nominals();
@@ -112,6 +114,7 @@ class Checker {
  private:
   Session& session_;
   const ResolvedCrate& crate_;
+  const TargetLayout& target_layout_;
   TypeStore types_;
 
   std::unordered_map<const ItemStruct*, StructInfo> struct_info_{};
@@ -587,7 +590,7 @@ class Checker {
   void check_comptime() {
     if (session_.has_errors()) return;
 
-    LayoutEngine layout(session_, types_, struct_info_, enum_info_, array_lens_);
+    LayoutEngine layout(session_, types_, struct_info_, enum_info_, array_lens_, target_layout_);
     ComptimeEvaluator eval(session_, crate_, &types_, &layout);
 
     // Evaluate array lengths that appear in item signatures and layouts.
@@ -1759,8 +1762,8 @@ class Checker {
 
 }  // namespace
 
-std::optional<CheckedCrate> check_crate(Session& session, const ResolvedCrate& crate) {
-  Checker checker(session, crate);
+std::optional<CheckedCrate> check_crate(Session& session, const ResolvedCrate& crate, const TargetLayout& target_layout) {
+  Checker checker(session, crate, target_layout);
   if (!checker.run()) return std::nullopt;
   return std::move(checker).finish();
 }

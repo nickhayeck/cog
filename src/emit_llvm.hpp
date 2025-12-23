@@ -9,11 +9,18 @@
 
 namespace cog {
 
+struct TargetSpec;
+
 struct EmitLlvmOptions {
-  std::filesystem::path out_ll{};
+  const TargetSpec* target = nullptr;
+
+  std::optional<std::filesystem::path> out_ll{};
+  std::optional<std::filesystem::path> out_bc{};
+  std::optional<std::filesystem::path> out_obj{};
+  std::optional<std::filesystem::path> out_exe{};
   bool emit_main_wrapper = true;
 };
 
-bool emit_llvm_ir(Session& session, const ResolvedCrate& crate, CheckedCrate& checked, const EmitLlvmOptions& opts);
+bool emit_llvm(Session& session, const ResolvedCrate& crate, CheckedCrate& checked, const EmitLlvmOptions& opts);
 
 }  // namespace cog

@@ -6,6 +6,7 @@
 #include "emit_llvm.hpp"
 #include "resolve.hpp"
 #include "session.hpp"
+#include "target.hpp"
 
 #include <iostream>
 #include <optional>
@@ -15,14 +16,17 @@
 
 static void usage(const char* argv0) {
   std::cerr << "usage: " << argv0
-            << " [--dump-ast] [--dump-tokens] [--emit-llvm <out.ll>] [--emit-exe <out>] <file.cg>\n";
+            << " [--dump-ast] [--dump-tokens] [--emit-llvm <out.ll>] [--emit-bc <out.bc>] [--emit-obj <out.o>] [--emit-exe <out>] [--target <triple>] <file.cg>\n";
 }
 
 int main(int argc, char** argv) {
   bool dump_ast = false;
   bool dump_tokens = false;
   std::optional<std::string_view> emit_llvm{};
+  std::optional<std::string_view> emit_bc{};
+  std::optional<std::string_view> emit_obj{};
   std::optional<std::string_view> emit_exe{};
+  std::optional<std::string_view> target_triple{};
   const char* input_path = nullptr;
 
   for (int i = 1; i < argc; i++) {
@@ -43,12 +47,36 @@ int main(int argc, char** argv) {
       emit_llvm = std::string_view(argv[++i]);
       continue;
     }
+    if (arg == "--emit-bc") {
+      if (i + 1 >= argc) {
+        usage(argv[0]);
+        return 2;
+      }
+      emit_bc = std::string_view(argv[++i]);
+      continue;
+    }
+    if (arg == "--emit-obj") {
+      if (i + 1 >= argc) {
+        usage(argv[0]);
+        return 2;
+      }
+      emit_obj = std::string_view(argv[++i]);
+      continue;
+    }
     if (arg == "--emit-exe") {
       if (i + 1 >= argc) {
         usage(argv[0]);
         return 2;
       }
       emit_exe = std::string_view(argv[++i]);
+      continue;
+    }
+    if (arg == "--target") {
+      if (i + 1 >= argc) {
+        usage(argv[0]);
+        return 2;
+      }
+      target_triple = std::string_view(argv[++i]);
       continue;
     }
     if (!arg.empty() && arg[0] == '-') {
@@ -72,39 +100,18 @@ int main(int argc, char** argv) {
   }
 
   cog::ResolvedCrate crate = cog::resolve_crate(session, file);
+  std::optional<cog::TargetSpec> target = cog::compute_target_spec(session, target_triple);
   std::optional<cog::CheckedCrate> checked{};
-  if (!session.has_errors()) checked = cog::check_crate(session, crate);
+  if (!session.has_errors() && target) checked = cog::check_crate(session, crate, target->layout);
 
-  if (!session.has_errors() && emit_llvm) {
+  if (!session.has_errors() && checked && target && (emit_llvm || emit_bc || emit_obj || emit_exe)) {
     cog::EmitLlvmOptions opts{};
-    opts.out_ll = std::filesystem::path(std::string(*emit_llvm));
-    (void)cog::emit_llvm_ir(session, crate, *checked, opts);
-  }
-
-  if (!session.has_errors() && emit_exe) {
-    std::filesystem::path exe_path = std::filesystem::path(std::string(*emit_exe));
-    std::filesystem::path ll_path{};
-    if (emit_llvm) {
-      ll_path = std::filesystem::path(std::string(*emit_llvm));
-    } else {
-      ll_path = std::filesystem::path(exe_path.string() + ".ll");
-    }
-
-    cog::EmitLlvmOptions opts{};
-    opts.out_ll = ll_path;
-    (void)cog::emit_llvm_ir(session, crate, *checked, opts);
-
-    if (!session.has_errors()) {
-      std::string cmd = "clang \"" + ll_path.string() + "\" -o \"" + exe_path.string() + "\"";
-      int rc = std::system(cmd.c_str());
-      if (rc != 0) {
-        session.diags.push_back(cog::Diagnostic{
-            .severity = cog::Severity::Error,
-            .span = cog::Span{},
-            .message = "clang failed: " + cmd,
-        });
-      }
-    }
+    opts.target = &*target;
+    if (emit_llvm) opts.out_ll = std::filesystem::path(std::string(*emit_llvm));
+    if (emit_bc) opts.out_bc = std::filesystem::path(std::string(*emit_bc));
+    if (emit_obj) opts.out_obj = std::filesystem::path(std::string(*emit_obj));
+    if (emit_exe) opts.out_exe = std::filesystem::path(std::string(*emit_exe));
+    (void)cog::emit_llvm(session, crate, *checked, opts);
   }
 
   if (session.has_errors()) {

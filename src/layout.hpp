@@ -3,6 +3,7 @@
 #include "ast.hpp"
 #include "sem.hpp"
 #include "session.hpp"
+#include "target.hpp"
 #include "types.hpp"
 
 #include <cstdint>
@@ -47,7 +48,8 @@ class LayoutEngine {
       TypeStore& types,
       const std::unordered_map<const ItemStruct*, StructInfo>& struct_info,
       const std::unordered_map<const ItemEnum*, EnumInfo>& enum_info,
-      const std::unordered_map<const Expr*, std::uint64_t>& array_lens);
+      const std::unordered_map<const Expr*, std::uint64_t>& array_lens,
+      TargetLayout target);
 
   std::optional<Layout> layout_of(TypeId ty, Span use_site);
   std::optional<std::uint64_t> size_of(TypeId ty, Span use_site);
@@ -63,6 +65,8 @@ class LayoutEngine {
   const std::unordered_map<const ItemStruct*, StructInfo>& struct_info_;
   const std::unordered_map<const ItemEnum*, EnumInfo>& enum_info_;
   const std::unordered_map<const Expr*, std::uint64_t>& array_lens_;
+  // Target-specific ABI knobs (pointer size/alignment, integer ABI alignment).
+  TargetLayout target_{};
 
   std::unordered_map<TypeId, Layout> cache_{};
   std::unordered_set<TypeId> in_progress_{};
@@ -79,10 +83,10 @@ class LayoutEngine {
 
   std::uint64_t pointer_size() const;
   std::uint64_t pointer_align() const;
+  std::uint64_t int_align(IntKind k) const;
   std::optional<std::uint64_t> array_len_value(const Expr* expr) const;
 
   static bool is_packed(const std::vector<Attr*>& attrs);
 };
 
 }  // namespace cog
-
