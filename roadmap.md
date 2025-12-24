@@ -1,6 +1,6 @@
 # Cog compiler roadmap
 
-Status: **v0.0.11 is implemented** (front-end + layout + LLVM codegen + dyn trait objects). See `examples/v0_0_11/main.cg` and `comptime_design.md`.
+Status: **v0.0.12 is implemented** (front-end + layout + LLVM codegen + dyn trait objects + initial C interop surface). See `examples/v0_0_12/main.cg` and `comptime_design.md`.
 
 ## Completed
 
@@ -48,7 +48,7 @@ Status: **v0.0.11 is implemented** (front-end + layout + LLVM codegen + dyn trai
 
 ### v0.0.7 — Layout engine + layout builtins (done)
 - Layout engine (`src/layout.hpp`, `src/layout.cpp`) for primitives, pointers (incl. fat pointers), tuples, arrays, structs, and enums.
-- Default `#[repr(cog)]` model (currently source-order layout); `#[repr(packed)]` is implemented and `#[repr(C)]` is reserved for stable C interop layout.
+- Default `repr(cog)` model (currently source-order layout); `repr(packed)` is implemented and `repr(C)` is reserved for stable C interop layout.
 - `builtin::size_of(T)` and `builtin::align_of(T)` type-check and evaluate at comptime using the layout engine.
 
 ### v0.0.9 — LLVM backend + executable driver (done)
@@ -71,9 +71,16 @@ Status: **v0.0.11 is implemented** (front-end + layout + LLVM codegen + dyn trai
 - LLVM codegen for `match` on ints/bools/enums (ordered decision chain) with basic bindings and guards.
 - LLVM representation for enums (tag + payload) and runtime constructors (including unit variants as values).
 
+### v0.0.12 — FFI surface (tags + extern/export + varargs) (done)
+- Migrate fully from `#[...]` to keyword tags after item keywords (`struct[...]`, `enum[...]`, `fn[...]`).
+- Implement `fn[extern]` imported declarations (no body) + extern-only `...` C varargs.
+- Implement `fn[export(C)]` exported definitions (body required; symbol name is unmangled).
+- Enforce `enum[repr(<int>)]` only on fieldless enums.
+- LLVM backend: avoid mangling for extern/export functions; emit vararg function types and apply basic C vararg promotions at call sites.
+
 ## Next milestones
 
-### v0.0.12 — Comptime functions + staged evaluation (comptime parameters)
+### v0.0.13 — Comptime functions + staged evaluation (comptime parameters)
 Goal: unlock parametric programming via comptime.
 
 - Allow comptime function calls in the interpreter (bounded recursion).
@@ -97,8 +104,8 @@ v0.1.0 should be the first “useful” release: you can compile and run small p
   - `dyn Trait` objects with working vtables + dyn calls
   - `const`/`static` + array lengths with deterministic comptime evaluation
 - ABI story:
-  - `#[repr(cog)]` default is implemented (layout is implementation-defined)
-  - `#[repr(C)]` structs for C interop are supported
+  - default `repr(cog)` is implemented (layout is implementation-defined)
+  - `struct[repr(C)]` structs for C interop are supported
   - pointer/slice/dyn object representations are specified and implemented
 - Diagnostics and stability:
   - no crashes on malformed programs; clear span-based errors
@@ -110,18 +117,16 @@ v0.1.0 should be the first “useful” release: you can compile and run small p
 - A tiny “prelude” module (core integer ops + a couple of builtins).
 
 **Open design questions (non-gating)**
-- C enums: representation + casts (`#[repr(i32)]` and friends).
+- C enums: representation + casts (`enum[repr(i32)]` and friends).
 - Unions: do we want them, and how do they interact with `match`/pattern syntax?
-- C ABI surface syntax: `extern` / `export` keywords vs attributes.
-- `#[repr(cog)]` policy boundaries: what is guaranteed vs compiler-defined?
-- Attributes: keep `#[...]` or adopt a different tagging convention?
+- `repr(cog)` policy boundaries: what is guaranteed vs compiler-defined?
 - Traits: role in the long-term design (esp. without “Rust-style” safety features).
 - Meta-typing + builtins for type-parametric programming (reflection and type construction).
 - Allocation API direction.
-- Variadic arguments.
+- Variadic arguments beyond extern-only C varargs.
 - Testing story (built-in test runner vs library/framework).
 
 ## C interop track (ongoing; subject to revision)
-- Decide the surface syntax for declaring/importing C ABI items (`extern`/`export`, link names, calling conventions).
-- Define `#[repr(C)]` coverage (structs first; fieldless enums via `#[repr(<int>)]`).
-- Add symbol/link control attributes (e.g. `#[link_name="..."]`, `#[link(lib="...")]`).
+- Define surface syntax for linking control (e.g. link names, calling conventions, libraries).
+- Define `repr(C)` coverage (structs first; fieldless enums via `repr(<int>)`).
+- Add symbol/link control tags (e.g. `link_name(...)`, `link_lib(...)`).

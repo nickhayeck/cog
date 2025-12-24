@@ -1,10 +1,10 @@
-# Cog v0.0.11 grammar (draft)
+# Cog v0.0.12 grammar (draft)
 
-This is an **approximate** EBNF aligned with the v0.0.11 prototype parser (`src/parser.y` + `src/lexer.l`). It describes the subset that currently parses; it is not intended to be a complete Rust grammar.
+This is an **approximate** EBNF aligned with the v0.0.12 prototype parser (`src/parser.y` + `src/lexer.l`). It describes the subset that currently parses; it is not intended to be a complete Rust grammar.
 
 Notes:
 - No generics (types/items/traits).
-- Attributes are parsed as `#[path]` or `#[path(path)]` (argument is a path, not a full token tree yet).
+- Item tags are written after the keyword: `struct[repr(C)] Name { ... }`, `fn[extern] foo(...);`.
 - To make `use a::{b,c};` parse reliably, the lexer emits a dedicated token for `::{` (`TOK_COLONCOLON_LBRACE` in the implementation).
 - Expression parsing is precedence-based: assignment, `||`, `&&`, equality, comparisons, `+/-`, `*//%`, `as`, unary, postfix.
  - `builtin::...` names are ordinary paths syntactically; they are handled specially during type checking / comptime evaluation.
@@ -24,26 +24,29 @@ program       := item*
 
 ### Items
 ```
-item          := attr* vis? item_core
+item          := vis? item_core
 vis           := "pub" | ε
-attr          := "#[" path "]"
-              | "#[" path "(" path ")" "]"
 
-item_core     := "use" use_tree ";"
-              | "mod" IDENT "{" item* "}"
-              | "mod" IDENT ";"
-              | "struct" IDENT "{" field_decl* "}"
-              | "enum" IDENT "{" variant_decl* "}"
-              | "trait" IDENT "{" trait_item* "}"
-              | "impl" path "{" impl_item* "}"
-              | "impl" path "for" path "{" impl_item* "}"
-              | "fn" IDENT "(" params? ")" ret? block
-              | "const" IDENT ":" type "=" expr ";"
-              | "static" IDENT ":" type "=" expr ";"
-              | "type" IDENT "=" type ";"
+tags          := "[" tag_list? "]"
+tag_list      := tag ("," tag)* ","?
+tag           := path
+              | path "(" path ")"
+
+item_core     := "use" tags? use_tree ";"
+              | "mod" tags? IDENT "{" item* "}"
+              | "mod" tags? IDENT ";"
+              | "struct" tags? IDENT "{" field_decl* "}"
+              | "enum" tags? IDENT "{" variant_decl* "}"
+              | "trait" tags? IDENT "{" trait_item* "}"
+              | "impl" tags? path "{" impl_item* "}"
+              | "impl" tags? path "for" path "{" impl_item* "}"
+              | "fn" tags? IDENT "(" params? ")" ret? (block | ";")
+              | "const" tags? IDENT ":" type "=" expr ";"
+              | "static" tags? IDENT ":" type "=" expr ";"
+              | "type" tags? IDENT "=" type ";"
 
 trait_item    := fn_decl ";"
-impl_item     := attr* vis? "fn" IDENT "(" params? ")" ret? block
+impl_item     := vis? "fn" tags? IDENT "(" params? ")" ret? block
 fn_decl       := "fn" IDENT "(" params? ")" ret?
 ret           := "->" type
 ```
@@ -58,7 +61,7 @@ use_trees     := use_tree ("," use_tree)* ","?
 
 ### Fields and variants
 ```
-field_decl    := attr* vis? IDENT ":" type ","?
+field_decl    := vis? IDENT ":" type ","?
 
 variant_decl  := IDENT ","?
               | IDENT "(" types? ")" ","?
@@ -66,7 +69,7 @@ variant_decl  := IDENT ","?
 
 ### Parameters
 ```
-params        := param ("," param)* ","?
+params        := param ("," param)* ("," "...")?
 param         := IDENT ":" type
               | "comptime" IDENT ":" type
 ```

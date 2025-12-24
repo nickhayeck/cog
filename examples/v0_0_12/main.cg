@@ -1,0 +1,39 @@
+// v0.0.12: keyword tags (`struct[...]`, `fn[...]`) + `extern`/`export` + extern-only `...` varargs.
+
+struct[repr(C)] Pair {
+    a: i32,
+    b: i32,
+}
+
+enum[repr(i32)] Flag {
+    Off,
+    On,
+}
+
+fn[extern] malloc(size: usize) -> mut* u8;
+fn[extern] free(p: mut* u8);
+fn[extern] printf(fmt: const* u8, ...) -> i32;
+
+fn[export(C)] add_one(x: i32) -> i32 { x + 1 }
+
+fn main() -> i32 {
+    let _pair: Pair = Pair { a: 1, b: 2 };
+    let flag: Flag = Flag::Off;
+
+    let bytes: usize = match flag {
+        Flag::Off => 16 as usize,
+        Flag::On => 32 as usize,
+    };
+
+    let p: mut* u8 = malloc(bytes);
+    free(p);
+
+    let x: i32 = add_one(41);
+
+    if false {
+        // Demonstrates extern-only varargs; not executed at runtime.
+        printf(0 as const* u8, x);
+    };
+
+    x
+}

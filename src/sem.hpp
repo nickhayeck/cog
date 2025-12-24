@@ -33,6 +33,7 @@ struct EnumInfo {
 struct FnInfo {
   std::vector<TypeId> params{};
   TypeId ret = 0;
+  bool is_variadic = false;
 };
 
 struct TraitMethodInfo {
@@ -46,4 +47,3 @@ struct TraitMethodSet {
 };
 
 }  // namespace cog
-

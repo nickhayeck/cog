@@ -218,6 +218,10 @@ struct ItemLocator {
     if (!fn || !fn->decl) return "cog$<fn>";
     auto it = fn_symbol.find(fn);
     if (it != fn_symbol.end()) return it->second;
+    for (const Attr* a : fn->attrs) {
+      if (!a || !a->name) continue;
+      if (path_is_ident(a->name, "extern") || path_is_ident(a->name, "export")) return fn->decl->name;
+    }
     return mangle_in_module(module_of(static_cast<const Item*>(fn)), sanitize(fn->decl->name));
   }
 };
@@ -537,7 +541,7 @@ class LlvmBackend {
     params.reserve(sig.params.size());
     for (TypeId p : sig.params) params.push_back(llvm_type(p));
     llvm::Type* ret = llvm_type(sig.ret);
-    return llvm::FunctionType::get(ret, params, /*isVarArg=*/false);
+    return llvm::FunctionType::get(ret, params, /*isVarArg=*/sig.is_variadic);
   }
 
   llvm::FunctionType* llvm_dyn_method_type(const TraitMethodInfo& tm) {
@@ -716,6 +720,22 @@ class LlvmBackend {
   void declare_local(FnCtx& f, std::string name, LocalSlot slot) {
     if (f.scopes.empty()) push_scope(f);
     f.scopes.back().insert({std::move(name), slot});
+  }
+
+  llvm::Value* promote_c_vararg(TypeId ty, llvm::Value* v) {
+    if (!v) return nullptr;
+    const TypeData& d = checked_.types.get(ty);
+    if (d.kind == TypeKind::Bool) {
+      return builder_.CreateZExt(v, llvm::Type::getInt32Ty(ctx_));
+    }
+    if (d.kind == TypeKind::Int) {
+      std::uint32_t bits = int_bits(d.int_kind, ptr_bits());
+      if (bits < 32) {
+        llvm::Type* i32 = llvm::Type::getInt32Ty(ctx_);
+        return is_signed_int(d.int_kind) ? builder_.CreateSExt(v, i32) : builder_.CreateZExt(v, i32);
+      }
+    }
+    return v;
   }
 
   llvm::AllocaInst* create_entry_alloca(llvm::Function* fn, llvm::Type* ty, std::string_view name) {
@@ -1687,11 +1707,23 @@ class LlvmBackend {
         }
 
         if (auto fn_item = resolve_fn_path(f.mid, callee)) {
-          llvm::Function* callee_fn = llvm_fn(*fn_item);
+          const ItemFn* fn = *fn_item;
+          llvm::Function* callee_fn = llvm_fn(fn);
           if (!callee_fn) return CgValue{.type = ty, .value = zero_init(llvm_type(ty))};
+
+          auto sig_it = checked_.fn_info.find(fn);
+          if (sig_it == checked_.fn_info.end()) return CgValue{.type = ty, .value = zero_init(llvm_type(ty))};
+          const FnInfo& sig = sig_it->second;
+
           std::vector<llvm::Value*> args{};
           args.reserve(call->args.size());
-          for (Expr* arg_expr : call->args) args.push_back(emit_expr(f, arg_expr).value);
+          for (size_t i = 0; i < call->args.size(); i++) {
+            CgValue arg = emit_expr(f, call->args[i]);
+            llvm::Value* v = arg.value;
+            if (sig.is_variadic && i >= sig.params.size()) v = promote_c_vararg(arg.type, v);
+            args.push_back(v);
+          }
+
           llvm::CallInst* call_inst = builder_.CreateCall(callee_fn->getFunctionType(), callee_fn, args);
           if (call_inst->getType()->isVoidTy()) return CgValue{.type = checked_.types.unit(), .value = nullptr};
           return CgValue{.type = type_of(e), .value = call_inst};
@@ -1846,6 +1878,10 @@ class LlvmBackend {
     auto it = root.values.find("main");
     if (it == root.values.end() || !it->second || it->second->kind != AstNodeKind::ItemFn) return;
     auto* main_fn = static_cast<const ItemFn*>(it->second);
+    for (const Attr* a : main_fn->attrs) {
+      if (!a || !a->name) continue;
+      if (path_is_ident(a->name, "extern") || path_is_ident(a->name, "export")) return;
+    }
 
     auto sig_it = checked_.fn_info.find(main_fn);
     if (sig_it == checked_.fn_info.end()) return;

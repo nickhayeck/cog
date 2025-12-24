@@ -63,6 +63,7 @@ static char* dup_string_literal() {
 ">="                     { return TOK_GE; }
 "&&"                     { return TOK_ANDAND; }
 "||"                     { return TOK_OROR; }
+"..."                    { return TOK_ELLIPSIS; }
 
 "fn"                     { return KW_FN; }
 "struct"                 { return KW_STRUCT; }

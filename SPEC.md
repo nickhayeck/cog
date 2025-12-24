@@ -1,6 +1,6 @@
 ---
 title: Cog Language Specification (Draft)
-version: 0.0.11-draft
+version: 0.0.12-draft
 edition: 2025
 status: living
 ---
@@ -59,9 +59,22 @@ This spec is intentionally split into:
 - `pub` makes an item visible outside its defining module.
 - Additional visibilities (e.g. `pub(crate)`) are deferred.
 
-### 3.3 Attributes
-- `#[...]` attaches metadata to the following item.
-- For v0.0.x, attributes are parsed and carried through the AST but semantics can be ignored unless explicitly implemented.
+### 3.3 Tags
+Cog uses **keyword tags** to attach metadata/ABI/layout controls to items.
+
+Syntax (surface):
+- Tags appear immediately after the item keyword: `keyword[tags...] ...`
+- A tag is a `path` with an optional `(path)` argument.
+
+Examples:
+```cog
+struct[repr(C)] MyStruct { x: i32 }
+enum[repr(i32)] MyEnum { A, B }
+fn[extern] malloc(size: usize) -> mut* u8;
+fn[export(C)] add_one(x: i32) -> i32 { x + 1 }
+```
+
+For v0.0.x, tags are parsed and carried through the AST; semantics are applied only where explicitly specified (e.g. `repr`, `extern`, `export`).
 
 ## 4. Types
 
@@ -112,13 +125,14 @@ Constraints (initial):
 - “Object safety” still matters even without generics: methods are dyn-callable only if their ABI does not depend on the concrete `Self` type. In v0.x, a dyn-callable method must take `self` by pointer and must not mention `Self` anywhere else (e.g. `-> Self` is not dyn-callable).
 
 ### 4.5 Layout and `repr`
-Supported attributes (syntax-level in v0.0.x, semantics incrementally):
-- Default representation is `#[repr(cog)]`.
-- `#[repr(cog)]`: implementation-defined layout; the compiler may reorder struct fields and choose enum tagging/layout strategies. Source order does not imply memory order.
-- `#[repr(C)]` (structs): C-compatible layout and field ordering.
-- `#[repr(packed)]` (structs): packed layout (alignment reduced; field order is preserved).
-- Planned:
-  - `#[repr(<int>)]` (fieldless enums): specify the underlying integer type for C-compatible enums (e.g. `#[repr(i32)]`).
+Supported tags (syntax-level in v0.0.x, semantics incrementally):
+- Default representation is `repr(cog)` (i.e. `struct`/`enum` without an explicit `repr` tag).
+- `repr(cog)`: implementation-defined layout; the compiler may reorder struct fields and choose enum tagging/layout strategies. Source order does not imply memory order.
+- `repr(C)` (structs): C-compatible layout and field ordering.
+- `repr(packed)` (structs): packed layout (alignment reduced; field order is preserved).
+- `repr(<int>)` (fieldless enums): specify the underlying integer type for C-compatible enums (e.g. `enum[repr(i32)] MyEnum { A, B }`).
+
+Implementation note (prototype): v0.0.12 validates `repr(C)` / `repr(<int>)` usage but does not yet fully implement C ABI layout for these cases; runtime layout/codegen currently follows `repr(cog)` rules unless otherwise specified.
 
 ## 5. Expressions, statements, and control flow
 
@@ -225,14 +239,31 @@ Planned:
 
 Cog’s long-term goal is “thin-FFI” interop with a crisp ABI story.
 
-The current plan is to use explicit ABI annotations on items (e.g. `extern` / `export`) and link-related attributes (e.g. `#[link_name="..."]`). Exact surface syntax is TBD.
+The v0.0.12 surface syntax uses tags on function items:
+- `fn[extern] name(...) -> ...;` declares an imported symbol (no body).
+- `fn[export(C)] name(...) -> ... { ... }` defines and exports an unmangled symbol.
+
+`export` and `pub` are orthogonal: export controls ABI/symbol visibility to the linker; `pub` controls module visibility.
 
 ### 10.1 ABI and layout
-- `#[repr(C)]` structs are intended to match C struct layout rules for the target.
+- `struct[repr(C)]` structs are intended to match C struct layout rules for the target.
 - Integers use two’s complement; endianness is target-defined.
 
 ### 10.2 Enums (future)
-- Fieldless enums will support `#[repr(<int>)]` (e.g. `#[repr(i32)]`) for C-compatible enums.
+- Fieldless enums support `enum[repr(<int>)]` (e.g. `enum[repr(i32)]`) for C-compatible enums. The v0.0.12 prototype validates that `repr(<int>)` is only used on fieldless enums; C-compatible lowering is planned.
+
+### 10.3 Variadics (extern-only)
+Cog supports **extern-only C varargs**:
+```cog
+fn[extern] printf(fmt: const* u8, ...) -> i32;
+```
+
+Constraints (v0.0.12):
+- `...` is only allowed in `fn[extern]` declarations (no body).
+- Calls to vararg functions must supply at least the fixed parameters.
+- The caller applies C default promotions for varargs:
+  - smaller integers and `bool` are promoted to `i32` (signed/unsigned preserved)
+  - (future) `f32` is promoted to `f64`
 
 ## 11. Build modes
 
@@ -247,11 +278,12 @@ Exact checks are specified per operation (later).
 
 The prototype compiler roadmap lives in `roadmap.md`. Below is the current implementation status.
 
-### v0.0.11 prototype compiler status
+### v0.0.12 prototype compiler status
 - Front-end: parse → module/load + `use` resolution → type-check + local move-check → comptime const-eval (for `const`/`static` and array lengths).
 - Parser:
   - Flex/Bison lexer+parser (no generics) producing a typed AST with source spans.
   - CLI flags: `cogc --dump-tokens <file.cg>`, `cogc --dump-ast <file.cg>`.
+  - Keyword tags on items: `struct[...], enum[...], fn[...]` (replaces `#[...]`).
 - Modules + name resolution:
   - Inline `mod name { ... }` and out-of-line `mod name;` with file mapping (`name.cg` or `name/mod.cg`).
   - `use path;`, `use path as alias;`, and `use path::{a, b as c};`.
@@ -265,7 +297,7 @@ The prototype compiler roadmap lives in `roadmap.md`. Below is the current imple
   - Local move checking rejects use-after-move; `Copy` modeled for primitives/pointers and aggregates of `Copy`.
 - Layout (v0.0.7+):
   - Target-dependent layout engine for primitives, pointers (incl fat pointers), tuples, arrays, structs, and enums.
-  - Default is `#[repr(cog)]` (prototype currently uses source-order layout); `#[repr(packed)]` is implemented and `#[repr(C)]` is reserved for stable C interop layout.
+  - Default is `repr(cog)` (prototype currently uses source-order layout); `repr(packed)` is implemented and `repr(C)` is reserved for stable C interop layout.
 - Comptime (minimal, but useful):
   - Interpreter for integer/bool const-eval and basic control flow (`if`/`while`/`loop`/`match`) in comptime contexts.
   - `builtin::compile_error("...")` triggers an error when executed at comptime.
@@ -273,6 +305,10 @@ The prototype compiler roadmap lives in `roadmap.md`. Below is the current imple
 - LLVM backend (early, v0.0.9+):
   - `cogc --emit-llvm <out.ll> <file.cg>` and `cogc --emit-exe <out> <file.cg>` (links with system `clang`).
   - Emits a runnable subset: ints/bools, blocks + `if/else`, `while`/`loop` + `break`/`continue`, `match` on ints/bools/enums, `let` + assignment, struct literals + field access, pointer deref, direct calls, methods, `builtin::addr_of(_mut)`, and dyn trait objects (`* dyn Trait`) via vtables.
+- C interop surface (early, v0.0.12):
+  - `fn[extern]` imported function declarations (no body).
+  - `fn[export(C)]` exported function definitions (unmangled symbol).
+  - Extern-only `...` varargs in function declarations.
 - Not yet implemented (runtime/codegen and staged evaluation):
   - Arrays/slices/string literals as runtime data (beyond type-checking and comptime).
   - Comptime function calls and staged evaluation via comptime parameters.

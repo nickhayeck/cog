@@ -66,6 +66,7 @@ static std::vector<T*> take_vec(std::vector<T*>* v) {
 
   cog::Param* param;
   cog::FnDecl* fn_decl;
+  cog::FnSig* sig;
 
   cog::Type* type;
   cog::Block* block;
@@ -103,14 +104,14 @@ static std::vector<T*> take_vec(std::vector<T*>* v) {
 %token KW_LOOP KW_MATCH KW_RETURN KW_BREAK KW_CONTINUE KW_COMPTIME KW_DYN KW_SELF_TYPE
 %token KW_TRUE KW_FALSE
 
-%token TOK_COLONCOLON TOK_COLONCOLON_LBRACE TOK_ARROW TOK_FATARROW TOK_EQEQ TOK_NEQ TOK_LE TOK_GE TOK_ANDAND TOK_OROR
+%token TOK_COLONCOLON TOK_COLONCOLON_LBRACE TOK_ARROW TOK_FATARROW TOK_EQEQ TOK_NEQ TOK_LE TOK_GE TOK_ANDAND TOK_OROR TOK_ELLIPSIS
 
 %type <file> program
 %type <items> items
 %type <item> item item_core
 %type <vis> vis_opt
-%type <attrs> attrs_opt
-%type <attr> attr
+%type <attrs> tags tags_list_opt tags_list
+%type <attr> tag
 %type <path> path
 %type <idents> path_segments
 %type <ident> path_seg
@@ -125,7 +126,8 @@ static std::vector<T*> take_vec(std::vector<T*>* v) {
 %type <types> types_opt types
 
 %type <param> param
-%type <params> params_opt params
+%type <params> params
+%type <sig> fn_sig
 %type <fn_decl> fn_decl
 
 %type <field_decl> field_decl
@@ -172,7 +174,7 @@ static std::vector<T*> take_vec(std::vector<T*>* v) {
 %right UNARY
 
 %destructor { free($$); } IDENT STRING use_alias_opt
-%destructor { delete $$; } items attrs_opt path_segments qpath_segments use_trees_opt use_trees fields_opt fields variants_opt variants params_opt params trait_items_opt trait_items impl_items_opt impl_items stmts args_opt args field_inits_opt field_inits match_arms_opt match_arms pat_list_opt pat_list pat_fields_opt pat_fields
+%destructor { delete $$; } items tags tags_list_opt tags_list path_segments qpath_segments use_trees_opt use_trees fields_opt fields variants_opt variants params trait_items_opt trait_items impl_items_opt impl_items stmts args_opt args field_inits_opt field_inits match_arms_opt match_arms pat_list_opt pat_list pat_fields_opt pat_fields
 
 %%
 
@@ -190,11 +192,10 @@ items
   ;
 
 item
-  : attrs_opt vis_opt item_core {
-      $3->attrs = take_vec($1);
-      $3->vis = $2;
-      $3->span = SPAN(@$);
-      $$ = $3;
+  : vis_opt item_core {
+      $2->vis = $1;
+      $2->span = SPAN(@$);
+      $$ = $2;
     }
   ;
 
@@ -203,69 +204,127 @@ vis_opt
   | KW_PUB { $$ = cog::Visibility::Pub; }
   ;
 
-attrs_opt
-  : /* empty */ { $$ = vec_new<cog::Attr>(); }
-  | attrs_opt attr { $$ = vec_push($1, $2); }
+tags
+  : '[' tags_list_opt ']' { $$ = $2; }
   ;
 
-attr
-  : '#' '[' path ']' { $$ = MK(cog::Attr, @$, $3, nullptr); }
-  | '#' '[' path '(' path ')' ']' { $$ = MK(cog::Attr, @$, $3, $5); }
+tags_list_opt
+  : /* empty */ { $$ = vec_new<cog::Attr>(); }
+  | tags_list { $$ = $1; }
+  ;
+
+tags_list
+  : tags_list ',' tag { $$ = vec_push($1, $3); }
+  | tags_list ',' { $$ = $1; }
+  | tag { $$ = vec1($1); }
+  ;
+
+tag
+  : path { $$ = MK(cog::Attr, @$, $1, nullptr); }
+  | path '(' path ')' { $$ = MK(cog::Attr, @$, $1, $3); }
   ;
 
 item_core
   : KW_USE use_tree ';' {
       $$ = MK(cog::ItemUse, @$, std::vector<cog::Attr*>{}, cog::Visibility::Private, $2);
     }
+  | KW_USE tags use_tree ';' {
+      $$ = MK(cog::ItemUse, @$, take_vec($2), cog::Visibility::Private, $3);
+    }
   | KW_MOD IDENT '{' items '}' {
       std::vector<cog::Item*> body = take_vec($4);
       $$ = MK(
           cog::ItemModInline, @$, std::vector<cog::Attr*>{}, cog::Visibility::Private, cog::take_str($2), std::move(body));
     }
+  | KW_MOD tags IDENT '{' items '}' {
+      std::vector<cog::Item*> body = take_vec($5);
+      $$ = MK(cog::ItemModInline, @$, take_vec($2), cog::Visibility::Private, cog::take_str($3), std::move(body));
+    }
   | KW_MOD IDENT ';' {
       $$ = MK(cog::ItemModDecl, @$, std::vector<cog::Attr*>{}, cog::Visibility::Private, cog::take_str($2));
+    }
+  | KW_MOD tags IDENT ';' {
+      $$ = MK(cog::ItemModDecl, @$, take_vec($2), cog::Visibility::Private, cog::take_str($3));
     }
   | KW_STRUCT IDENT '{' fields_opt '}' {
       std::vector<cog::FieldDecl*> fs = take_vec($4);
       $$ = MK(
           cog::ItemStruct, @$, std::vector<cog::Attr*>{}, cog::Visibility::Private, cog::take_str($2), std::move(fs));
     }
+  | KW_STRUCT tags IDENT '{' fields_opt '}' {
+      std::vector<cog::FieldDecl*> fs = take_vec($5);
+      $$ = MK(cog::ItemStruct, @$, take_vec($2), cog::Visibility::Private, cog::take_str($3), std::move(fs));
+    }
   | KW_ENUM IDENT '{' variants_opt '}' {
       std::vector<cog::VariantDecl*> vs = take_vec($4);
       $$ = MK(
           cog::ItemEnum, @$, std::vector<cog::Attr*>{}, cog::Visibility::Private, cog::take_str($2), std::move(vs));
+    }
+  | KW_ENUM tags IDENT '{' variants_opt '}' {
+      std::vector<cog::VariantDecl*> vs = take_vec($5);
+      $$ = MK(cog::ItemEnum, @$, take_vec($2), cog::Visibility::Private, cog::take_str($3), std::move(vs));
     }
   | KW_TRAIT IDENT '{' trait_items_opt '}' {
       std::vector<cog::FnDecl*> ms = take_vec($4);
       $$ = MK(
           cog::ItemTrait, @$, std::vector<cog::Attr*>{}, cog::Visibility::Private, cog::take_str($2), std::move(ms));
     }
+  | KW_TRAIT tags IDENT '{' trait_items_opt '}' {
+      std::vector<cog::FnDecl*> ms = take_vec($5);
+      $$ = MK(cog::ItemTrait, @$, take_vec($2), cog::Visibility::Private, cog::take_str($3), std::move(ms));
+    }
   | KW_IMPL path '{' impl_items_opt '}' {
       std::vector<cog::ItemFn*> ms = take_vec($4);
       $$ = MK(cog::ItemImplInherent, @$, std::vector<cog::Attr*>{}, cog::Visibility::Private, $2, std::move(ms));
     }
+  | KW_IMPL tags path '{' impl_items_opt '}' {
+      std::vector<cog::ItemFn*> ms = take_vec($5);
+      $$ = MK(cog::ItemImplInherent, @$, take_vec($2), cog::Visibility::Private, $3, std::move(ms));
+    }
   | KW_IMPL path KW_FOR path '{' impl_items_opt '}' {
       std::vector<cog::ItemFn*> ms = take_vec($6);
-      $$ = MK(
-          cog::ItemImplTrait, @$, std::vector<cog::Attr*>{}, cog::Visibility::Private, $2, $4, std::move(ms));
+      $$ = MK(cog::ItemImplTrait, @$, std::vector<cog::Attr*>{}, cog::Visibility::Private, $2, $4, std::move(ms));
     }
-  | KW_FN IDENT '(' params_opt ')' ret_opt block {
-      std::vector<cog::Param*> ps = take_vec($4);
-      cog::FnSig* sig = MK(cog::FnSig, @$, std::move(ps), $6);
-      cog::FnDecl* decl = MK(cog::FnDecl, @$, cog::take_str($2), sig);
-      $$ = MK(cog::ItemFn, @$, std::vector<cog::Attr*>{}, cog::Visibility::Private, decl, $7);
+  | KW_IMPL tags path KW_FOR path '{' impl_items_opt '}' {
+      std::vector<cog::ItemFn*> ms = take_vec($7);
+      $$ = MK(cog::ItemImplTrait, @$, take_vec($2), cog::Visibility::Private, $3, $5, std::move(ms));
+    }
+  | KW_FN IDENT fn_sig block {
+      cog::FnDecl* decl = MK(cog::FnDecl, @$, cog::take_str($2), $3);
+      $$ = MK(cog::ItemFn, @$, std::vector<cog::Attr*>{}, cog::Visibility::Private, decl, $4);
+    }
+  | KW_FN tags IDENT fn_sig block {
+      cog::FnDecl* decl = MK(cog::FnDecl, @$, cog::take_str($3), $4);
+      $$ = MK(cog::ItemFn, @$, take_vec($2), cog::Visibility::Private, decl, $5);
+    }
+  | KW_FN IDENT fn_sig ';' {
+      cog::FnDecl* decl = MK(cog::FnDecl, @$, cog::take_str($2), $3);
+      $$ = MK(cog::ItemFn, @$, std::vector<cog::Attr*>{}, cog::Visibility::Private, decl, nullptr);
+    }
+  | KW_FN tags IDENT fn_sig ';' {
+      cog::FnDecl* decl = MK(cog::FnDecl, @$, cog::take_str($3), $4);
+      $$ = MK(cog::ItemFn, @$, take_vec($2), cog::Visibility::Private, decl, nullptr);
     }
   | KW_CONST IDENT ':' type '=' expr ';' {
+      $$ = MK(cog::ItemConst, @$, std::vector<cog::Attr*>{}, cog::Visibility::Private, cog::take_str($2), $4, $6);
+    }
+  | KW_CONST tags IDENT ':' type '=' expr ';' {
       $$ = MK(
-          cog::ItemConst, @$, std::vector<cog::Attr*>{}, cog::Visibility::Private, cog::take_str($2), $4, $6);
+          cog::ItemConst, @$, take_vec($2), cog::Visibility::Private, cog::take_str($3), $5, $7);
     }
   | KW_STATIC IDENT ':' type '=' expr ';' {
+      $$ = MK(cog::ItemStatic, @$, std::vector<cog::Attr*>{}, cog::Visibility::Private, cog::take_str($2), $4, $6);
+    }
+  | KW_STATIC tags IDENT ':' type '=' expr ';' {
       $$ = MK(
-          cog::ItemStatic, @$, std::vector<cog::Attr*>{}, cog::Visibility::Private, cog::take_str($2), $4, $6);
+          cog::ItemStatic, @$, take_vec($2), cog::Visibility::Private, cog::take_str($3), $5, $7);
     }
   | KW_TYPE IDENT '=' type ';' {
+      $$ = MK(cog::ItemTypeAlias, @$, std::vector<cog::Attr*>{}, cog::Visibility::Private, cog::take_str($2), $4);
+    }
+  | KW_TYPE tags IDENT '=' type ';' {
       $$ = MK(
-          cog::ItemTypeAlias, @$, std::vector<cog::Attr*>{}, cog::Visibility::Private, cog::take_str($2), $4);
+          cog::ItemTypeAlias, @$, take_vec($2), cog::Visibility::Private, cog::take_str($3), $5);
     }
   ;
 
@@ -317,30 +376,36 @@ impl_items
   ;
 
 impl_item
-  : attrs_opt vis_opt KW_FN IDENT '(' params_opt ')' ret_opt block {
-      std::vector<cog::Attr*> attrs = take_vec($1);
-      std::vector<cog::Param*> ps = take_vec($6);
-      cog::FnSig* sig = MK(cog::FnSig, @$, std::move(ps), $8);
-      cog::FnDecl* decl = MK(cog::FnDecl, @$, cog::take_str($4), sig);
-      $$ = MK(cog::ItemFn, @$, std::move(attrs), $2, decl, $9);
+  : vis_opt KW_FN IDENT fn_sig block {
+      cog::FnDecl* decl = MK(cog::FnDecl, @$, cog::take_str($3), $4);
+      $$ = MK(cog::ItemFn, @$, std::vector<cog::Attr*>{}, $1, decl, $5);
+    }
+  | vis_opt KW_FN tags IDENT fn_sig block {
+      std::vector<cog::Attr*> tags = take_vec($3);
+      cog::FnDecl* decl = MK(cog::FnDecl, @$, cog::take_str($4), $5);
+      $$ = MK(cog::ItemFn, @$, std::move(tags), $1, decl, $6);
     }
   ;
 
 fn_decl
-  : KW_FN IDENT '(' params_opt ')' ret_opt {
-      std::vector<cog::Param*> ps = take_vec($4);
-      $$ = MK(cog::FnDecl, @$, cog::take_str($2), MK(cog::FnSig, @$, std::move(ps), $6));
+  : KW_FN IDENT fn_sig {
+      $$ = MK(cog::FnDecl, @$, cog::take_str($2), $3);
     }
   ;
 
-params_opt
-  : /* empty */ { $$ = vec_new<cog::Param>(); }
-  | params { $$ = $1; }
+fn_sig
+  : '(' ')' ret_opt { $$ = MK(cog::FnSig, @$, std::vector<cog::Param*>{}, $3, /*is_variadic=*/false); }
+  | '(' params ')' ret_opt {
+      $$ = MK(cog::FnSig, @$, take_vec($2), $4, /*is_variadic=*/false);
+    }
+  | '(' params ',' TOK_ELLIPSIS ')' ret_opt {
+      $$ = MK(cog::FnSig, @$, take_vec($2), $6, /*is_variadic=*/true);
+    }
+  | '(' TOK_ELLIPSIS ')' ret_opt { $$ = MK(cog::FnSig, @$, std::vector<cog::Param*>{}, $4, /*is_variadic=*/true); }
   ;
 
 params
   : params ',' param { $$ = vec_push($1, $3); }
-  | params ',' { $$ = $1; }
   | param { $$ = vec1($1); }
   ;
 
@@ -420,11 +485,11 @@ fields
   ;
 
 field_decl
-  : attrs_opt vis_opt IDENT ':' type ',' {
-      $$ = MK(cog::FieldDecl, @$, take_vec($1), $2, cog::take_str($3), $5);
+  : vis_opt IDENT ':' type ',' {
+      $$ = MK(cog::FieldDecl, @$, std::vector<cog::Attr*>{}, $1, cog::take_str($2), $4);
     }
-  | attrs_opt vis_opt IDENT ':' type {
-      $$ = MK(cog::FieldDecl, @$, take_vec($1), $2, cog::take_str($3), $5);
+  | vis_opt IDENT ':' type {
+      $$ = MK(cog::FieldDecl, @$, std::vector<cog::Attr*>{}, $1, cog::take_str($2), $4);
     }
   ;
 

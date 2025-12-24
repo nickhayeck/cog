@@ -489,8 +489,9 @@ struct Param final : AstNode {
 struct FnSig final : AstNode {
   std::vector<Param*> params{};
   Type* ret = nullptr;  // optional; null means ()
-  explicit FnSig(Span span, std::vector<Param*> params, Type* ret)
-      : AstNode(AstNodeKind::FnSig, span), params(std::move(params)), ret(ret) {}
+  bool is_variadic = false;
+  explicit FnSig(Span span, std::vector<Param*> params, Type* ret, bool is_variadic = false)
+      : AstNode(AstNodeKind::FnSig, span), params(std::move(params)), ret(ret), is_variadic(is_variadic) {}
 };
 
 struct FnDecl final : AstNode {
@@ -660,4 +661,3 @@ std::string_view ast_kind_name(AstNodeKind kind);
 void dump_ast(std::ostream& os, const AstNode* node, int indent = 0);
 
 }  // namespace cog
-

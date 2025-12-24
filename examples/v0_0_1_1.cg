@@ -1,7 +1,6 @@
 // v0.0.1.1 parser/typechecker stress (supported in v0.0.4).
 
-#[repr(packed)]
-pub struct PackedPair {
+pub struct[repr(packed)] PackedPair {
     a: u8,
     b: u16,
 }

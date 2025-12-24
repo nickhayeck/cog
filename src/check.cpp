@@ -130,6 +130,70 @@ class Checker {
     session_.diags.push_back(Diagnostic{.severity = Severity::Error, .span = span, .message = std::move(message)});
   }
 
+  static bool path_is_ident(const Path* p, std::string_view name) {
+    if (!p || p->segments.size() != 1 || !p->segments[0]) return false;
+    return p->segments[0]->text == name;
+  }
+
+  struct TagLookup {
+    const Attr* first = nullptr;
+    size_t count = 0;
+  };
+
+  static TagLookup find_tag(const std::vector<Attr*>& attrs, std::string_view name) {
+    TagLookup out{};
+    for (const Attr* a : attrs) {
+      if (!a || !a->name) continue;
+      if (!path_is_ident(a->name, name)) continue;
+      out.count++;
+      if (!out.first) out.first = a;
+    }
+    return out;
+  }
+
+  void validate_fn_abi_tags(const ItemFn* fn, std::optional<TypeId> self_ty) {
+    if (!fn || !fn->decl || !fn->decl->sig) return;
+
+    const TagLookup ex = find_tag(fn->attrs, "extern");
+    const TagLookup exp = find_tag(fn->attrs, "export");
+
+    if (ex.count > 1) error(ex.first ? ex.first->span : fn->span, "duplicate tag `extern`");
+    if (exp.count > 1) error(exp.first ? exp.first->span : fn->span, "duplicate tag `export`");
+
+    const bool is_extern = ex.count > 0;
+    const bool is_export = exp.count > 0;
+    const bool has_body = fn->body != nullptr;
+    const bool is_variadic = fn->decl->sig->is_variadic;
+
+    if (self_ty && (is_extern || is_export || is_variadic)) {
+      error(fn->span, "`extern`/`export`/varargs are only supported on free functions");
+      return;
+    }
+
+    if (is_extern && is_export) error(fn->span, "a function cannot be both `extern` and `export`");
+
+    if (is_extern && ex.first && ex.first->arg) error(ex.first->span, "`extern` does not take an argument in v0.0.x");
+
+    if (is_export && exp.first) {
+      if (!exp.first->arg) {
+        error(exp.first->span, "`export` requires an ABI argument (e.g. `fn[export(C)] ...`)");
+      } else if (!path_is_ident(exp.first->arg, "C")) {
+        error(exp.first->span, "unsupported export ABI (only `C` is supported in v0.0.x)");
+      }
+    }
+
+    if (!has_body && !is_extern) error(fn->span, "function declarations without a body must be marked `fn[extern]`");
+    if (has_body && is_extern) error(fn->span, "`fn[extern]` declarations must not have a body");
+    if (!has_body && is_export) error(fn->span, "`fn[export(C)]` requires a body");
+
+    if (is_variadic) {
+      if (!is_extern) error(fn->span, "variadics (`...`) are only supported for `fn[extern]` declarations");
+      if (has_body) error(fn->span, "variadic functions must not have a body (extern-only)");
+      if (is_export) error(fn->span, "`fn[export(C)]` cannot be variadic in v0.0.x");
+      if (fn->decl->sig->params.empty()) error(fn->span, "variadic extern functions must have at least one fixed parameter");
+    }
+  }
+
   void predeclare_nominals() {
     for (const Module& m : crate_.modules) {
       for (Item* item : m.items) {
@@ -191,6 +255,27 @@ class Checker {
       }
       info.variants.insert({v->name, std::move(vi)});
     }
+
+    // Validate `enum[repr(<int>)]`: only valid on fieldless enums (C-style enums).
+    bool has_int_repr = false;
+    for (const Attr* a : e->attrs) {
+      if (!a || !a->name || !path_is_ident(a->name, "repr") || !a->arg) continue;
+      if (!a->arg || a->arg->segments.size() != 1 || !a->arg->segments[0]) continue;
+      if (types_.parse_int_kind(a->arg->segments[0]->text)) {
+        has_int_repr = true;
+        break;
+      }
+    }
+    if (has_int_repr) {
+      for (const VariantDecl* v : e->variants) {
+        if (!v) continue;
+        if (!v->payload.empty()) {
+          error(v->span, "`enum[repr(<int>)]` requires a fieldless enum (no payload variants)");
+          break;
+        }
+      }
+    }
+
     enum_info_.insert({e, std::move(info)});
   }
 
@@ -246,6 +331,10 @@ class Checker {
     for (size_t i = 0; i < f.params.size(); i++) {
       if (i) out += ", ";
       out += types.to_string(f.params[i]);
+    }
+    if (f.is_variadic) {
+      if (!f.params.empty()) out += ", ";
+      out += "...";
     }
     out += ") -> ";
     out += types.to_string(f.ret);
@@ -323,6 +412,9 @@ class Checker {
       if (seen.contains(decl->name)) {
         error(decl->span, "duplicate method `" + decl->name + "` in trait `" + tr->name + "`");
         continue;
+      }
+      if (decl->sig->is_variadic) {
+        error(decl->span, "trait methods cannot be variadic (`...`)");
       }
       seen.insert(decl->name);
       set.order.push_back(decl->name);
@@ -431,11 +523,13 @@ class Checker {
 
   void collect_fn_sig(ModuleId mid, const ItemFn* fn, std::optional<TypeId> self_ty, bool allow_self) {
     if (!fn || !fn->decl || !fn->decl->sig) return;
+    validate_fn_abi_tags(fn, self_ty);
     fn_info_.insert({fn, lower_fn_sig(mid, fn->decl->sig, self_ty, allow_self)});
   }
 
   FnInfo lower_fn_sig(ModuleId mid, const FnSig* sig, std::optional<TypeId> self_ty, bool allow_self) {
     FnInfo out{};
+    out.is_variadic = sig->is_variadic;
     out.ret = sig->ret ? lower_type(mid, sig->ret, /*allow_unsized=*/false, self_ty, allow_self) : types_.unit();
     for (const Param* p : sig->params) {
       if (!p) continue;
@@ -1471,15 +1565,49 @@ class Checker {
     if (it == fn_info_.end()) return {.type = types_.error()};
 
     const FnInfo& sig = it->second;
-    if (args.size() != sig.params.size()) {
-      error(fn->span, "call arity mismatch");
-      return {.type = sig.ret};
+    const size_t fixed = sig.params.size();
+    if (!sig.is_variadic) {
+      if (args.size() != fixed) {
+        error(fn->span, "call arity mismatch");
+        return {.type = sig.ret};
+      }
+    } else {
+      if (args.size() < fixed) {
+        error(fn->span, "call arity mismatch (variadic function requires at least " + std::to_string(fixed) + " args)");
+        return {.type = sig.ret};
+      }
     }
-    for (size_t i = 0; i < args.size(); i++) {
+
+    for (size_t i = 0; i < fixed && i < args.size(); i++) {
       TypeId got = check_expr(mid, args[i], env, sig.params[i]).type;
       if (!types_.can_coerce(got, sig.params[i])) {
         error(args[i]->span,
               "argument type mismatch: expected `" + types_.to_string(sig.params[i]) + "`, got `" + types_.to_string(got) + "`");
+      }
+    }
+
+    if (sig.is_variadic) {
+      for (size_t i = fixed; i < args.size(); i++) {
+        TypeId got = check_expr(mid, args[i], env, std::nullopt).type;
+        const TypeData& gd = types_.get(got);
+        bool ok = false;
+        switch (gd.kind) {
+          case TypeKind::Bool:
+          case TypeKind::Int:
+            ok = true;
+            break;
+          case TypeKind::Ptr: {
+            const TypeData& pd = types_.get(gd.pointee);
+            ok = pd.kind != TypeKind::DynTrait && pd.kind != TypeKind::Slice;
+            break;
+          }
+          default:
+            ok = false;
+            break;
+        }
+        if (!ok) {
+          error(args[i]->span, "invalid C vararg argument type `" + types_.to_string(got) + "`");
+        }
       }
     }
     (void)expected;
