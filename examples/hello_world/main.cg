@@ -1,0 +1,9 @@
+// Minimal "hello world"
+
+fn[extern] printf(fmt: const* u8, ...) -> i32;
+
+fn main() -> i32 {
+    printf("Hello, world!\n");
+    printf("Hello, world!2\n");
+    0
+}

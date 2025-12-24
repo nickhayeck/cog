@@ -14,6 +14,7 @@ This repo contains an early C++ prototype compiler (`cogc`).
 - Front-end: parse → modules/`use` → type check + local move check → comptime const-eval for `const`/`static` and array lengths.
 - LLVM backend (early): emits runnable code for ints/bools, `if/else`, `while`/`loop` + `break/continue`, `match` on ints/bools/enums, structs, methods, and `dyn Trait` calls.
 - C interop surface (early): keyword tags on items, `fn[extern]` declarations, `fn[export(C)]` definitions, and extern-only `...` varargs.
+- String literals (early): lowered to NUL-terminated global constants (enables `printf`-style examples).
 
 ## Build and run
 Prereqs: CMake, a C++23 compiler, Flex/Bison, LLVM (C++ libraries), and `clang` (currently used as the linker driver for `--emit-exe`).

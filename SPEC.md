@@ -36,7 +36,7 @@ This spec is intentionally split into:
 ### 2.1 Tokens
 - Identifiers: `[_a-zA-Z][_a-zA-Z0-9]*` (Unicode identifier support is out of scope for v0.0.x)
 - Integer literals: decimal-only (v0.0.x); hex/binary/octal later
-- String literals: `"..."`
+- String literals: `"..."` (supports basic escapes in v0.0.x: `\\n`, `\\r`, `\\t`, `\\\"`, `\\\\`)
 - Char literals: `'a'` (later)
 - Comments:
   - Line: `// ...`
@@ -142,6 +142,10 @@ Cog is expression-oriented with Rust-like blocks:
 - Control flow: `if/else`, `while`, `loop`, `break`, `continue`, `return`
 - Pattern matching: `match expr { pat (if guard)? => expr_or_block, ... }`
 - Calls, method calls, field access, indexing, `as` casts
+
+String literals (v0.0.x):
+- A string literal expression evaluates to a pointer to an immutable, NUL-terminated byte sequence in static storage.
+- Its type is `const* u8` (C string) in the current prototype.
 
 ## 6. Patterns
 

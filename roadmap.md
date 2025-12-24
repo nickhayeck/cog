@@ -71,12 +71,16 @@ Status: **v0.0.12 is implemented** (front-end + layout + LLVM codegen + dyn trai
 - LLVM codegen for `match` on ints/bools/enums (ordered decision chain) with basic bindings and guards.
 - LLVM representation for enums (tag + payload) and runtime constructors (including unit variants as values).
 
-### v0.0.12 — FFI surface (tags + extern/export + varargs) (done)
+### v0.0.12 — FFI surface (tags + extern/export + varargs) + string literals (done)
 - Migrate fully from `#[...]` to keyword tags after item keywords (`struct[...]`, `enum[...]`, `fn[...]`).
 - Implement `fn[extern]` imported declarations (no body) + extern-only `...` C varargs.
 - Implement `fn[export(C)]` exported definitions (body required; symbol name is unmangled).
 - Enforce `enum[repr(<int>)]` only on fieldless enums.
 - LLVM backend: avoid mangling for extern/export functions; emit vararg function types and apply basic C vararg promotions at call sites.
+- String literals:
+  - Decode basic escapes in the lexer (`\\n`, `\\r`, `\\t`, `\\\"`, `\\\\`).
+  - Lower to NUL-terminated global constants and use `const* u8` as the prototype type for C interop.
+  - Example: `examples/hello_world/main.cg`.
 
 ## Next milestones
 

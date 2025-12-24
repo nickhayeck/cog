@@ -1084,7 +1084,8 @@ class Checker {
         break;
       }
       case AstNodeKind::ExprString:
-        r = {.type = types_.ptr(Mutability::Const, types_.slice(types_.int_(IntKind::U8)))};
+        // For now, string literals are C strings: `const* u8` pointing to a NUL-terminated byte sequence in static storage.
+        r = {.type = types_.ptr(Mutability::Const, types_.int_(IntKind::U8))};
         break;
       case AstNodeKind::ExprBlock:
         r = check_block(mid, static_cast<const ExprBlock*>(expr)->block, env, expected);
@@ -1484,7 +1485,7 @@ class Checker {
       return {.type = types_.ptr(Mutability::Mut, p.type)};
     }
     if (callee->segments.size() == 2 && callee->segments[0]->text == "builtin" && callee->segments[1]->text == "compile_error") {
-      TypeId msg_ty = types_.ptr(Mutability::Const, types_.slice(types_.int_(IntKind::U8)));
+      TypeId msg_ty = types_.ptr(Mutability::Const, types_.int_(IntKind::U8));
       if (call->args.size() != 1) {
         error(call->span, "builtin::compile_error expects 1 argument");
         return {.type = expected.value_or(types_.unit()), .diverged = true};

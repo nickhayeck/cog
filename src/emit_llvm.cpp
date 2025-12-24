@@ -23,6 +23,7 @@
 #include <llvm/Target/TargetMachine.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
@@ -142,7 +143,20 @@ struct ItemLocator {
         item_module[item] = mid;
         if (item->kind == AstNodeKind::ItemFn) {
           auto* fn = static_cast<const ItemFn*>(item);
-          if (fn->decl) fn_symbol.insert({fn, mangle_in_module(mid, sanitize(fn->decl->name))});
+          // if we have an extern/export attr, we shouldn't mangle the name at all
+          bool no_mangle = false;
+          for (const Attr* a : fn->attrs) {
+            if (!a || !a->name) continue;
+            if (path_is_ident(a->name, "extern") || path_is_ident(a->name, "export")) {
+              no_mangle = true;
+              break;
+            }
+          }
+          // insert into map
+          if (fn->decl) {
+              auto name = no_mangle ? fn->decl->name : mangle_in_module(mid, sanitize(fn->decl->name));
+              fn_symbol.insert({fn, name});
+          }
         }
         if (item->kind == AstNodeKind::ItemImplInherent) {
           auto* impl = static_cast<const ItemImplInherent*>(item);
@@ -1214,6 +1228,14 @@ class LlvmBackend {
         auto* i = static_cast<const ExprInt*>(e);
         llvm::Type* ll_ty = llvm_type(ty);
         return CgValue{.type = ty, .value = llvm::ConstantInt::get(ll_ty, static_cast<std::uint64_t>(i->value), /*isSigned=*/true)};
+      }
+      case AstNodeKind::ExprString: {
+        auto* s = static_cast<const ExprString*>(e);
+        llvm::GlobalVariable* g = builder_.CreateGlobalString(llvm::StringRef(s->value), "str", /*AddressSpace=*/0, module_.get());
+        llvm::Constant* z = llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx_), 0);
+        std::array<llvm::Constant*, 2> idxs{z, z};
+        llvm::Constant* v = llvm::ConstantExpr::getInBoundsGetElementPtr(g->getValueType(), g, idxs);
+        return CgValue{.type = ty, .value = builder_.CreateBitCast(v, ptr_ty())};
       }
       case AstNodeKind::ExprStructLit: {
         auto* sl = static_cast<const ExprStructLit*>(e);

@@ -12,7 +12,7 @@ Notes:
 ## Lexical notes
 - Identifiers: `[A-Za-z_][A-Za-z0-9_]*`
 - Integers: `[0-9]+` (decimal only)
-- Strings: `"..."` (escapes are lexed; semantics are future work)
+- Strings: `"..."` (v0.0.x supports basic escapes: `\\n`, `\\r`, `\\t`, `\\\"`, `\\\\`)
 - Comments: `// ...` and `/* ... */`
 
 ## EBNF (approximate)

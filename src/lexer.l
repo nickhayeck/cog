@@ -28,14 +28,56 @@ static char* dup_yytext() {
 }
 
 static char* dup_string_literal() {
-  // yytext includes quotes; keep the raw bytes between them for v0.0.1.
+  // yytext includes quotes; decode a small set of escapes for v0.0.x.
+  //
+  // NOTE: this returns a NUL-terminated C string because the parser consumes it
+  // via `take_str(char*)`. As a result, embedded `\0` is not supported yet.
   size_t len = static_cast<size_t>(yyleng);
   if (len < 2) return dup_yytext();
-  char* out = static_cast<char*>(std::malloc(len - 1));
+
+  // Worst case: no escapes, size is (len - 2) + 1 for NUL.
+  char* out = static_cast<char*>(std::malloc(len));
   if (!out) return nullptr;
-  std::memcpy(out, yytext + 1, len - 2);
-  out[len - 2] = '\0';
-  return out;
+
+  size_t j = 0;
+  for (size_t i = 1; i + 1 < len; i++) {
+    char c = yytext[i];
+    if (c != '\\') {
+      out[j++] = c;
+      continue;
+    }
+    if (i + 1 >= len - 1) {
+      out[j++] = '\\';
+      break;
+    }
+    char esc = yytext[++i];
+    switch (esc) {
+      case 'n':
+        out[j++] = '\n';
+        break;
+      case 'r':
+        out[j++] = '\r';
+        break;
+      case 't':
+        out[j++] = '\t';
+        break;
+      case '\\':
+        out[j++] = '\\';
+        break;
+      case '"':
+        out[j++] = '"';
+        break;
+      default:
+        // Keep unknown escapes as-is for now (e.g. "\xNN" will remain "xNN").
+        out[j++] = esc;
+        break;
+    }
+  }
+  out[j] = '\0';
+
+  // Shrink to fit (best effort).
+  char* shrunk = static_cast<char*>(std::realloc(out, j + 1));
+  return shrunk ? shrunk : out;
 }
 
 %}
