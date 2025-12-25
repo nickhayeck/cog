@@ -44,10 +44,12 @@ namespace {
 // This is a direct AST→LLVM IR emitter for the current v0.0.x subset; it is
 // intentionally simple and prioritizes debuggability over optimization.
 //
-// Key ABI notes (see SPEC.md for the language-level contract):
+// Key ABI notes:
+// - Core v0.1 intent: see `spec/layout_abi.md`.
+// - Prototype-only details (e.g. legacy dyn dispatch): see `SPEC.md`.
 // - Pointers are modeled as ordinary LLVM pointers (opaque `ptr`); we do not
 //   attach `noalias` and we assume pointers may alias freely.
-// - `*mut dyn Trait` / `*const dyn Trait` are lowered to `{ data_ptr, vtable_ptr }`
+// - (Legacy) `*mut dyn Trait` / `*const dyn Trait` are lowered to `{ data_ptr, vtable_ptr }`
 //   where both fields are `ptr` and vtable slots are laid out in trait-decl order.
 // - Enums are lowered as `{ tag, payload_bytes }` where `payload_bytes` is an
 //   integer array sized/aligned by the layout engine.

@@ -1,6 +1,8 @@
-# Cog v0.0.12 grammar (draft)
+# Cog v0.0.12 prototype grammar (draft)
 
 This is an **approximate** EBNF aligned with the v0.0.12 prototype parser (`src/parser.y` + `src/lexer.l`). It describes the subset that currently parses; it is not intended to be a complete Rust grammar.
+
+Core language grammar (v0.1 draft) lives in `spec/syntax.md`. The prototype grammar differs in a few places (notably `fn[extern]` vs `fn[extern(C)]`, and legacy dynamic dispatch keywords that are not part of the v0.1 core spec).
 
 Notes:
 - No generics (types/items/traits).

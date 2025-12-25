@@ -1,6 +1,6 @@
 # Cog compiler roadmap
 
-Status: **v0.0.12 is implemented** (front-end + layout + LLVM codegen + dyn trait objects + initial C interop surface). See `examples/v0_0_12/main.cg` and `comptime_design.md`.
+Status: **v0.0.12 is implemented** (front-end + layout + LLVM codegen + initial C interop surface). See `examples/v0_0_12/main.cg` and `comptime_design.md`.
 
 ## Completed
 
@@ -14,25 +14,23 @@ Status: **v0.0.12 is implemented** (front-end + layout + LLVM codegen + dyn trai
 - Out-of-line file mapping for `mod name;`: `D/name.cg` then `D/name/mod.cg`.
 - `use` resolution for `use path;`, `use path as alias;`, `use path::{...};`.
 - Namespaces for modules/types/values + concrete diagnostics for missing items.
-- Method indexing for inherent impls and trait impls.
+- Method indexing for inherent impls.
 
 ### v0.0.4 — Type system + local move checking (done)
 - Nominal type checking for structs/enums, field access, struct literals, enum variants, calls.
-- Method calls: inherent methods first, then in-scope traits with an impl for the receiver type.
+- Method calls: inherent methods (`impl Type { ... }`).
 - `match` typing (arm unification) + match guards (`if guard` must be `bool`).
 - Pointer rules:
   - implicit `mut* T` → `const* T` coercion
-  - `dyn Trait` and `[T]` must appear behind pointers
+  - `[T]` must appear behind pointers
 - Conservative local move checker:
   - rejects use-after-move of locals
   - assignment re-initializes locals
   - `Copy` modeled for primitives/pointers and aggregates of `Copy`
 
-### v0.0.5 — Trait objects + vtables (typing) (done)
-- Type-check `receiver.method(...)` where the receiver is `const* dyn Trait` / `mut* dyn Trait` using the trait method set.
-- Validate trait impls: no extra methods, no missing methods, and method signatures match (with `Self` substitution).
-- Object-safety (minimal): dyn-dispatchable methods must take `self: const* Self` or `self: mut* Self` and must not mention `Self` elsewhere.
-- Note: v0.0.10 implements LLVM lowering for dyn calls (vtables + indirect dispatch).
+### v0.0.5 — Legacy: dynamic dispatch scaffolding (done; not part of v0.1 spec)
+- The prototype implemented a trait/dyn object system for experimentation.
+- The v0.1 core language spec removes this mechanism; users can hand-roll vtables where needed.
 
 ### v0.0.6 — Comptime interpreter (minimal, useful) (done)
 - Implement a minimal comptime interpreter for:
@@ -43,7 +41,7 @@ Status: **v0.0.12 is implemented** (front-end + layout + LLVM codegen + dyn trai
   - `const` / `static` initializers (all are evaluated in v0.0.6)
   - array lengths `[T; N]` (length expressions are evaluated as `usize`)
 - Current limitations (planned extensions):
-  - comptime function calls and comptime method/dyn calls are not supported
+  - comptime function calls and comptime method calls are not supported
   - comptime indexing/array literals are not supported yet
 
 ### v0.0.7 — Layout engine + layout builtins (done)
@@ -60,11 +58,9 @@ Status: **v0.0.12 is implemented** (front-end + layout + LLVM codegen + dyn trai
   - `cogc --emit-exe <out> <file.cg>` (links via system `clang`)
 - Emits: ints/bools, blocks + tail expr, `if/else`, `let` + assignment, struct literals + field access, pointer deref, direct calls, method calls, and `builtin::addr_of(_mut)`.
 
-### v0.0.10 — Trait objects lowering (vtables + dyn coercions) (done)
-- `* dyn Trait` lowered to `{ data_ptr, vtable_ptr }` with typed vtable structs per trait.
-- Vtables generated for each `(Trait, ConcreteType)` impl with wrapper thunks (`i8* self` erasure).
-- Dyn coercion implemented as explicit cast: `mut* T as mut* dyn Trait` (and const variants).
-- Dyn method calls lowered to vtable loads + indirect calls.
+### v0.0.10 — Legacy: dynamic dispatch lowering (done; not part of v0.1 spec)
+- The prototype lowered dynamic-dispatch calls through vtables.
+- The v0.1 core spec does not include dynamic dispatch.
 
 ### v0.0.11 — Enums + match/loops (LLVM) (done)
 - LLVM codegen for `while`/`loop` + `break`/`continue`.
@@ -75,7 +71,7 @@ Status: **v0.0.12 is implemented** (front-end + layout + LLVM codegen + dyn trai
 - Migrate fully from `#[...]` to keyword tags after item keywords (`struct[...]`, `enum[...]`, `fn[...]`).
 - Implement `fn[extern]` imported declarations (no body) + extern-only `...` C varargs.
 - Implement `fn[export(C)]` exported definitions (body required; symbol name is unmangled).
-- Enforce `enum[repr(<int>)]` only on fieldless enums.
+- Enforce an integer-tagged enum representation only on fieldless enums (prototype syntax uses `repr(i32)`; core spec uses `tag(i32)`).
 - LLVM backend: avoid mangling for extern/export functions; emit vararg function types and apply basic C vararg promotions at call sites.
 - String literals:
   - Decode basic escapes in the lexer (`\\n`, `\\r`, `\\t`, `\\\"`, `\\\\`).
@@ -99,18 +95,17 @@ v0.1.0 should be the first “useful” release: you can compile and run small p
 
 **v0.1.0 exit criteria (must-have)**
 - End-to-end pipeline: `cogc` compiles and links an executable for a stable subset.
-- Docs: a stable `SPEC.md` for the subset + a practical `README.md`.
+- Docs: a stable core spec under `spec/` + a practical `README.md`.
 - Stable subset support:
   - modules (`mod` inline/out-of-line) + `use` trees
   - structs/enums + `match` (at least ints + enums)
   - functions + calls + methods via `impl`
-  - traits + static dispatch (in-scope traits)
-  - `dyn Trait` objects with working vtables + dyn calls
   - `const`/`static` + array lengths with deterministic comptime evaluation
 - ABI story:
   - default `repr(cog)` is implemented (layout is implementation-defined)
   - `struct[repr(C)]` structs for C interop are supported
-  - pointer/slice/dyn object representations are specified and implemented
+  - `enum[tag(IntType)]` (fieldless enums) for C-like enums
+  - pointer/slice representations are specified and implemented
 - Diagnostics and stability:
   - no crashes on malformed programs; clear span-based errors
   - basic test coverage (smoke tests + a few negative tests)
@@ -121,10 +116,9 @@ v0.1.0 should be the first “useful” release: you can compile and run small p
 - A tiny “prelude” module (core integer ops + a couple of builtins).
 
 **Open design questions (non-gating)**
-- C enums: representation + casts (`enum[repr(i32)]` and friends).
+- C enums: representation + casts (`enum[tag(i32)]` and friends).
 - Unions: do we want them, and how do they interact with `match`/pattern syntax?
 - `repr(cog)` policy boundaries: what is guaranteed vs compiler-defined?
-- Traits: role in the long-term design (esp. without “Rust-style” safety features).
 - Meta-typing + builtins for type-parametric programming (reflection and type construction).
 - Allocation API direction.
 - Variadic arguments beyond extern-only C varargs.
@@ -132,5 +126,5 @@ v0.1.0 should be the first “useful” release: you can compile and run small p
 
 ## C interop track (ongoing; subject to revision)
 - Define surface syntax for linking control (e.g. link names, calling conventions, libraries).
-- Define `repr(C)` coverage (structs first; fieldless enums via `repr(<int>)`).
+- Define `repr(C)` coverage (structs first; fieldless enums via `tag(<int>)`).
 - Add symbol/link control tags (e.g. `link_name(...)`, `link_lib(...)`).

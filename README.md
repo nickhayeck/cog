@@ -4,17 +4,18 @@ Cog is a Rust-syntax systems language with Zig-style compile-time execution, tar
 
 This repo contains an early C++ prototype compiler (`cogc`).
 
-- Spec: `SPEC.md`
+- Core language spec (v0.1 draft): `spec/README.md`
+- Prototype notes (historical): `SPEC.md`
 - Roadmap: `roadmap.md`
-- Grammar (approx): `grammar.md`
+- Grammar: `spec/syntax.md` (core) and `grammar.md` (prototype parser)
 - Comptime design notes: `comptime_design.md`
 - Examples: `examples/`
 
 ## Status (v0.0.12)
 - Front-end: parse → modules/`use` → type check + local move check → comptime const-eval for `const`/`static` and array lengths.
-- LLVM backend (early): emits runnable code for ints/bools, `if/else`, `while`/`loop` + `break/continue`, `match` on ints/bools/enums, structs, methods, and `dyn Trait` calls.
-- C interop surface (early): keyword tags on items, `fn[extern]` declarations, `fn[export(C)]` definitions, and extern-only `...` varargs.
-- String literals (early): lowered to NUL-terminated global constants (enables `printf`-style examples).
+- LLVM backend (early): emits runnable code for ints/bools, `if/else`, `while`/`loop` + `break/continue`, `match` on ints/bools/enums, structs, and methods.
+- C interop surface (early): keyword tags on items, `fn[extern]` declarations, `fn[export(C)]` definitions, and extern-only `...` varargs (core spec uses `extern(C)` / `export(C)` tags).
+- String literals (early): currently lowered to NUL-terminated global constants for `printf`-style examples (core spec defines `"..."` as `const* [u8]` and `c"..."` as C strings).
 
 ## Build and run
 Prereqs: CMake, a C++23 compiler, Flex/Bison, LLVM (C++ libraries), and `clang` (currently used as the linker driver for `--emit-exe`).
