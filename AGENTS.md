@@ -44,7 +44,6 @@ These are project-local instructions for working in this repo.
 ## Design notes
 - Long-form comptime plan: `comptime_design.md`
 - Core language spec (v0.1 draft): `spec/README.md`
-- Prototype notes (historical): `SPEC.md`
 
 ## Flex/Bison constraints
 - The macOS system `bison` may be old; keep the grammar compatible with GNU Bison 2.3.

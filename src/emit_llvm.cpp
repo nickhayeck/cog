@@ -46,7 +46,6 @@ namespace {
 //
 // Key ABI notes:
 // - Core v0.1 intent: see `spec/layout_abi.md`.
-// - Prototype-only details (e.g. legacy dyn dispatch): see `SPEC.md`.
 // - Pointers are modeled as ordinary LLVM pointers (opaque `ptr`); we do not
 //   attach `noalias` and we assume pointers may alias freely.
 // - (Legacy) `*mut dyn Trait` / `*const dyn Trait` are lowered to `{ data_ptr, vtable_ptr }`

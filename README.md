@@ -5,7 +5,6 @@ Cog is a Rust-syntax systems language with Zig-style compile-time execution, tar
 This repo contains an early C++ prototype compiler (`cogc`).
 
 - Core language spec (v0.1 draft): `spec/README.md`
-- Prototype notes (historical): `SPEC.md`
 - Roadmap: `roadmap.md`
 - Grammar: `spec/syntax.md` (core) and `grammar.md` (prototype parser)
 - Comptime design notes: `comptime_design.md`

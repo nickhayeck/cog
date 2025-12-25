@@ -1,6 +1,6 @@
 # Cog compiler roadmap
 
-Status: **v0.0.12 is implemented** (front-end + layout + LLVM codegen + initial C interop surface). See `examples/v0_0_12/main.cg` and `comptime_design.md`.
+Status: **v0.0.12 is implemented** (front-end + layout + LLVM codegen + initial C interop surface). The v0.1 core language spec lives in `spec/README.md`.
 
 ## Completed
 
@@ -31,6 +31,7 @@ Status: **v0.0.12 is implemented** (front-end + layout + LLVM codegen + initial 
 ### v0.0.5 — Legacy: dynamic dispatch scaffolding (done; not part of v0.1 spec)
 - The prototype implemented a trait/dyn object system for experimentation.
 - The v0.1 core language spec removes this mechanism; users can hand-roll vtables where needed.
+- Scheduled removal: v0.0.14.
 
 ### v0.0.6 — Comptime interpreter (minimal, useful) (done)
 - Implement a minimal comptime interpreter for:
@@ -61,6 +62,7 @@ Status: **v0.0.12 is implemented** (front-end + layout + LLVM codegen + initial 
 ### v0.0.10 — Legacy: dynamic dispatch lowering (done; not part of v0.1 spec)
 - The prototype lowered dynamic-dispatch calls through vtables.
 - The v0.1 core spec does not include dynamic dispatch.
+- Scheduled removal: v0.0.14.
 
 ### v0.0.11 — Enums + match/loops (LLVM) (done)
 - LLVM codegen for `while`/`loop` + `break`/`continue`.
@@ -80,15 +82,125 @@ Status: **v0.0.12 is implemented** (front-end + layout + LLVM codegen + initial 
 
 ## Next milestones
 
-### v0.0.13 — Comptime functions + staged evaluation (comptime parameters)
-Goal: unlock parametric programming via comptime.
+### v0.0.13 — Spec-surface alignment (tags, enums, visibility, never type, test modules)
+Goal: make the parser/AST match `spec/syntax.md` + `spec/layout_abi.md` so we can implement against one stable surface.
 
-- Allow comptime function calls in the interpreter (bounded recursion).
-- Support `comptime` parameters as compile-time inputs to compilation:
-  - a call with comptime arguments is interpreted/partially evaluated until only runtime operations remain
-  - lowering produces concrete IR (no comptime parameters exist at runtime)
-  - memoize results by canonicalized comptime values (compiler optimization, not a language feature)
-- Add `builtin::type_info(type)` builtin backed by the layout engine.
+- Migrate function tags:
+  - accept `fn[extern(C)]` / `fn[export(C)]`
+  - keep `fn[extern]` as a deprecated alias until v0.0.14
+  - implement `extern_name("...")` / `export_name("...")` and enforce conflict rules
+- Migrate fieldless enums:
+  - accept `enum[tag(i32)]`
+  - keep `enum[repr(i32)]` as a deprecated alias until v0.0.14
+  - parse discriminants and do compile-time “fits in tag type” validation
+- Add `pub(crate)` to the parser/AST (enforcement lands in v0.0.20).
+- Parse `!` in types and reserve it in the type checker (full semantics in v0.0.18).
+- Parse `mod[test]` tags (execution model lands near the v0.1 RC).
+- Update examples to the new surface syntax (strings remain prototype-style until v0.0.15).
+
+### v0.0.14 — Clean up tech debt: remove trait/dyn + delete deprecated aliases
+Goal: stop accumulating cruft and align the implementation with the v0.1 core spec.
+
+- Remove trait/dyn parsing, AST nodes, name resolution, type checking, and LLVM lowering (not in `spec/`).
+- Remove the deprecated surface aliases from v0.0.13 (`fn[extern]`, `enum[repr(i32)]`).
+- Centralize tag parsing + validation into a single helper so future tags don’t fork logic.
+- Add a small negative-test set (parse/type errors) alongside existing smoke tests.
+
+### v0.0.15 — Strings: `"..."` slices + `c"..."` C strings
+Goal: match `spec/lexical.md` + `spec/layout_abi.md` string rules.
+
+- Lexer: add `c"..."` token form and `\\0` escape.
+- Type checker:
+  - `"..."` has type `const* [u8]` (fat pointer `{ptr,len}`)
+  - `c"..."` has type `const* u8` (NUL-terminated)
+- Codegen:
+  - emit string storage as readonly globals
+  - construct `{ptr,len}` for `"..."` at use sites
+  - keep deduplication allowed; no pointer-identity guarantee
+- Update `examples/hello_world/main.cg` to use `c"..."` for `printf`.
+
+### v0.0.16 — Comptime (step 1): function calls + resource limits + reflection
+Goal: make comptime usable beyond literals/blocks.
+
+- Interpreter: support calling non-extern functions at comptime (bounded recursion).
+- Implement deterministic resource limits:
+  - step budget
+  - recursion depth
+  - comptime heap budget (even if coarse at first)
+- Add `builtin::type_info(type)` backed by the layout engine (TypeInfo layout unstable).
+
+### v0.0.17 — Comptime (step 2): comptime parameters + residualization
+Goal: implement Zig-style staged evaluation: interpret comptime parts, emit only runtime ops.
+
+- Support `comptime` parameters in function signatures and calls.
+- Implement partial evaluation so a call with comptime args produces residual runtime code with no comptime parameters.
+- Add memoization keyed by canonicalized comptime argument values (compiler optimization only).
+- If needed for residualization, introduce a small typed internal IR (AST→IR→LLVM) to avoid entangling codegen with interpretation.
+
+### v0.0.18 — Core typing: `!`, match exhaustiveness, tuple structs, function pointers
+Goal: fill in core type semantics required for v0.1.
+
+- Numeric literals:
+  - represent integer/float literals as `comptime_int` / `comptime_float` until coerced/cast
+  - enforce “fits in type” rules for coercions and `as` casts
+- Implement `!` as a real type:
+  - diverging expressions (`return`, non-terminating `loop`, `builtin::compile_error`) have type `!`
+  - `!` coerces to any type for arm/unification
+- Match exhaustiveness:
+  - require exhaustiveness for `bool`, fieldless enums, and payload enums
+  - require `_` for integer matches (v0.1 rule)
+- Tuple structs + tuple indexing:
+  - type-check `struct Name(T0, T1, ...);`
+  - allow `.0`, `.1` field access
+- Function types/pointers:
+  - type-check `fn(T0, ...) -> R` as a type
+  - allow `const* fn(...) -> R` values and calls through them
+
+### v0.0.19 — Type expressions + minimal shipped `core` + `?`
+Goal: unlock `core::Option(T)` / `core::Result(T, E)` and the `?` operator (`spec/stdlib.md`).
+
+- Extend the type checker to support **type-level calls** in type positions (e.g. `core::Option(i32)`), evaluated at comptime.
+- Ship a minimal `core` module with:
+  - `core::Option` and `core::Result` as compiler-provided comptime type functions (no general user-defined type construction yet)
+  - enough support to type-check and pattern-match the resulting enums
+- Implement `?` for `core::Option(T)` and `core::Result(T, E)` only.
+
+### v0.0.20 — Visibility enforcement + module polish
+Goal: match `spec/modules.md` visibility rules and make modules ergonomic.
+
+- Enforce `pub` / `pub(crate)` visibility across modules.
+- Confirm “child modules can see private ancestor items” behavior (and add diagnostics when visibility fails).
+- Tighten `use` diagnostics (fully-qualified suggestions, “did you mean” for missing items).
+
+### v0.0.21 — FFI correctness: C ABI boundaries + repr(C) layout
+Goal: make extern/export “actually correct” (per `spec/layout_abi.md`).
+
+- Enforce FFI-safe types for `extern(C)`/`export(C)` signatures (v0.1: primitives + raw pointers only).
+- Implement `struct[repr(C)]` layout using LLVM `DataLayout`/`TargetMachine` so size/align/offsets match the target C ABI.
+- Implement `enum[tag(IntType)]` as “represented exactly as `IntType`” for fieldless enums (no hidden tag/payload).
+- Improve symbol-name control:
+  - default extern/export names are unmangled
+  - `*_name(...)` overrides names
+- Add an end-to-end C interop example using `malloc/free/printf` with `c"..."`.
+
+### v0.0.22 — Build modes (Debug/ReleaseSafe/ReleaseFast) + runtime traps
+Goal: begin matching `spec/build_modes.md` behavior.
+
+- Add `--build-mode {debug,release_safe,release_fast}` (default: debug for now).
+- Implement trap sites in codegen for:
+  - integer overflow (checked ops)
+  - div-by-zero, shift-range
+  - bounds checks for indexing
+  - null/misalignment traps for explicit deref
+- In `ReleaseFast`, compile these to UB-friendly IR (no checks).
+
+### v0.0.23 — v0.1.0 release candidate (docs, examples, harness)
+Goal: freeze the v0.1 subset and make it pleasant to use.
+
+- Ensure `spec/` and the compiler agree on the v0.1 subset (tag syntax, strings, enums, FFI limits).
+- Expand `examples/` to cover the v0.1 core features and C interop. Get rid of per-version examples and instead have examples named by the feature/concept they demonstrate.
+- Make `ctest` run a stable smoke suite (`--emit-exe` + run) plus a small negative suite.
+- Polish diagnostics (module paths, “did you mean”, span rendering) enough for day-to-day use.
 
 ## Release target: v0.1.0
 v0.1.0 should be the first “useful” release: you can compile and run small programs, and the surface subset is stable enough to build examples against.
@@ -98,9 +210,15 @@ v0.1.0 should be the first “useful” release: you can compile and run small p
 - Docs: a stable core spec under `spec/` + a practical `README.md`.
 - Stable subset support:
   - modules (`mod` inline/out-of-line) + `use` trees
+  - visibility: private-by-default, `pub`, `pub(crate)`
   - structs/enums + `match` (at least ints + enums)
   - functions + calls + methods via `impl`
+  - `fn[extern(C)]` / `fn[export(C)]` + extern-only `...` varargs
   - `const`/`static` + array lengths with deterministic comptime evaluation
+  - string literals: `"..."` (`const* [u8]`) and `c"..."` (`const* u8`)
+  - function pointers: `const* fn(...) -> R`
+  - `!` type and diverging expressions
+  - `core::Option(T)` / `core::Result(T, E)` + `?`
 - ABI story:
   - default `repr(cog)` is implemented (layout is implementation-defined)
   - `struct[repr(C)]` structs for C interop are supported
@@ -111,9 +229,8 @@ v0.1.0 should be the first “useful” release: you can compile and run small p
   - basic test coverage (smoke tests + a few negative tests)
 
 **v0.1.0 nice-to-have**
-- Privacy/visibility enforcement (`pub` across modules).
 - Better `match` checking (exhaustiveness + unreachable arms) for small domains.
-- A tiny “prelude” module (core integer ops + a couple of builtins).
+- A richer prelude/core surface (more integer ops and helpers).
 
 **Open design questions (non-gating)**
 - C enums: representation + casts (`enum[tag(i32)]` and friends).
