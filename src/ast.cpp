@@ -18,8 +18,6 @@ std::string_view ast_kind_name(AstNodeKind kind) {
       return "TypePath";
     case AstNodeKind::TypePtr:
       return "TypePtr";
-    case AstNodeKind::TypeDyn:
-      return "TypeDyn";
     case AstNodeKind::TypeSlice:
       return "TypeSlice";
     case AstNodeKind::TypeArray:
@@ -30,6 +28,8 @@ std::string_view ast_kind_name(AstNodeKind kind) {
       return "TypeUnit";
     case AstNodeKind::TypeType:
       return "TypeType";
+    case AstNodeKind::TypeNever:
+      return "TypeNever";
     case AstNodeKind::UseTree:
       return "UseTree";
     case AstNodeKind::ItemUse:
@@ -42,12 +42,8 @@ std::string_view ast_kind_name(AstNodeKind kind) {
       return "ItemStruct";
     case AstNodeKind::ItemEnum:
       return "ItemEnum";
-    case AstNodeKind::ItemTrait:
-      return "ItemTrait";
     case AstNodeKind::ItemImplInherent:
       return "ItemImplInherent";
-    case AstNodeKind::ItemImplTrait:
-      return "ItemImplTrait";
     case AstNodeKind::ItemFn:
       return "ItemFn";
     case AstNodeKind::ItemConst:
@@ -182,9 +178,6 @@ void dump_ast(std::ostream& os, const AstNode* node, int indent) {
     case AstNodeKind::ItemEnum:
       dump_text(os, static_cast<const ItemEnum*>(node)->name);
       break;
-    case AstNodeKind::ItemTrait:
-      dump_text(os, static_cast<const ItemTrait*>(node)->name);
-      break;
     case AstNodeKind::ItemConst:
       dump_text(os, static_cast<const ItemConst*>(node)->name);
       break;
@@ -230,7 +223,14 @@ void dump_ast(std::ostream& os, const AstNode* node, int indent) {
     case AstNodeKind::Attr: {
       auto* n = static_cast<const Attr*>(node);
       dump_ast(os, n->name, indent + 1);
-      if (n->arg) dump_ast(os, n->arg, indent + 1);
+      if (n->arg_path) {
+        dump_ast(os, n->arg_path, indent + 1);
+      } else if (n->arg_string) {
+        indent_to(os, indent + 1);
+        os << "AttrArgString";
+        dump_text(os, *n->arg_string);
+        os << '\n';
+      }
       return;
     }
     case AstNodeKind::TypePath: {
@@ -239,10 +239,6 @@ void dump_ast(std::ostream& os, const AstNode* node, int indent) {
     }
     case AstNodeKind::TypePtr: {
       dump_ast(os, static_cast<const TypePtr*>(node)->pointee, indent + 1);
-      return;
-    }
-    case AstNodeKind::TypeDyn: {
-      dump_ast(os, static_cast<const TypeDyn*>(node)->trait, indent + 1);
       return;
     }
     case AstNodeKind::TypeSlice: {
@@ -287,21 +283,9 @@ void dump_ast(std::ostream& os, const AstNode* node, int indent) {
       for (const VariantDecl* v : n->variants) dump_ast(os, v, indent + 1);
       return;
     }
-    case AstNodeKind::ItemTrait: {
-      auto* n = static_cast<const ItemTrait*>(node);
-      for (const FnDecl* m : n->methods) dump_ast(os, m, indent + 1);
-      return;
-    }
     case AstNodeKind::ItemImplInherent: {
       auto* n = static_cast<const ItemImplInherent*>(node);
       dump_ast(os, n->type_name, indent + 1);
-      for (const ItemFn* m : n->methods) dump_ast(os, m, indent + 1);
-      return;
-    }
-    case AstNodeKind::ItemImplTrait: {
-      auto* n = static_cast<const ItemImplTrait*>(node);
-      dump_ast(os, n->trait_name, indent + 1);
-      dump_ast(os, n->for_type_name, indent + 1);
       for (const ItemFn* m : n->methods) dump_ast(os, m, indent + 1);
       return;
     }
@@ -336,6 +320,7 @@ void dump_ast(std::ostream& os, const AstNode* node, int indent) {
     case AstNodeKind::VariantDecl: {
       auto* n = static_cast<const VariantDecl*>(node);
       for (const Type* t : n->payload) dump_ast(os, t, indent + 1);
+      if (n->discriminant) dump_ast(os, n->discriminant, indent + 1);
       return;
     }
     case AstNodeKind::ItemConst: {
@@ -518,4 +503,3 @@ void dump_ast(std::ostream& os, const AstNode* node, int indent) {
 }
 
 }  // namespace cog
-

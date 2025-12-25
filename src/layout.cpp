@@ -79,8 +79,8 @@ std::optional<std::uint64_t> LayoutEngine::array_len_value(const Expr* expr) con
 
 bool LayoutEngine::is_packed(const std::vector<Attr*>& attrs) {
   for (const Attr* a : attrs) {
-    if (!a || !a->name || !path_is_ident(a->name, "repr") || !a->arg) continue;
-    if (path_is_ident(a->arg, "packed")) return true;
+    if (!a || !a->name || !path_is_ident(a->name, "repr") || !a->arg_path) continue;
+    if (path_is_ident(a->arg_path, "packed")) return true;
   }
   return false;
 }
@@ -189,6 +189,8 @@ std::optional<Layout> LayoutEngine::compute_layout(TypeId ty, Span use_site) {
       std::uint64_t align = std::max<std::uint64_t>(int_align(d.int_kind), 1);
       return Layout{.size = size, .align = align, .sized = true};
     }
+    case TypeKind::Never:
+      return Layout{.size = 0, .align = 1, .sized = true};
     case TypeKind::TypeType:
       error(use_site, "`type` has no runtime layout");
       return std::nullopt;
@@ -199,13 +201,12 @@ std::optional<Layout> LayoutEngine::compute_layout(TypeId ty, Span use_site) {
       const TypeData& pd = types_.get(d.pointee);
       std::uint64_t sz = pointer_size();
       std::uint64_t al = pointer_align();
-      if (pd.kind == TypeKind::Slice || pd.kind == TypeKind::DynTrait) {
+      if (pd.kind == TypeKind::Slice) {
         sz = pointer_size() * 2;
       }
       return Layout{.size = sz, .align = al, .sized = true};
     }
     case TypeKind::Slice:
-    case TypeKind::DynTrait:
       return Layout{.size = 0, .align = 1, .sized = false};
     case TypeKind::Array: {
       auto elem_l = layout_of(d.elem, use_site);
@@ -303,6 +304,36 @@ std::optional<EnumLayout> LayoutEngine::compute_enum_layout(const ItemEnum* def,
   else if (n <= 0x1'0000'0000ULL) tag_size = 4;
   else tag_size = 8;
   std::uint64_t tag_align = tag_size;
+
+  if (it->second.tag_int) {
+    switch (*it->second.tag_int) {
+      case IntKind::I8:
+      case IntKind::U8:
+        tag_size = 1;
+        break;
+      case IntKind::I16:
+      case IntKind::U16:
+        tag_size = 2;
+        break;
+      case IntKind::I32:
+      case IntKind::U32:
+        tag_size = 4;
+        break;
+      case IntKind::I64:
+      case IntKind::U64:
+        tag_size = 8;
+        break;
+      case IntKind::I128:
+      case IntKind::U128:
+        tag_size = 16;
+        break;
+      case IntKind::Isize:
+      case IntKind::Usize:
+        tag_size = pointer_size();
+        break;
+    }
+    tag_align = std::max<std::uint64_t>(int_align(*it->second.tag_int), 1);
+  }
 
   std::uint64_t payload_size = 0;
   std::uint64_t payload_align = 1;

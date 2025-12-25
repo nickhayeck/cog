@@ -19,6 +19,7 @@ struct ParseState {
 extern ParseState* g_parse_state;
 
 std::string take_str(char* s);  // takes ownership and frees
+std::string take_string(std::string* s);  // takes ownership and deletes
 void push_error(Span span, std::string message);
 
 template <typename T, typename... Args>
@@ -28,4 +29,3 @@ T* mk(Span span, Args&&... args) {
 }
 
 }  // namespace cog
-

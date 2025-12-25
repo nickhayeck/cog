@@ -1,0 +1,13 @@
+// Raw pointers: `&` / `&mut`, deref, and assignment through pointers.
+
+fn main() -> i32 {
+    let mut x: i32 = 0;
+    let px: mut* i32 = &mut x;
+
+    *px = 41;
+
+    let cx: const* i32 = px;
+    let y: i32 = *cx;
+
+    y + 1
+}

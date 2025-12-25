@@ -6,7 +6,7 @@ use util::{Counter, Sink};
 
 fn main() -> i32 {
     let mut c: Counter = Counter { n: 0 };
-    let cp: mut* Counter = builtin::addr_of_mut(c);
+    let cp: mut* Counter = &mut c;
     let ds: mut* dyn Sink = cp as mut* dyn Sink;
 
     ds.write(5 as u8);
@@ -14,4 +14,3 @@ fn main() -> i32 {
 
     c.get()
 }
-

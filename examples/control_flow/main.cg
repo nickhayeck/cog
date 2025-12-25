@@ -1,4 +1,4 @@
-// v0.0.11 (early): LLVM codegen for `while`/`loop` + `break`/`continue` and `match` on enums.
+// Control flow (`while`/`loop`, `break`/`continue`) + `match` on enums (originally v0.0.11).
 
 pub enum Mode {
     Off,

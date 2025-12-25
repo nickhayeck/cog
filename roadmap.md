@@ -1,6 +1,6 @@
 # Cog compiler roadmap
 
-Status: **v0.0.12 is implemented** (front-end + layout + LLVM codegen + initial C interop surface). The v0.1 core language spec lives in `spec/README.md`.
+Status: **v0.0.15 is implemented** (front-end + layout + LLVM codegen + early C interop + v0.1 surface alignment). The v0.1 core language spec lives in `spec/README.md`.
 
 ## Completed
 
@@ -31,7 +31,7 @@ Status: **v0.0.12 is implemented** (front-end + layout + LLVM codegen + initial 
 ### v0.0.5 — Legacy: dynamic dispatch scaffolding (done; not part of v0.1 spec)
 - The prototype implemented a trait/dyn object system for experimentation.
 - The v0.1 core language spec removes this mechanism; users can hand-roll vtables where needed.
-- Scheduled removal: v0.0.14.
+- Removed in v0.0.14.
 
 ### v0.0.6 — Comptime interpreter (minimal, useful) (done)
 - Implement a minimal comptime interpreter for:
@@ -57,12 +57,12 @@ Status: **v0.0.12 is implemented** (front-end + layout + LLVM codegen + initial 
   - `cogc --emit-bc <out.bc> <file.cg>`
   - `cogc --emit-obj <out.o> <file.cg>`
   - `cogc --emit-exe <out> <file.cg>` (links via system `clang`)
-- Emits: ints/bools, blocks + tail expr, `if/else`, `let` + assignment, struct literals + field access, pointer deref, direct calls, method calls, and `builtin::addr_of(_mut)`.
+- Emits: ints/bools, blocks + tail expr, `if/else`, `let` + assignment, struct literals + field access, pointer deref, direct calls, method calls, and address-of (`&` / `&mut`).
 
 ### v0.0.10 — Legacy: dynamic dispatch lowering (done; not part of v0.1 spec)
 - The prototype lowered dynamic-dispatch calls through vtables.
 - The v0.1 core spec does not include dynamic dispatch.
-- Scheduled removal: v0.0.14.
+- Removed in v0.0.14.
 
 ### v0.0.11 — Enums + match/loops (LLVM) (done)
 - LLVM codegen for `while`/`loop` + `break`/`continue`.
@@ -80,44 +80,23 @@ Status: **v0.0.12 is implemented** (front-end + layout + LLVM codegen + initial 
   - Lower to NUL-terminated global constants and use `const* u8` as the prototype type for C interop.
   - Example: `examples/hello_world/main.cg`.
 
-## Next milestones
+### v0.0.13 — Spec-surface alignment (tags, enums, visibility, never type, test modules) (done)
+- Accept `fn[extern(C)]` / `fn[export(C)]` plus `extern_name(...)` / `export_name(...)` with conflict validation.
+- Accept `enum[tag(<int>)]` for fieldless enums; parse discriminants and validate them at comptime.
+- Parse `pub(crate)`, `!`, and `mod[test]`.
 
-### v0.0.13 — Spec-surface alignment (tags, enums, visibility, never type, test modules)
-Goal: make the parser/AST match `spec/syntax.md` + `spec/layout_abi.md` so we can implement against one stable surface.
+### v0.0.14 — Clean up tech debt: remove trait/dyn + delete deprecated aliases (done)
+- Remove trait/dyn parsing, name resolution, type checking, and LLVM lowering (not in `spec/`).
+- Remove deprecated prototype surfaces like `enum[repr(i32)]`.
+- Keep historical trait/dyn examples out of smoke tests.
 
-- Migrate function tags:
-  - accept `fn[extern(C)]` / `fn[export(C)]`
-  - keep `fn[extern]` as a deprecated alias until v0.0.14
-  - implement `extern_name("...")` / `export_name("...")` and enforce conflict rules
-- Migrate fieldless enums:
-  - accept `enum[tag(i32)]`
-  - keep `enum[repr(i32)]` as a deprecated alias until v0.0.14
-  - parse discriminants and do compile-time “fits in tag type” validation
-- Add `pub(crate)` to the parser/AST (enforcement lands in v0.0.20).
-- Parse `!` in types and reserve it in the type checker (full semantics in v0.0.18).
-- Parse `mod[test]` tags (execution model lands near the v0.1 RC).
-- Update examples to the new surface syntax (strings remain prototype-style until v0.0.15).
-
-### v0.0.14 — Clean up tech debt: remove trait/dyn + delete deprecated aliases
-Goal: stop accumulating cruft and align the implementation with the v0.1 core spec.
-
-- Remove trait/dyn parsing, AST nodes, name resolution, type checking, and LLVM lowering (not in `spec/`).
-- Remove the deprecated surface aliases from v0.0.13 (`fn[extern]`, `enum[repr(i32)]`).
-- Centralize tag parsing + validation into a single helper so future tags don’t fork logic.
-- Add a small negative-test set (parse/type errors) alongside existing smoke tests.
-
-### v0.0.15 — Strings: `"..."` slices + `c"..."` C strings
-Goal: match `spec/lexical.md` + `spec/layout_abi.md` string rules.
-
+### v0.0.15 — Strings: `"..."` slices + `c"..."` C strings (done)
 - Lexer: add `c"..."` token form and `\\0` escape.
-- Type checker:
-  - `"..."` has type `const* [u8]` (fat pointer `{ptr,len}`)
-  - `c"..."` has type `const* u8` (NUL-terminated)
-- Codegen:
-  - emit string storage as readonly globals
-  - construct `{ptr,len}` for `"..."` at use sites
-  - keep deduplication allowed; no pointer-identity guarantee
-- Update `examples/hello_world/main.cg` to use `c"..."` for `printf`.
+- Type checker: `"..."` is `const* [u8]` and `c"..."` is `const* u8`.
+- Codegen: emit readonly string globals, lowering `"..."` as `{ptr,len}` and `c"..."` as NUL-terminated.
+- Update `examples/hello_world/main.cg` and add `examples/ffi_tags_strings/main.cg` (renamed from the old `v0_0_15` folder).
+
+## Next milestones
 
 ### v0.0.16 — Comptime (step 1): function calls + resource limits + reflection
 Goal: make comptime usable beyond literals/blocks.

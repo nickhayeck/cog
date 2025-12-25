@@ -176,7 +176,7 @@ This grammar sketches precedence; implementations should use a precedence parser
 ```
 expr := assign_expr
 
-assign_expr := postfix_expr "=" assign_expr
+assign_expr := unary_expr "=" assign_expr
             | logical_or_expr
 
 logical_or_expr  := logical_or_expr "||" logical_and_expr
@@ -195,7 +195,8 @@ multiplicative_expr := multiplicative_expr ("*" | "/" | "%") cast_expr
 cast_expr := cast_expr "as" type
           | unary_expr
 
-unary_expr := ("-" | "!" | "*") unary_expr
+unary_expr := ("-" | "!" | "*" | "&") unary_expr
+            | "&" "mut" unary_expr
             | postfix_expr
 
 postfix_expr := primary_expr

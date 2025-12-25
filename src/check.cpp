@@ -6,6 +6,7 @@
 #include "target.hpp"
 #include "types.hpp"
 
+#include <limits>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -87,26 +88,24 @@ class Checker {
   Checker(Session& session, const ResolvedCrate& crate, const TargetLayout& target_layout)
       : session_(session), crate_(crate), target_layout_(target_layout) {}
 
-  bool run() {
-    predeclare_nominals();
-    collect_type_layouts();
-    collect_signatures();
-    check_trait_impls();
-    check_comptime();
-    check_bodies();
-    return !session_.has_errors();
-  }
+	  bool run() {
+	    predeclare_nominals();
+	    collect_type_layouts();
+	    collect_signatures();
+	    check_comptime();
+	    check_bodies();
+	    return !session_.has_errors();
+	  }
 
   CheckedCrate finish() && {
     CheckedCrate out{};
-    out.types = std::move(types_);
-    out.struct_info = std::move(struct_info_);
-    out.enum_info = std::move(enum_info_);
-    out.trait_methods = std::move(trait_methods_);
-    out.const_types = std::move(const_types_);
-    out.static_types = std::move(static_types_);
-    out.fn_info = std::move(fn_info_);
-    out.expr_types = std::move(expr_types_);
+	    out.types = std::move(types_);
+	    out.struct_info = std::move(struct_info_);
+	    out.enum_info = std::move(enum_info_);
+	    out.const_types = std::move(const_types_);
+	    out.static_types = std::move(static_types_);
+	    out.fn_info = std::move(fn_info_);
+	    out.expr_types = std::move(expr_types_);
     out.array_lens = std::move(array_lens_);
     return out;
   }
@@ -115,14 +114,13 @@ class Checker {
   Session& session_;
   const ResolvedCrate& crate_;
   const TargetLayout& target_layout_;
-  TypeStore types_;
+	  TypeStore types_;
 
-  std::unordered_map<const ItemStruct*, StructInfo> struct_info_{};
-  std::unordered_map<const ItemEnum*, EnumInfo> enum_info_{};
-  std::unordered_map<const ItemTrait*, TraitMethodSet> trait_methods_{};
-  std::unordered_map<const ItemConst*, TypeId> const_types_{};
-  std::unordered_map<const ItemStatic*, TypeId> static_types_{};
-  std::unordered_map<const ItemFn*, FnInfo> fn_info_{};
+	  std::unordered_map<const ItemStruct*, StructInfo> struct_info_{};
+	  std::unordered_map<const ItemEnum*, EnumInfo> enum_info_{};
+	  std::unordered_map<const ItemConst*, TypeId> const_types_{};
+	  std::unordered_map<const ItemStatic*, TypeId> static_types_{};
+	  std::unordered_map<const ItemFn*, FnInfo> fn_info_{};
   std::unordered_map<const Expr*, TypeId> expr_types_{};
   std::unordered_map<const Expr*, std::uint64_t> array_lens_{};
 
@@ -156,9 +154,27 @@ class Checker {
 
     const TagLookup ex = find_tag(fn->attrs, "extern");
     const TagLookup exp = find_tag(fn->attrs, "export");
+    const TagLookup exn = find_tag(fn->attrs, "extern_name");
+    const TagLookup expn = find_tag(fn->attrs, "export_name");
+    const TagLookup inl = find_tag(fn->attrs, "inline");
 
     if (ex.count > 1) error(ex.first ? ex.first->span : fn->span, "duplicate tag `extern`");
     if (exp.count > 1) error(exp.first ? exp.first->span : fn->span, "duplicate tag `export`");
+    if (exn.count > 1) error(exn.first ? exn.first->span : fn->span, "duplicate tag `extern_name`");
+    if (expn.count > 1) error(expn.first ? expn.first->span : fn->span, "duplicate tag `export_name`");
+    if (inl.count > 1) error(inl.first ? inl.first->span : fn->span, "duplicate tag `inline`");
+
+    // Reject unknown fn tags (v0.1 spec: fixed set, may expand later).
+    for (const Attr* a : fn->attrs) {
+      if (!a || !a->name || a->name->segments.empty() || !a->name->segments[0]) continue;
+      if (a->name->segments.size() != 1) {
+        error(a->span, "invalid fn tag (expected a single identifier)");
+        continue;
+      }
+      std::string_view name = a->name->segments[0]->text;
+      const bool ok = (name == "extern" || name == "extern_name" || name == "export" || name == "export_name" || name == "inline");
+      if (!ok) error(a->span, "unknown fn tag `" + std::string(name) + "`");
+    }
 
     const bool is_extern = ex.count > 0;
     const bool is_export = exp.count > 0;
@@ -166,28 +182,70 @@ class Checker {
     const bool is_variadic = fn->decl->sig->is_variadic;
 
     if (self_ty && (is_extern || is_export || is_variadic)) {
-      error(fn->span, "`extern`/`export`/varargs are only supported on free functions");
+      error(fn->span, "`extern(C)`/`export(C)`/varargs are only supported on free functions");
       return;
     }
 
     if (is_extern && is_export) error(fn->span, "a function cannot be both `extern` and `export`");
 
-    if (is_extern && ex.first && ex.first->arg) error(ex.first->span, "`extern` does not take an argument in v0.0.x");
+    if (is_extern && ex.first) {
+      if (!ex.first->arg_path) {
+        error(ex.first->span, "`extern` requires an ABI argument (e.g. `fn[extern(C)] ...;`)");
+      } else if (!path_is_ident(ex.first->arg_path, "C")) {
+        error(ex.first->span, "unsupported extern ABI (only `C` is supported in v0.0.x)");
+      }
+      if (ex.first->arg_string) error(ex.first->span, "`extern(C)` does not accept a string argument");
+    }
 
     if (is_export && exp.first) {
-      if (!exp.first->arg) {
-        error(exp.first->span, "`export` requires an ABI argument (e.g. `fn[export(C)] ...`)");
-      } else if (!path_is_ident(exp.first->arg, "C")) {
+      if (!exp.first->arg_path) {
+        error(exp.first->span, "`export` requires an ABI argument (e.g. `fn[export(C)] ... { ... }`)");
+      } else if (!path_is_ident(exp.first->arg_path, "C")) {
         error(exp.first->span, "unsupported export ABI (only `C` is supported in v0.0.x)");
+      }
+      if (exp.first->arg_string) error(exp.first->span, "`export(C)` does not accept a string argument");
+    }
+
+    if (exn.count > 0 && !is_extern) error(exn.first ? exn.first->span : fn->span, "`extern_name(...)` requires `extern(C)`");
+    if (expn.count > 0 && !is_export) error(expn.first ? expn.first->span : fn->span, "`export_name(...)` requires `export(C)`");
+
+    if (exn.first) {
+      if (!exn.first->arg_path && !exn.first->arg_string) {
+        error(exn.first->span, "`extern_name` requires an argument");
+      } else if (exn.first->arg_path && (exn.first->arg_path->segments.size() != 1 || !exn.first->arg_path->segments[0])) {
+        error(exn.first->span, "`extern_name` requires a single identifier or a string literal");
+      }
+    }
+    if (expn.first) {
+      if (!expn.first->arg_path && !expn.first->arg_string) {
+        error(expn.first->span, "`export_name` requires an argument");
+      } else if (expn.first->arg_path && (expn.first->arg_path->segments.size() != 1 || !expn.first->arg_path->segments[0])) {
+        error(expn.first->span, "`export_name` requires a single identifier or a string literal");
       }
     }
 
-    if (!has_body && !is_extern) error(fn->span, "function declarations without a body must be marked `fn[extern]`");
-    if (has_body && is_extern) error(fn->span, "`fn[extern]` declarations must not have a body");
+    // Conflict rules: extern/export groups cannot be combined with other tags.
+    if (is_extern) {
+      for (const Attr* a : fn->attrs) {
+        if (!a || !a->name) continue;
+        if (path_is_ident(a->name, "extern") || path_is_ident(a->name, "extern_name")) continue;
+        error(a->span, "`extern(C)` functions may not have other tags in v0.0.x");
+      }
+    }
+    if (is_export) {
+      for (const Attr* a : fn->attrs) {
+        if (!a || !a->name) continue;
+        if (path_is_ident(a->name, "export") || path_is_ident(a->name, "export_name")) continue;
+        error(a->span, "`export(C)` functions may not have other tags in v0.0.x");
+      }
+    }
+
+    if (!has_body && !is_extern) error(fn->span, "function declarations without a body must be marked `fn[extern(C)]`");
+    if (has_body && is_extern) error(fn->span, "`fn[extern(C)]` declarations must not have a body");
     if (!has_body && is_export) error(fn->span, "`fn[export(C)]` requires a body");
 
     if (is_variadic) {
-      if (!is_extern) error(fn->span, "variadics (`...`) are only supported for `fn[extern]` declarations");
+      if (!is_extern) error(fn->span, "variadics (`...`) are only supported for `fn[extern(C)]` declarations");
       if (has_body) error(fn->span, "variadic functions must not have a body (extern-only)");
       if (is_export) error(fn->span, "`fn[export(C)]` cannot be variadic in v0.0.x");
       if (fn->decl->sig->params.empty()) error(fn->span, "variadic extern functions must have at least one fixed parameter");
@@ -256,21 +314,44 @@ class Checker {
       info.variants.insert({v->name, std::move(vi)});
     }
 
-    // Validate `enum[repr(<int>)]`: only valid on fieldless enums (C-style enums).
-    bool has_int_repr = false;
+    // v0.0.13: `enum[tag(<int>)]` for fieldless (C-style) enums.
+    const Attr* tag_attr = nullptr;
     for (const Attr* a : e->attrs) {
-      if (!a || !a->name || !path_is_ident(a->name, "repr") || !a->arg) continue;
-      if (!a->arg || a->arg->segments.size() != 1 || !a->arg->segments[0]) continue;
-      if (types_.parse_int_kind(a->arg->segments[0]->text)) {
-        has_int_repr = true;
-        break;
+      if (!a || !a->name) continue;
+
+      // Legacy: `enum[repr(i32)]` was used in earlier prototypes; the v0.1 spec uses `tag(i32)`.
+      if (path_is_ident(a->name, "repr") && a->arg_path && a->arg_path->segments.size() == 1 && a->arg_path->segments[0] &&
+          types_.parse_int_kind(a->arg_path->segments[0]->text)) {
+        error(a->span, "`enum[repr(<int>)]` is removed; use `enum[tag(<int>)]`");
       }
+
+      if (!path_is_ident(a->name, "tag")) continue;
+      if (tag_attr) {
+        error(a->span, "duplicate tag `tag`");
+        continue;
+      }
+      tag_attr = a;
     }
-    if (has_int_repr) {
+
+    if (tag_attr) {
+      if (tag_attr->arg_string) error(tag_attr->span, "`tag` expects an integer type argument, not a string");
+      if (!tag_attr->arg_path || tag_attr->arg_path->segments.size() != 1 || !tag_attr->arg_path->segments[0]) {
+        error(tag_attr->span, "`tag` requires an integer type argument (e.g. `enum[tag(i32)] ...`)");
+      } else {
+        auto ik = types_.parse_int_kind(tag_attr->arg_path->segments[0]->text);
+        if (!ik) {
+          error(tag_attr->span, "invalid `tag` type (expected an integer type)");
+        } else {
+          info.tag_int = *ik;
+        }
+      }
+
+      // `tag(<int>)` is only allowed on fieldless enums.
       for (const VariantDecl* v : e->variants) {
         if (!v) continue;
         if (!v->payload.empty()) {
-          error(v->span, "`enum[repr(<int>)]` requires a fieldless enum (no payload variants)");
+          error(v->span, "`enum[tag(<int>)]` requires a fieldless enum (no payload variants)");
+          info.tag_int = std::nullopt;
           break;
         }
       }
@@ -279,12 +360,12 @@ class Checker {
     enum_info_.insert({e, std::move(info)});
   }
 
-  void collect_signatures() {
-    for (ModuleId mid = 0; mid < crate_.modules.size(); mid++) {
-      const Module& m = crate_.modules[mid];
-      for (Item* item : m.items) {
-        if (!item) continue;
-        switch (item->kind) {
+	  void collect_signatures() {
+	    for (ModuleId mid = 0; mid < crate_.modules.size(); mid++) {
+	      const Module& m = crate_.modules[mid];
+	      for (Item* item : m.items) {
+	        if (!item) continue;
+	        switch (item->kind) {
           case AstNodeKind::ItemConst: {
             auto* c = static_cast<const ItemConst*>(item);
             TypeId ty = lower_type(mid, c->type, /*allow_unsized=*/false, std::nullopt, /*allow_self=*/false);
@@ -297,229 +378,22 @@ class Checker {
             static_types_.insert({s, ty});
             break;
           }
-          case AstNodeKind::ItemFn: {
-            collect_fn_sig(mid, static_cast<const ItemFn*>(item), std::nullopt, /*allow_self=*/false);
-            break;
-          }
-          case AstNodeKind::ItemTrait: {
-            auto* tr = static_cast<const ItemTrait*>(item);
-            collect_trait_method_set(mid, tr);
-            break;
-          }
-          case AstNodeKind::ItemImplInherent: {
-            auto* impl = static_cast<const ItemImplInherent*>(item);
-            TypeId self_ty = lower_type_path(mid, impl->type_name, /*allow_unsized=*/false, std::nullopt, false);
-            for (const ItemFn* mfn : impl->methods) collect_fn_sig(mid, mfn, self_ty, /*allow_self=*/true);
-            break;
-          }
-          case AstNodeKind::ItemImplTrait: {
-            auto* impl = static_cast<const ItemImplTrait*>(item);
-            TypeId self_ty = lower_type_path(mid, impl->for_type_name, /*allow_unsized=*/false, std::nullopt, false);
-            for (const ItemFn* mfn : impl->methods) collect_fn_sig(mid, mfn, self_ty, /*allow_self=*/true);
-            break;
-          }
-          default:
-            break;
-        }
-      }
-    }
-  }
-
-  static std::string fmt_sig(const TypeStore& types, const FnInfo& f) {
-    std::string out{};
-    out += "(";
-    for (size_t i = 0; i < f.params.size(); i++) {
-      if (i) out += ", ";
-      out += types.to_string(f.params[i]);
-    }
-    if (f.is_variadic) {
-      if (!f.params.empty()) out += ", ";
-      out += "...";
-    }
-    out += ") -> ";
-    out += types.to_string(f.ret);
-    return out;
-  }
-
-  bool type_contains_self(TypeId t) const {
-    const TypeData& d = types_.get(t);
-    switch (d.kind) {
-      case TypeKind::Self:
-        return true;
-      case TypeKind::Ptr:
-        return type_contains_self(d.pointee);
-      case TypeKind::Slice:
-        return type_contains_self(d.elem);
-      case TypeKind::Array:
-        return type_contains_self(d.elem);
-      case TypeKind::Tuple:
-        for (TypeId e : d.tuple_elems) {
-          if (type_contains_self(e)) return true;
-        }
-        return false;
-      case TypeKind::Error:
-      case TypeKind::Unit:
-      case TypeKind::Bool:
-      case TypeKind::Int:
-      case TypeKind::TypeType:
-      case TypeKind::Struct:
-      case TypeKind::Enum:
-      case TypeKind::DynTrait:
-        return false;
-    }
-    return false;
-  }
-
-  TypeId substitute_self(TypeId t, TypeId self_ty) {
-    const TypeData& d = types_.get(t);
-    switch (d.kind) {
-      case TypeKind::Self:
-        return self_ty;
-      case TypeKind::Ptr:
-        return types_.ptr(d.mutability, substitute_self(d.pointee, self_ty));
-      case TypeKind::Slice:
-        return types_.slice(substitute_self(d.elem, self_ty));
-      case TypeKind::Array:
-        return types_.array(substitute_self(d.elem, self_ty), d.array_len_expr);
-      case TypeKind::Tuple: {
-        std::vector<TypeId> elems{};
-        elems.reserve(d.tuple_elems.size());
-        for (TypeId e : d.tuple_elems) elems.push_back(substitute_self(e, self_ty));
-        return types_.tuple(std::move(elems));
-      }
-      case TypeKind::Error:
-      case TypeKind::Unit:
-      case TypeKind::Bool:
-      case TypeKind::Int:
-      case TypeKind::TypeType:
-      case TypeKind::Struct:
-      case TypeKind::Enum:
-      case TypeKind::DynTrait:
-        return t;
-    }
-    return t;
-  }
-
-  void collect_trait_method_set(ModuleId mid, const ItemTrait* tr) {
-    if (!tr) return;
-    if (trait_methods_.contains(tr)) return;
-
-    TraitMethodSet set{};
-    std::unordered_set<std::string> seen{};
-
-    for (const FnDecl* decl : tr->methods) {
-      if (!decl || !decl->sig) continue;
-      if (seen.contains(decl->name)) {
-        error(decl->span, "duplicate method `" + decl->name + "` in trait `" + tr->name + "`");
-        continue;
-      }
-      if (decl->sig->is_variadic) {
-        error(decl->span, "trait methods cannot be variadic (`...`)");
-      }
-      seen.insert(decl->name);
-      set.order.push_back(decl->name);
-
-      FnInfo sig = lower_fn_sig(mid, decl->sig, std::nullopt, /*allow_self=*/true);
-
-      bool object_safe = true;
-      if (sig.params.empty()) {
-        object_safe = false;
-      } else {
-        const TypeData& self_param = types_.get(sig.params[0]);
-        if (self_param.kind != TypeKind::Ptr) {
-          object_safe = false;
-        } else if (types_.get(self_param.pointee).kind != TypeKind::Self) {
-          object_safe = false;
-        }
-      }
-      for (size_t i = 1; i < sig.params.size() && object_safe; i++) {
-        if (type_contains_self(sig.params[i])) object_safe = false;
-      }
-      if (object_safe && type_contains_self(sig.ret)) object_safe = false;
-
-      set.methods.insert({decl->name, TraitMethodInfo{.sig = std::move(sig), .object_safe = object_safe}});
-    }
-
-    trait_methods_.insert({tr, std::move(set)});
-  }
-
-  void check_trait_impls() {
-    for (ModuleId mid = 0; mid < crate_.modules.size(); mid++) {
-      const Module& m = crate_.modules[mid];
-      for (Item* item : m.items) {
-        if (!item) continue;
-        if (item->kind != AstNodeKind::ItemImplTrait) continue;
-        auto* impl = static_cast<const ItemImplTrait*>(item);
-
-        const Item* trait_item = resolve_type_item(mid, impl->trait_name);
-        if (!trait_item || trait_item->kind != AstNodeKind::ItemTrait) {
-          error(impl->trait_name ? impl->trait_name->span : impl->span, "unknown trait in impl");
-          continue;
-        }
-        auto* tr = static_cast<const ItemTrait*>(trait_item);
-        auto ts_it = trait_methods_.find(tr);
-        if (ts_it == trait_methods_.end()) continue;
-        const TraitMethodSet& tset = ts_it->second;
-
-        TypeId self_ty = lower_type_path(mid, impl->for_type_name, /*allow_unsized=*/false, std::nullopt, false);
-        const TypeData& sd = types_.get(self_ty);
-        if (sd.kind != TypeKind::Struct && sd.kind != TypeKind::Enum) {
-          error(impl->for_type_name ? impl->for_type_name->span : impl->span, "trait impl target must be a nominal type");
-          continue;
-        }
-
-        std::unordered_map<std::string, const ItemFn*> impl_methods{};
-        for (const ItemFn* mfn : impl->methods) {
-          if (!mfn || !mfn->decl) continue;
-          if (impl_methods.contains(mfn->decl->name)) {
-            error(mfn->span, "duplicate method `" + mfn->decl->name + "` in trait impl");
-            continue;
-          }
-          impl_methods.insert({mfn->decl->name, mfn});
-        }
-
-        // No extra methods.
-        for (const auto& [name, mfn] : impl_methods) {
-          if (!tset.methods.contains(name)) {
-            error(mfn->span, "method `" + name + "` is not a member of trait `" + tr->name + "`");
-          }
-        }
-
-        // All required methods.
-        for (const auto& [name, tm] : tset.methods) {
-          auto it = impl_methods.find(name);
-          if (it == impl_methods.end()) {
-            error(impl->span, "missing method `" + name + "` in impl of `" + tr->name + "`");
-            continue;
-          }
-
-          auto fi = fn_info_.find(it->second);
-          if (fi == fn_info_.end()) continue;
-          const FnInfo& impl_sig = fi->second;
-          const FnInfo& trait_sig = tm.sig;
-
-          if (impl_sig.params.size() != trait_sig.params.size()) {
-            error(it->second->span, "signature mismatch for `" + name + "`: expected " + fmt_sig(types_, trait_sig) + ", got " +
-                                       fmt_sig(types_, impl_sig));
-            continue;
-          }
-
-          bool ok = true;
-          for (size_t i = 0; i < impl_sig.params.size(); i++) {
-            TypeId expected = substitute_self(trait_sig.params[i], self_ty);
-            if (!types_.equal(impl_sig.params[i], expected)) ok = false;
-          }
-          TypeId expected_ret = substitute_self(trait_sig.ret, self_ty);
-          if (!types_.equal(impl_sig.ret, expected_ret)) ok = false;
-
-          if (!ok) {
-            error(it->second->span, "signature mismatch for `" + name + "`: expected " + fmt_sig(types_, trait_sig) + ", got " +
-                                       fmt_sig(types_, impl_sig));
-          }
-        }
-      }
-    }
-  }
+	          case AstNodeKind::ItemFn: {
+	            collect_fn_sig(mid, static_cast<const ItemFn*>(item), std::nullopt, /*allow_self=*/false);
+	            break;
+	          }
+	          case AstNodeKind::ItemImplInherent: {
+	            auto* impl = static_cast<const ItemImplInherent*>(item);
+	            TypeId self_ty = lower_type_path(mid, impl->type_name, /*allow_unsized=*/false, std::nullopt, false);
+	            for (const ItemFn* mfn : impl->methods) collect_fn_sig(mid, mfn, self_ty, /*allow_self=*/true);
+	            break;
+	          }
+	          default:
+	            break;
+	        }
+	      }
+	    }
+	  }
 
   void collect_fn_sig(ModuleId mid, const ItemFn* fn, std::optional<TypeId> self_ty, bool allow_self) {
     if (!fn || !fn->decl || !fn->decl->sig) return;
@@ -539,20 +413,22 @@ class Checker {
     return out;
   }
 
-  TypeId lower_type(ModuleId mid, const Type* ty, bool allow_unsized, std::optional<TypeId> self_ty, bool allow_self) {
-    if (!ty) return types_.error();
-    switch (ty->kind) {
-      case AstNodeKind::TypeUnit:
-        return types_.unit();
-      case AstNodeKind::TypeType:
-        return types_.type_type();
-      case AstNodeKind::TypePath:
-        return lower_type_path(mid, static_cast<const TypePath*>(ty)->path, allow_unsized, self_ty, allow_self);
-      case AstNodeKind::TypePtr: {
-        auto* p = static_cast<const TypePtr*>(ty);
-        TypeId pointee = lower_type(mid, p->pointee, /*allow_unsized=*/true, self_ty, allow_self);
-        return types_.ptr(p->mutability, pointee);
-      }
+	  TypeId lower_type(ModuleId mid, const Type* ty, bool allow_unsized, std::optional<TypeId> self_ty, bool allow_self) {
+	    if (!ty) return types_.error();
+	    switch (ty->kind) {
+	      case AstNodeKind::TypeUnit:
+	        return types_.unit();
+	      case AstNodeKind::TypeType:
+	        return types_.type_type();
+	      case AstNodeKind::TypeNever:
+	        return types_.never();
+	      case AstNodeKind::TypePath:
+	        return lower_type_path(mid, static_cast<const TypePath*>(ty)->path, allow_unsized, self_ty, allow_self);
+	      case AstNodeKind::TypePtr: {
+	        auto* p = static_cast<const TypePtr*>(ty);
+	        TypeId pointee = lower_type(mid, p->pointee, /*allow_unsized=*/true, self_ty, allow_self);
+	        return types_.ptr(p->mutability, pointee);
+	      }
       case AstNodeKind::TypeSlice: {
         if (!allow_unsized) error(ty->span, "slice types must appear behind a pointer");
         TypeId elem = lower_type(mid, static_cast<const TypeSlice*>(ty)->elem, /*allow_unsized=*/false, self_ty, allow_self);
@@ -563,26 +439,17 @@ class Checker {
         TypeId elem = lower_type(mid, a->elem, /*allow_unsized=*/false, self_ty, allow_self);
         return types_.array(elem, a->len);
       }
-      case AstNodeKind::TypeTuple: {
-        auto* t = static_cast<const TypeTuple*>(ty);
-        std::vector<TypeId> elems;
-        for (const Type* e : t->elems) elems.push_back(lower_type(mid, e, /*allow_unsized=*/false, self_ty, allow_self));
-        return types_.tuple(std::move(elems));
-      }
-      case AstNodeKind::TypeDyn: {
-        if (!allow_unsized) error(ty->span, "`dyn Trait` must appear behind a pointer");
-        const Item* tr_item = resolve_type_item(mid, static_cast<const TypeDyn*>(ty)->trait);
-        if (!tr_item || tr_item->kind != AstNodeKind::ItemTrait) {
-          error(ty->span, "unknown trait in `dyn` type");
-          return types_.error();
-        }
-        return types_.dyn_trait(static_cast<const ItemTrait*>(tr_item));
-      }
-      default:
-        break;
-    }
-    return types_.error();
-  }
+	      case AstNodeKind::TypeTuple: {
+	        auto* t = static_cast<const TypeTuple*>(ty);
+	        std::vector<TypeId> elems;
+	        for (const Type* e : t->elems) elems.push_back(lower_type(mid, e, /*allow_unsized=*/false, self_ty, allow_self));
+	        return types_.tuple(std::move(elems));
+	      }
+	      default:
+	        break;
+	    }
+	    return types_.error();
+	  }
 
   const Item* resolve_type_item(ModuleId mid, const Path* path) {
     if (!path || path->segments.empty()) return nullptr;
@@ -625,23 +492,20 @@ class Checker {
     const Item* item = resolve_type_item(mid, path);
     if (!item) return types_.error();
 
-    switch (item->kind) {
-      case AstNodeKind::ItemStruct:
-        return types_.struct_(static_cast<const ItemStruct*>(item));
-      case AstNodeKind::ItemEnum:
-        return types_.enum_(static_cast<const ItemEnum*>(item));
-      case AstNodeKind::ItemTypeAlias: {
-        auto* ta = static_cast<const ItemTypeAlias*>(item);
-        return lower_type(mid, ta->aliased, allow_unsized, self_ty, allow_self);
-      }
-      case AstNodeKind::ItemTrait:
-        error(path->span, "traits are only usable via `dyn Trait`");
-        return types_.error();
-      default:
-        break;
-    }
-    return types_.error();
-  }
+	    switch (item->kind) {
+	      case AstNodeKind::ItemStruct:
+	        return types_.struct_(static_cast<const ItemStruct*>(item));
+	      case AstNodeKind::ItemEnum:
+	        return types_.enum_(static_cast<const ItemEnum*>(item));
+	      case AstNodeKind::ItemTypeAlias: {
+	        auto* ta = static_cast<const ItemTypeAlias*>(item);
+	        return lower_type(mid, ta->aliased, allow_unsized, self_ty, allow_self);
+	      }
+	      default:
+	        break;
+	    }
+	    return types_.error();
+	  }
 
   std::optional<TypeId> lower_type_value_expr(ModuleId mid, const Expr* e) {
     if (!e) return std::nullopt;
@@ -653,33 +517,27 @@ class Checker {
     return lower_type_path(mid, p, /*allow_unsized=*/false, std::nullopt, /*allow_self=*/false);
   }
 
-  void check_bodies() {
-    for (ModuleId mid = 0; mid < crate_.modules.size(); mid++) {
-      const Module& m = crate_.modules[mid];
-      for (Item* item : m.items) {
-        if (!item) continue;
+	  void check_bodies() {
+	    for (ModuleId mid = 0; mid < crate_.modules.size(); mid++) {
+	      const Module& m = crate_.modules[mid];
+	      for (Item* item : m.items) {
+	        if (!item) continue;
         switch (item->kind) {
           case AstNodeKind::ItemFn:
             check_fn_body(mid, static_cast<const ItemFn*>(item), std::nullopt);
             break;
-          case AstNodeKind::ItemImplInherent: {
-            auto* impl = static_cast<const ItemImplInherent*>(item);
-            TypeId self_ty = lower_type_path(mid, impl->type_name, false, std::nullopt, false);
-            for (const ItemFn* mfn : impl->methods) check_fn_body(mid, mfn, self_ty);
-            break;
-          }
-          case AstNodeKind::ItemImplTrait: {
-            auto* impl = static_cast<const ItemImplTrait*>(item);
-            TypeId self_ty = lower_type_path(mid, impl->for_type_name, false, std::nullopt, false);
-            for (const ItemFn* mfn : impl->methods) check_fn_body(mid, mfn, self_ty);
-            break;
-          }
-          default:
-            break;
-        }
-      }
-    }
-  }
+	          case AstNodeKind::ItemImplInherent: {
+	            auto* impl = static_cast<const ItemImplInherent*>(item);
+	            TypeId self_ty = lower_type_path(mid, impl->type_name, false, std::nullopt, false);
+	            for (const ItemFn* mfn : impl->methods) check_fn_body(mid, mfn, self_ty);
+	            break;
+	          }
+	          default:
+	            break;
+	        }
+	      }
+	    }
+	  }
 
   void check_comptime() {
     if (session_.has_errors()) return;
@@ -690,9 +548,9 @@ class Checker {
     // Evaluate array lengths that appear in item signatures and layouts.
     for (ModuleId mid = 0; mid < crate_.modules.size(); mid++) {
       const Module& m = crate_.modules[mid];
-      for (Item* item : m.items) {
-        if (!item) continue;
-        switch (item->kind) {
+	      for (Item* item : m.items) {
+	        if (!item) continue;
+	        switch (item->kind) {
           case AstNodeKind::ItemStruct: {
             auto* s = static_cast<const ItemStruct*>(item);
             for (const FieldDecl* f : s->fields) {
@@ -708,54 +566,32 @@ class Checker {
             }
             break;
           }
-          case AstNodeKind::ItemFn: {
-            auto* fn = static_cast<const ItemFn*>(item);
-            if (fn->decl && fn->decl->sig) {
-              for (const Param* p : fn->decl->sig->params) {
-                if (p) check_type_arrays(mid, p->type, eval);
-              }
-              if (fn->decl->sig->ret) check_type_arrays(mid, fn->decl->sig->ret, eval);
-            }
-            break;
-          }
-          case AstNodeKind::ItemTrait: {
-            auto* tr = static_cast<const ItemTrait*>(item);
-            for (const FnDecl* decl : tr->methods) {
-              if (!decl || !decl->sig) continue;
-              for (const Param* p : decl->sig->params) {
-                if (p) check_type_arrays(mid, p->type, eval);
-              }
-              if (decl->sig->ret) check_type_arrays(mid, decl->sig->ret, eval);
-            }
-            break;
-          }
-          case AstNodeKind::ItemImplInherent: {
-            auto* impl = static_cast<const ItemImplInherent*>(item);
-            for (const ItemFn* mfn : impl->methods) {
-              if (!mfn || !mfn->decl || !mfn->decl->sig) continue;
-              for (const Param* p : mfn->decl->sig->params) {
-                if (p) check_type_arrays(mid, p->type, eval);
-              }
-              if (mfn->decl->sig->ret) check_type_arrays(mid, mfn->decl->sig->ret, eval);
-            }
-            break;
-          }
-          case AstNodeKind::ItemImplTrait: {
-            auto* impl = static_cast<const ItemImplTrait*>(item);
-            for (const ItemFn* mfn : impl->methods) {
-              if (!mfn || !mfn->decl || !mfn->decl->sig) continue;
-              for (const Param* p : mfn->decl->sig->params) {
-                if (p) check_type_arrays(mid, p->type, eval);
-              }
-              if (mfn->decl->sig->ret) check_type_arrays(mid, mfn->decl->sig->ret, eval);
-            }
-            break;
-          }
-          case AstNodeKind::ItemConst: {
-            auto* c = static_cast<const ItemConst*>(item);
-            check_type_arrays(mid, c->type, eval);
-            break;
-          }
+	          case AstNodeKind::ItemFn: {
+	            auto* fn = static_cast<const ItemFn*>(item);
+	            if (fn->decl && fn->decl->sig) {
+	              for (const Param* p : fn->decl->sig->params) {
+	                if (p) check_type_arrays(mid, p->type, eval);
+	              }
+	              if (fn->decl->sig->ret) check_type_arrays(mid, fn->decl->sig->ret, eval);
+	            }
+	            break;
+	          }
+	          case AstNodeKind::ItemImplInherent: {
+	            auto* impl = static_cast<const ItemImplInherent*>(item);
+	            for (const ItemFn* mfn : impl->methods) {
+	              if (!mfn || !mfn->decl || !mfn->decl->sig) continue;
+	              for (const Param* p : mfn->decl->sig->params) {
+	                if (p) check_type_arrays(mid, p->type, eval);
+	              }
+	              if (mfn->decl->sig->ret) check_type_arrays(mid, mfn->decl->sig->ret, eval);
+	            }
+	            break;
+	          }
+	          case AstNodeKind::ItemConst: {
+	            auto* c = static_cast<const ItemConst*>(item);
+	            check_type_arrays(mid, c->type, eval);
+	            break;
+	          }
           case AstNodeKind::ItemStatic: {
             auto* s = static_cast<const ItemStatic*>(item);
             check_type_arrays(mid, s->type, eval);
@@ -768,6 +604,153 @@ class Checker {
           }
           default:
             break;
+        }
+      }
+    }
+    if (session_.has_errors()) return;
+
+    // Evaluate enum discriminants (fieldless only, v0.0.x).
+    auto is_signed_int = [](IntKind k) {
+      switch (k) {
+        case IntKind::I8:
+        case IntKind::I16:
+        case IntKind::I32:
+        case IntKind::I64:
+        case IntKind::I128:
+        case IntKind::Isize:
+          return true;
+        case IntKind::U8:
+        case IntKind::U16:
+        case IntKind::U32:
+        case IntKind::U64:
+        case IntKind::U128:
+        case IntKind::Usize:
+          return false;
+      }
+      return true;
+    };
+    auto int_bits = [&](IntKind k) -> std::uint32_t {
+      switch (k) {
+        case IntKind::I8:
+        case IntKind::U8:
+          return 8;
+        case IntKind::I16:
+        case IntKind::U16:
+          return 16;
+        case IntKind::I32:
+        case IntKind::U32:
+          return 32;
+        case IntKind::I64:
+        case IntKind::U64:
+          return 64;
+        case IntKind::I128:
+        case IntKind::U128:
+          return 128;
+        case IntKind::Isize:
+        case IntKind::Usize:
+          return target_layout_.pointer_bits;
+      }
+      return 64;
+    };
+    auto fits_in_int_kind = [&](std::int64_t v, IntKind k) -> bool {
+      std::uint32_t bits = int_bits(k);
+      if (bits >= 64) {
+        if (!is_signed_int(k)) return v >= 0;
+        return true;
+      }
+      if (is_signed_int(k)) {
+        const std::int64_t min = -(std::int64_t(1) << (bits - 1));
+        const std::int64_t max = (std::int64_t(1) << (bits - 1)) - 1;
+        return v >= min && v <= max;
+      }
+      if (v < 0) return false;
+      const std::uint64_t max = (std::uint64_t(1) << bits) - 1;
+      return static_cast<std::uint64_t>(v) <= max;
+    };
+
+    for (ModuleId mid = 0; mid < crate_.modules.size(); mid++) {
+      for (Item* item : crate_.modules[mid].items) {
+        if (!item || item->kind != AstNodeKind::ItemEnum) continue;
+        auto* e = static_cast<const ItemEnum*>(item);
+        auto info_it = enum_info_.find(e);
+        if (info_it == enum_info_.end()) continue;
+
+        EnumInfo& info = info_it->second;
+        info.discriminants.clear();
+
+        bool fieldless = true;
+        for (const VariantDecl* v : e->variants) {
+          if (!v) continue;
+          if (!v->payload.empty()) fieldless = false;
+        }
+
+        if (!fieldless) {
+          for (const VariantDecl* v : e->variants) {
+            if (!v || !v->discriminant) continue;
+            error(v->span, "enum discriminants are only supported on fieldless enums in v0.0.x");
+          }
+          continue;
+        }
+
+        // Default tag width (implementation detail): match the layout engine's current choice.
+        const size_t n = info.variants_in_order.size();
+        std::uint64_t tag_bytes = 4;
+        if (n <= 0x100) tag_bytes = 1;
+        else if (n <= 0x10000) tag_bytes = 2;
+        else if (n <= 0x1'0000'0000ULL) tag_bytes = 4;
+        else tag_bytes = 8;
+        const std::uint64_t tag_bits = tag_bytes * 8;
+
+        auto fits_default_tag = [&](std::int64_t v) -> bool {
+          if (v < 0) return false;
+          if (tag_bits >= 64) return true;
+          const std::uint64_t max = (std::uint64_t(1) << tag_bits) - 1;
+          return static_cast<std::uint64_t>(v) <= max;
+        };
+
+        std::unordered_map<std::int64_t, std::string> seen{};
+        std::int64_t next = 0;
+
+        for (const VariantDecl* v : e->variants) {
+          if (!v) continue;
+
+          if (v->discriminant) {
+            TypeId expected = info.tag_int ? types_.int_(*info.tag_int) : types_.int_(IntKind::I64);
+            Env env{};
+            (void)check_expr(mid, v->discriminant, env, expected);
+            if (!session_.has_errors()) {
+              auto cv = eval.eval_expr(mid, v->discriminant);
+              if (!cv || cv->kind != ComptimeValue::Kind::Int) {
+                error(v->discriminant->span, "enum discriminant must be an integer comptime expression");
+              } else {
+                next = cv->int_value;
+              }
+            }
+          }
+
+          if (info.tag_int) {
+            if (!fits_in_int_kind(next, *info.tag_int)) {
+              error(v->span, "enum discriminant does not fit in `tag(" + types_.to_string(types_.int_(*info.tag_int)) + ")`");
+            }
+          } else {
+            if (!fits_default_tag(next)) {
+              error(v->span, "enum discriminant does not fit in the default tag size for this enum; add `enum[tag(...)]`");
+            }
+          }
+
+          if (auto it = seen.find(next); it != seen.end()) {
+            error(v->span, "duplicate enum discriminant value (also used by `" + it->second + "`)");
+          } else {
+            seen.insert({next, v->name});
+          }
+
+          info.discriminants.insert({v->name, next});
+
+          if (next == std::numeric_limits<std::int64_t>::max()) {
+            error(v->span, "enum discriminant overflow");
+            break;
+          }
+          next++;
         }
       }
     }
@@ -1084,8 +1067,13 @@ class Checker {
         break;
       }
       case AstNodeKind::ExprString:
-        // For now, string literals are C strings: `const* u8` pointing to a NUL-terminated byte sequence in static storage.
-        r = {.type = types_.ptr(Mutability::Const, types_.int_(IntKind::U8))};
+        // v0.0.15: `"..."` is a byte slice pointer (`const* [u8]`); `c"..."` is a C string pointer (`const* u8`).
+        if (static_cast<const ExprString*>(expr)->is_c_string) {
+          r = {.type = types_.ptr(Mutability::Const, types_.int_(IntKind::U8))};
+        } else {
+          TypeId u8 = types_.int_(IntKind::U8);
+          r = {.type = types_.ptr(Mutability::Const, types_.slice(u8))};
+        }
         break;
       case AstNodeKind::ExprBlock:
         r = check_block(mid, static_cast<const ExprBlock*>(expr)->block, env, expected);
@@ -1326,6 +1314,16 @@ class Checker {
         }
         break;
       }
+      case AstNodeKind::ExprUnary: {
+        auto* u = static_cast<const ExprUnary*>(e);
+        if (u->op != UnaryOp::Deref) break;
+        TypeId t = check_expr(mid, u->expr, env, std::nullopt).type;
+        if (u->expr) expr_types_[u->expr] = t;
+        const TypeData& td = types_.get(t);
+        if (td.kind != TypeKind::Ptr) break;
+        if (types_.get(td.pointee).kind == TypeKind::Slice) break;
+        return {.type = td.pointee, .writable = (td.mutability == Mutability::Mut), .root_local = ""};
+      }
       default:
         break;
     }
@@ -1386,6 +1384,17 @@ class Checker {
           return {.type = types_.error()};
         }
         return {.type = td.pointee};
+      }
+      case UnaryOp::AddrOf:
+      case UnaryOp::AddrOfMut: {
+        Place p = check_place(mid, u->expr, env);
+        if (u->expr) expr_types_[u->expr] = p.type;
+        if (!types_.is_sized(p.type)) error(u->expr ? u->expr->span : u->span, "address-of requires a sized place");
+        if (u->op == UnaryOp::AddrOfMut && !p.writable) {
+          error(u->expr ? u->expr->span : u->span, "`&mut` requires a mutable place");
+        }
+        Mutability mut = (u->op == UnaryOp::AddrOfMut) ? Mutability::Mut : Mutability::Const;
+        return {.type = types_.ptr(mut, p.type)};
       }
     }
     return {.type = types_.error()};
@@ -1466,26 +1475,17 @@ class Checker {
       return {.type = types_.int_(IntKind::Usize)};
     }
     if (callee->segments.size() == 2 && callee->segments[0]->text == "builtin" && callee->segments[1]->text == "addr_of") {
-      if (call->args.size() != 1) {
-        error(call->span, "builtin::addr_of expects 1 argument");
-        return {.type = types_.error()};
-      }
-      Place p = check_place(mid, call->args[0], env);
-      if (!types_.is_sized(p.type)) error(call->args[0]->span, "builtin::addr_of requires a sized place");
-      return {.type = types_.ptr(Mutability::Const, p.type)};
+      error(call->span, "builtin::addr_of was removed; use unary `&place`");
+      if (call->args.size() == 1) (void)check_place(mid, call->args[0], env);
+      return {.type = types_.error()};
     }
     if (callee->segments.size() == 2 && callee->segments[0]->text == "builtin" && callee->segments[1]->text == "addr_of_mut") {
-      if (call->args.size() != 1) {
-        error(call->span, "builtin::addr_of_mut expects 1 argument");
-        return {.type = types_.error()};
-      }
-      Place p = check_place(mid, call->args[0], env);
-      if (!p.writable) error(call->args[0]->span, "builtin::addr_of_mut requires a mutable place");
-      if (!types_.is_sized(p.type)) error(call->args[0]->span, "builtin::addr_of_mut requires a sized place");
-      return {.type = types_.ptr(Mutability::Mut, p.type)};
+      error(call->span, "builtin::addr_of_mut was removed; use unary `&mut place`");
+      if (call->args.size() == 1) (void)check_place(mid, call->args[0], env);
+      return {.type = types_.error()};
     }
     if (callee->segments.size() == 2 && callee->segments[0]->text == "builtin" && callee->segments[1]->text == "compile_error") {
-      TypeId msg_ty = types_.ptr(Mutability::Const, types_.int_(IntKind::U8));
+      TypeId msg_ty = types_.ptr(Mutability::Const, types_.slice(types_.int_(IntKind::U8)));
       if (call->args.size() != 1) {
         error(call->span, "builtin::compile_error expects 1 argument");
         return {.type = expected.value_or(types_.unit()), .diverged = true};
@@ -1597,11 +1597,11 @@ class Checker {
           case TypeKind::Int:
             ok = true;
             break;
-          case TypeKind::Ptr: {
-            const TypeData& pd = types_.get(gd.pointee);
-            ok = pd.kind != TypeKind::DynTrait && pd.kind != TypeKind::Slice;
-            break;
-          }
+	          case TypeKind::Ptr: {
+	            const TypeData& pd = types_.get(gd.pointee);
+	            ok = pd.kind != TypeKind::Slice;
+	            break;
+	          }
           default:
             ok = false;
             break;
@@ -1632,73 +1632,12 @@ class Checker {
 
     const TypeData& nd = types_.get(nominal);
     const Item* def = nullptr;
-    if (nd.kind == TypeKind::Struct) def = static_cast<const Item*>(nd.struct_def);
-    if (nd.kind == TypeKind::Enum) def = static_cast<const Item*>(nd.enum_def);
-    if (nd.kind == TypeKind::DynTrait) {
-      if (!nd.trait_def) {
-        error(mc->span, "invalid `dyn` receiver type");
-        return {.type = types_.error()};
-      }
-      if (rd.kind != TypeKind::Ptr) {
-        error(mc->span, "calling methods on `dyn` requires a pointer receiver");
-        return {.type = types_.error()};
-      }
-
-      auto ts_it = trait_methods_.find(nd.trait_def);
-      if (ts_it == trait_methods_.end()) {
-        error(mc->span, "unknown trait in `dyn` receiver");
-        return {.type = types_.error()};
-      }
-      auto mi = ts_it->second.methods.find(mc->method);
-      if (mi == ts_it->second.methods.end()) {
-        error(mc->span, "cannot resolve method `" + mc->method + "` on `dyn " + nd.trait_def->name + "`");
-        return {.type = types_.error()};
-      }
-      const TraitMethodInfo& tm = mi->second;
-      const FnInfo& sig = tm.sig;
-      if (sig.params.empty()) {
-        error(mc->span, "trait method is missing a receiver parameter");
-        return {.type = sig.ret};
-      }
-      if (!tm.object_safe) {
-        error(mc->span, "method `" + mc->method + "` is not callable on `dyn " + nd.trait_def->name + "` (not object-safe)");
-        return {.type = sig.ret};
-      }
-
-      TypeId self_param = sig.params[0];
-      const TypeData& sp = types_.get(self_param);
-      if (sp.kind != TypeKind::Ptr || types_.get(sp.pointee).kind != TypeKind::Self) {
-        error(mc->span, "dyn-dispatchable methods must take `self: const* Self` or `self: mut* Self`");
-        return {.type = sig.ret};
-      }
-
-      TypeId expected_recv = types_.ptr(sp.mutability, nominal);
-      if (!types_.can_coerce(recv_ty, expected_recv)) {
-        error(mc->receiver->span,
-              "receiver type mismatch: expected `" + types_.to_string(expected_recv) + "`, got `" + types_.to_string(recv_ty) + "`");
-      }
-
-      if (mc->args.size() + 1 != sig.params.size()) {
-        error(mc->span, "method call arity mismatch");
-        return {.type = sig.ret};
-      }
-
-      for (size_t i = 0; i < mc->args.size(); i++) {
-        TypeId expected_arg = sig.params[i + 1];
-        TypeId got = check_expr(mid, mc->args[i], env, expected_arg).type;
-        if (!types_.can_coerce(got, expected_arg)) {
-          error(mc->args[i]->span,
-                "argument type mismatch: expected `" + types_.to_string(expected_arg) + "`, got `" + types_.to_string(got) + "`");
-        }
-      }
-
-      (void)expected;
-      return {.type = sig.ret};
-    }
-    if (!def) {
-      error(mc->span, "method calls require a nominal receiver type");
-      return {.type = types_.error()};
-    }
+	    if (nd.kind == TypeKind::Struct) def = static_cast<const Item*>(nd.struct_def);
+	    if (nd.kind == TypeKind::Enum) def = static_cast<const Item*>(nd.enum_def);
+	    if (!def) {
+	      error(mc->span, "method calls require a nominal receiver type");
+	      return {.type = types_.error()};
+	    }
 
     // Inherent first.
     const ItemFn* method = nullptr;
@@ -1707,26 +1646,10 @@ class Checker {
       if (mi != it->second.end()) method = mi->second;
     }
 
-    // Traits in scope.
-    if (!method) {
-      const Module& m = crate_.modules[mid];
-      for (const auto& [_, ty_item] : m.types) {
-        if (!ty_item || ty_item->kind != AstNodeKind::ItemTrait) continue;
-        TraitImplKey key{.trait = static_cast<const ItemTrait*>(ty_item), .type = def};
-        auto impl_it = crate_.trait_impl_methods.find(key);
-        if (impl_it == crate_.trait_impl_methods.end()) continue;
-        auto mi = impl_it->second.find(mc->method);
-        if (mi != impl_it->second.end()) {
-          method = mi->second;
-          break;
-        }
-      }
-    }
-
-    if (!method) {
-      error(mc->span, "cannot resolve method `" + mc->method + "`");
-      return {.type = types_.error()};
-    }
+	    if (!method) {
+	      error(mc->span, "cannot resolve method `" + mc->method + "`");
+	      return {.type = types_.error()};
+	    }
 
     auto fi = fn_info_.find(method);
     if (fi == fn_info_.end()) return {.type = types_.error()};

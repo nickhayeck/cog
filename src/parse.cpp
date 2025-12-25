@@ -49,6 +49,8 @@ static const char* token_name(int tok) {
       return "IDENT";
     case STRING:
       return "STRING";
+    case CSTRING:
+      return "CSTRING";
     case INT:
       return "INT";
 
@@ -58,12 +60,8 @@ static const char* token_name(int tok) {
       return "struct";
     case KW_ENUM:
       return "enum";
-    case KW_TRAIT:
-      return "trait";
     case KW_IMPL:
       return "impl";
-    case KW_FOR:
-      return "for";
     case KW_TYPE:
       return "type";
     case KW_CONST:
@@ -76,6 +74,8 @@ static const char* token_name(int tok) {
       return "use";
     case KW_PUB:
       return "pub";
+    case KW_CRATE:
+      return "crate";
     case KW_AS:
       return "as";
     case KW_LET:
@@ -100,8 +100,6 @@ static const char* token_name(int tok) {
       return "continue";
     case KW_COMPTIME:
       return "comptime";
-    case KW_DYN:
-      return "dyn";
     case KW_SELF_TYPE:
       return "Self";
     case KW_TRUE:
@@ -131,6 +129,41 @@ static const char* token_name(int tok) {
       return "||";
   }
   return nullptr;
+}
+
+static void dump_string_lit(std::ostream& os, std::string_view s) {
+  os << '"';
+  for (unsigned char c : s) {
+    switch (c) {
+      case '\n':
+        os << "\\n";
+        break;
+      case '\r':
+        os << "\\r";
+        break;
+      case '\t':
+        os << "\\t";
+        break;
+      case '\0':
+        os << "\\0";
+        break;
+      case '"':
+        os << "\\\"";
+        break;
+      case '\\':
+        os << "\\\\";
+        break;
+      default:
+        if (c >= 32 && c < 127) {
+          os << static_cast<char>(c);
+        } else {
+          static constexpr char kHex[] = "0123456789abcdef";
+          os << "\\x" << kHex[(c >> 4) & 0xf] << kHex[c & 0xf];
+        }
+        break;
+    }
+  }
+  os << '"';
 }
 
 void dump_tokens(FileId file_id, const char* path, std::ostream& os) {
@@ -166,9 +199,13 @@ void dump_tokens(FileId file_id, const char* path, std::ostream& os) {
 
     switch (tok) {
       case IDENT:
-      case STRING: {
-        std::string s = take_str(yylval.str);
-        os << " \"" << s << "\"";
+        os << " ";
+        dump_string_lit(os, take_str(yylval.cstr));
+        break;
+      case STRING:
+      case CSTRING: {
+        os << " ";
+        dump_string_lit(os, take_string(yylval.str_lit));
         break;
       }
       case INT:

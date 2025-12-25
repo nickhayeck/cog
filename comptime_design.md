@@ -143,7 +143,7 @@ At comptime, we need a model for:
 - aggregate construction (struct/enum/tuple/array)
 
 Two practical options:
-1. **Pure value interpreter** for most things + a small “comptime heap” for addressable objects (needed for `addr_of`, slices, and eventually C interop).
+1. **Pure value interpreter** for most things + a small “comptime heap” for addressable objects (needed for `&`/`&mut`, slices, and eventually C interop).
 2. A more complete VM with memory + pointers (heavier).
 
 Recommendation:
@@ -178,14 +178,14 @@ builtin::type_info(comptime T: type) -> TypeInfo
 builtin::compile_error(msg: const* [u8]) -> !
 ```
 
-### 6.3 Address builtins
+### 6.3 Address-of operators
 ```cog
-builtin::addr_of(x: T) -> const* T
-builtin::addr_of_mut(x: mut T) -> mut* T
+&place: const* T
+&mut place: mut* T
 ```
 
 Notes:
-- `addr_of`/`addr_of_mut` require a comptime memory model with stable addresses.
+- `&` / `&mut` require a comptime memory model with stable addresses.
 - `compile_error` should be allowed only in comptime contexts (or should force evaluation).
 
 ---

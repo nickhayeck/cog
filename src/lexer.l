@@ -6,6 +6,7 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <string>
 
 int yycolumn = 1;
 
@@ -27,57 +28,59 @@ static char* dup_yytext() {
   return out;
 }
 
-static char* dup_string_literal() {
+static std::string* dup_string_literal_bytes(size_t quote_start) {
   // yytext includes quotes; decode a small set of escapes for v0.0.x.
   //
-  // NOTE: this returns a NUL-terminated C string because the parser consumes it
-  // via `take_str(char*)`. As a result, embedded `\0` is not supported yet.
+  // This returns a byte string (may contain NUL) for v0.0.15+:
+  // - STRING: `"..."` -> bytes
+  // - CSTRING: `c"..."` -> bytes (codegen adds trailing NUL)
   size_t len = static_cast<size_t>(yyleng);
-  if (len < 2) return dup_yytext();
+  if (len < quote_start + 2) return new std::string{};
 
-  // Worst case: no escapes, size is (len - 2) + 1 for NUL.
-  char* out = static_cast<char*>(std::malloc(len));
-  if (!out) return nullptr;
+  size_t open_quote = quote_start;
+  size_t close_quote = len - 1;
+  if (yytext[open_quote] != '"' || yytext[close_quote] != '"') return new std::string{yytext, yytext + len};
 
-  size_t j = 0;
-  for (size_t i = 1; i + 1 < len; i++) {
+  std::string out{};
+  out.reserve(len - (quote_start + 2));
+
+  for (size_t i = open_quote + 1; i < close_quote; i++) {
     char c = yytext[i];
     if (c != '\\') {
-      out[j++] = c;
+      out.push_back(c);
       continue;
     }
-    if (i + 1 >= len - 1) {
-      out[j++] = '\\';
+    if (i + 1 >= close_quote) {
+      out.push_back('\\');
       break;
     }
     char esc = yytext[++i];
     switch (esc) {
       case 'n':
-        out[j++] = '\n';
+        out.push_back('\n');
         break;
       case 'r':
-        out[j++] = '\r';
+        out.push_back('\r');
         break;
       case 't':
-        out[j++] = '\t';
+        out.push_back('\t');
+        break;
+      case '0':
+        out.push_back('\0');
         break;
       case '\\':
-        out[j++] = '\\';
+        out.push_back('\\');
         break;
       case '"':
-        out[j++] = '"';
+        out.push_back('"');
         break;
       default:
         // Keep unknown escapes as-is for now (e.g. "\xNN" will remain "xNN").
-        out[j++] = esc;
+        out.push_back(esc);
         break;
     }
   }
-  out[j] = '\0';
-
-  // Shrink to fit (best effort).
-  char* shrunk = static_cast<char*>(std::realloc(out, j + 1));
-  return shrunk ? shrunk : out;
+  return new std::string(std::move(out));
 }
 
 %}
@@ -110,15 +113,14 @@ static char* dup_string_literal() {
 "fn"                     { return KW_FN; }
 "struct"                 { return KW_STRUCT; }
 "enum"                   { return KW_ENUM; }
-"trait"                  { return KW_TRAIT; }
 "impl"                   { return KW_IMPL; }
-"for"                    { return KW_FOR; }
 "type"                   { return KW_TYPE; }
 "const"                  { return KW_CONST; }
 "static"                 { return KW_STATIC; }
 "mod"                    { return KW_MOD; }
 "use"                    { return KW_USE; }
 "pub"                    { return KW_PUB; }
+"crate"                  { return KW_CRATE; }
 "as"                     { return KW_AS; }
 "let"                    { return KW_LET; }
 "mut"                    { return KW_MUT; }
@@ -131,16 +133,16 @@ static char* dup_string_literal() {
 "break"                  { return KW_BREAK; }
 "continue"               { return KW_CONTINUE; }
 "comptime"               { return KW_COMPTIME; }
-"dyn"                    { return KW_DYN; }
 "Self"                   { return KW_SELF_TYPE; }
 "true"                   { return KW_TRUE; }
 "false"                  { return KW_FALSE; }
 
 [0-9]+                   { yylval.int_val = std::atoll(yytext); return INT; }
 
-\"([^\"\\]|\\.)*\"       { yylval.str = dup_string_literal(); return STRING; }
+c\"([^\"\\]|\\.)*\"      { yylval.str_lit = dup_string_literal_bytes(1); return CSTRING; }
+\"([^\"\\]|\\.)*\"       { yylval.str_lit = dup_string_literal_bytes(0); return STRING; }
 
-[_a-zA-Z][_a-zA-Z0-9]*   { yylval.str = dup_yytext(); return IDENT; }
+[_a-zA-Z][_a-zA-Z0-9]*   { yylval.cstr = dup_yytext(); return IDENT; }
 
 .                        { return static_cast<unsigned char>(yytext[0]); }
 

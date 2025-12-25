@@ -1,5 +1,8 @@
+ #include <iostream>
+
 #include "emit_llvm.hpp"
 
+#include "ast.hpp"
 #include "comptime.hpp"
 #include "layout.hpp"
 #include "target.hpp"
@@ -48,8 +51,7 @@ namespace {
 // - Core v0.1 intent: see `spec/layout_abi.md`.
 // - Pointers are modeled as ordinary LLVM pointers (opaque `ptr`); we do not
 //   attach `noalias` and we assume pointers may alias freely.
-// - (Legacy) `*mut dyn Trait` / `*const dyn Trait` are lowered to `{ data_ptr, vtable_ptr }`
-//   where both fields are `ptr` and vtable slots are laid out in trait-decl order.
+// - Slice pointers (`const* [T]` / `mut* [T]`) are lowered as `{ ptr, usize }`.
 // - Enums are lowered as `{ tag, payload_bytes }` where `payload_bytes` is an
 //   integer array sized/aligned by the layout engine.
 
@@ -124,8 +126,8 @@ static bool path_is_ident(const Path* p, std::string_view name) {
 
 static bool is_packed(const std::vector<Attr*>& attrs) {
   for (const Attr* a : attrs) {
-    if (!a || !a->name || !path_is_ident(a->name, "repr") || !a->arg) continue;
-    if (path_is_ident(a->arg, "packed")) return true;
+    if (!a || !a->name || !path_is_ident(a->name, "repr") || !a->arg_path) continue;
+    if (path_is_ident(a->arg_path, "packed")) return true;
   }
   return false;
 }
@@ -144,19 +146,22 @@ struct ItemLocator {
         item_module[item] = mid;
         if (item->kind == AstNodeKind::ItemFn) {
           auto* fn = static_cast<const ItemFn*>(item);
-          // if we have an extern/export attr, we shouldn't mangle the name at all
           bool no_mangle = false;
+          std::optional<std::string> forced_symbol{};
           for (const Attr* a : fn->attrs) {
             if (!a || !a->name) continue;
-            if (path_is_ident(a->name, "extern") || path_is_ident(a->name, "export")) {
-              no_mangle = true;
-              break;
+            if (path_is_ident(a->name, "extern") || path_is_ident(a->name, "export")) no_mangle = true;
+            if (path_is_ident(a->name, "extern_name") || path_is_ident(a->name, "export_name")) {
+              if (a->arg_string) forced_symbol = *a->arg_string;
+              if (a->arg_path && a->arg_path->segments.size() == 1 && a->arg_path->segments[0]) {
+                forced_symbol = a->arg_path->segments[0]->text;
+              }
             }
           }
           // insert into map
           if (fn->decl) {
-              auto name = no_mangle ? fn->decl->name : mangle_in_module(mid, sanitize(fn->decl->name));
-              fn_symbol.insert({fn, name});
+            std::string name = forced_symbol ? *forced_symbol : (no_mangle ? fn->decl->name : mangle_in_module(mid, sanitize(fn->decl->name)));
+            fn_symbol.insert({fn, std::move(name)});
           }
         }
         if (item->kind == AstNodeKind::ItemImplInherent) {
@@ -167,19 +172,6 @@ struct ItemLocator {
               fn_symbol.insert(
                   {m,
                    mangle_in_module(mid, "inherent" + mangle_path(impl->type_name) + "$" + sanitize(m->decl->name))});
-            }
-          }
-        }
-        if (item->kind == AstNodeKind::ItemImplTrait) {
-          auto* impl = static_cast<const ItemImplTrait*>(item);
-          for (const ItemFn* m : impl->methods) {
-            item_module[static_cast<const Item*>(m)] = mid;
-            if (m && m->decl) {
-              fn_symbol.insert({m,
-                                mangle_in_module(
-                                    mid,
-                                    "impl" + mangle_path(impl->trait_name) + "$for" + mangle_path(impl->for_type_name) +
-                                        "$" + sanitize(m->decl->name))});
             }
           }
         }
@@ -233,11 +225,24 @@ struct ItemLocator {
     if (!fn || !fn->decl) return "cog$<fn>";
     auto it = fn_symbol.find(fn);
     if (it != fn_symbol.end()) return it->second;
+
+    for (const Attr* a : fn->attrs) {
+      if (!a || !a->name) continue;
+      if (path_is_ident(a->name, "extern_name") || path_is_ident(a->name, "export_name")) {
+        if (a->arg_string) return *a->arg_string;
+        if (a->arg_path && a->arg_path->segments.size() == 1 && a->arg_path->segments[0]) return a->arg_path->segments[0]->text;
+      }
+    }
     for (const Attr* a : fn->attrs) {
       if (!a || !a->name) continue;
       if (path_is_ident(a->name, "extern") || path_is_ident(a->name, "export")) return fn->decl->name;
     }
     return mangle_in_module(module_of(static_cast<const Item*>(fn)), sanitize(fn->decl->name));
+  }
+
+  std::string symbol_for_static(const ItemStatic* st) const {
+    if (!st) return "cog$<static>";
+    return mangle_in_module(module_of(static_cast<const Item*>(st)), "static$" + sanitize(st->name));
   }
 };
 
@@ -274,9 +279,7 @@ class LlvmBackend {
     module_->setDataLayout(target_machine_->createDataLayout());
 
     build_nominal_types();
-    build_trait_object_types();
     build_function_decls();
-    build_trait_vtables_and_wrappers();
     build_function_bodies();
     if (opts.emit_main_wrapper) emit_main_shim();
 
@@ -303,12 +306,12 @@ class LlvmBackend {
 
   std::unordered_map<const ItemStruct*, llvm::StructType*> struct_types_{};
   std::unordered_map<const ItemEnum*, llvm::StructType*> enum_types_{};
-  std::unordered_map<const ItemTrait*, llvm::StructType*> vtable_types_{};
-  std::unordered_map<const ItemTrait*, llvm::StructType*> dyn_types_{};
+  llvm::StructType* slice_ptr_type_ = nullptr;
 
   std::unordered_map<const ItemFn*, llvm::Function*> fn_decls_{};
-  std::unordered_map<std::string, llvm::Function*> dyn_wrappers_{};
   std::unordered_set<const ItemFn*> emitted_fns_{};
+
+  std::unordered_map<const ItemStatic*, llvm::GlobalVariable*> static_globals_{};
 
   void error(Span span, std::string message) {
     session_.diags.push_back(Diagnostic{.severity = Severity::Error, .span = span, .message = std::move(message)});
@@ -354,6 +357,13 @@ class LlvmBackend {
 
   llvm::Type* llvm_tag_int_bytes(std::uint64_t bytes) { return llvm::IntegerType::get(ctx_, static_cast<unsigned>(bytes * 8)); }
 
+  llvm::StructType* llvm_slice_ptr_type() {
+    if (slice_ptr_type_) return slice_ptr_type_;
+    slice_ptr_type_ = llvm::StructType::create(ctx_, "cog.slice_ptr");
+    slice_ptr_type_->setBody({ptr_ty(), llvm_int_ty(IntKind::Usize)}, /*isPacked=*/false);
+    return slice_ptr_type_;
+  }
+
   llvm::Type* llvm_type(TypeId ty) {
     const TypeData& d = checked_.types.get(ty);
     switch (d.kind) {
@@ -365,12 +375,24 @@ class LlvmBackend {
         return llvm::Type::getInt1Ty(ctx_);
       case TypeKind::Int:
         return llvm_int_ty(d.int_kind);
+      case TypeKind::Never:
+        return llvm::Type::getVoidTy(ctx_);
       case TypeKind::Ptr: {
         const TypeData& pd = checked_.types.get(d.pointee);
-        if (pd.kind == TypeKind::DynTrait && pd.trait_def) {
-          return llvm_dyn_type(pd.trait_def);
-        }
+        if (pd.kind == TypeKind::Slice) return llvm_slice_ptr_type();
         return ptr_ty();
+      }
+      case TypeKind::Array: {
+        llvm::Type* elem_ty = llvm_type(d.elem);
+        std::uint64_t len = 0;
+        if (!d.array_len_expr) {
+          error(Span{}, "array length is missing during LLVM lowering");
+        } else if (auto it = checked_.array_lens.find(d.array_len_expr); it != checked_.array_lens.end()) {
+          len = it->second;
+        } else {
+          error(Span{}, "array length is not a known comptime constant during LLVM lowering");
+        }
+        return llvm::ArrayType::get(elem_ty, len);
       }
       case TypeKind::Struct:
         return llvm_struct_type(d.struct_def);
@@ -392,18 +414,6 @@ class LlvmBackend {
     if (!e) return nullptr;
     auto it = enum_types_.find(e);
     return it == enum_types_.end() ? nullptr : it->second;
-  }
-
-  llvm::StructType* llvm_vtable_type(const ItemTrait* tr) {
-    if (!tr) return nullptr;
-    auto it = vtable_types_.find(tr);
-    return it == vtable_types_.end() ? nullptr : it->second;
-  }
-
-  llvm::StructType* llvm_dyn_type(const ItemTrait* tr) {
-    if (!tr) return nullptr;
-    auto it = dyn_types_.find(tr);
-    return it == dyn_types_.end() ? nullptr : it->second;
   }
 
   std::string llvm_struct_type_name(const ItemStruct* s) const {
@@ -428,59 +438,6 @@ class LlvmBackend {
     name += ".";
     name += sanitize(e ? e->name : "<enum>");
     return name;
-  }
-
-  std::string llvm_trait_suffix(const ItemTrait* tr) const {
-    ModuleId mid = locator_.module_of(static_cast<const Item*>(tr));
-    std::string suffix{};
-    for (auto part : locator_.module_path(mid)) {
-      if (!suffix.empty()) suffix += ".";
-      suffix += sanitize(part);
-    }
-    if (!suffix.empty()) suffix += ".";
-    suffix += sanitize(tr ? tr->name : "<trait>");
-    return suffix;
-  }
-
-  std::string type_suffix_for_item(const Item* item) const {
-    ModuleId mid = locator_.module_of(item);
-    std::string out{};
-    for (auto part : locator_.module_path(mid)) {
-      out += "$";
-      out += sanitize(part);
-    }
-    if (item && item->kind == AstNodeKind::ItemStruct) {
-      out += "$";
-      out += sanitize(static_cast<const ItemStruct*>(item)->name);
-    } else if (item && item->kind == AstNodeKind::ItemEnum) {
-      out += "$";
-      out += sanitize(static_cast<const ItemEnum*>(item)->name);
-    } else {
-      out += "$<type>";
-    }
-    return out;
-  }
-
-  std::string trait_suffix_for_item(const ItemTrait* tr) const {
-    ModuleId mid = locator_.module_of(static_cast<const Item*>(tr));
-    std::string out{};
-    for (auto part : locator_.module_path(mid)) {
-      out += "$";
-      out += sanitize(part);
-    }
-    out += "$";
-    out += sanitize(tr ? tr->name : "<trait>");
-    return out;
-  }
-
-  std::string vtable_global_sym(const ItemTrait* tr, const Item* type_item, ModuleId mid) const {
-    return locator_.mangle_in_module(mid, "vtable" + trait_suffix_for_item(tr) + "$for" + type_suffix_for_item(type_item));
-  }
-
-  std::string wrapper_sym(const ItemTrait* tr, const Item* type_item, std::string_view method, ModuleId mid) const {
-    return locator_.mangle_in_module(
-        mid,
-        "dyncall" + trait_suffix_for_item(tr) + "$for" + type_suffix_for_item(type_item) + "$" + sanitize(method));
   }
 
   TypeId type_of(const Expr* e) const {
@@ -532,41 +489,12 @@ class LlvmBackend {
     }
   }
 
-  void build_trait_object_types() {
-    for (const auto& [tr, method_set] : checked_.trait_methods) {
-      if (!tr) continue;
-
-      std::string vt_name = "vtable." + llvm_trait_suffix(tr);
-      std::string dyn_name = "dyn." + llvm_trait_suffix(tr);
-
-      llvm::StructType* vt = llvm::StructType::create(ctx_, std::move(vt_name));
-      llvm::StructType* dyn = llvm::StructType::create(ctx_, std::move(dyn_name));
-      vtable_types_.insert({tr, vt});
-      dyn_types_.insert({tr, dyn});
-
-      std::vector<llvm::Type*> vt_fields(method_set.order.size(), ptr_ty());
-      vt->setBody(vt_fields, /*isPacked=*/false);
-
-      dyn->setBody({ptr_ty(), ptr_ty()}, /*isPacked=*/false);
-    }
-  }
-
   llvm::FunctionType* llvm_fn_type(const FnInfo& sig) {
     std::vector<llvm::Type*> params{};
     params.reserve(sig.params.size());
     for (TypeId p : sig.params) params.push_back(llvm_type(p));
     llvm::Type* ret = llvm_type(sig.ret);
     return llvm::FunctionType::get(ret, params, /*isVarArg=*/sig.is_variadic);
-  }
-
-  llvm::FunctionType* llvm_dyn_method_type(const TraitMethodInfo& tm) {
-    // Vtable entry signature: ret (ptr self, arg1, arg2, ...)
-    std::vector<llvm::Type*> params{};
-    params.reserve(tm.sig.params.size());
-    params.push_back(ptr_ty());
-    for (size_t i = 1; i < tm.sig.params.size(); i++) params.push_back(llvm_type(tm.sig.params[i]));
-    llvm::Type* ret = llvm_type(tm.sig.ret);
-    return llvm::FunctionType::get(ret, params, /*isVarArg=*/false);
   }
 
   void build_function_decls() {
@@ -576,10 +504,6 @@ class LlvmBackend {
         if (item->kind == AstNodeKind::ItemFn) declare_function(static_cast<const ItemFn*>(item));
         if (item->kind == AstNodeKind::ItemImplInherent) {
           auto* impl = static_cast<const ItemImplInherent*>(item);
-          for (const ItemFn* m : impl->methods) declare_function(m);
-        }
-        if (item->kind == AstNodeKind::ItemImplTrait) {
-          auto* impl = static_cast<const ItemImplTrait*>(item);
           for (const ItemFn* m : impl->methods) declare_function(m);
         }
       }
@@ -604,91 +528,6 @@ class LlvmBackend {
     return it == fn_decls_.end() ? nullptr : it->second;
   }
 
-  llvm::Function* get_or_create_dyn_wrapper(
-      const std::string& symbol,
-      const ItemFn* impl_fn,
-      const TraitMethodInfo& tm) {
-    if (auto it = dyn_wrappers_.find(symbol); it != dyn_wrappers_.end()) return it->second;
-
-    llvm::FunctionType* wrapper_ty = llvm_dyn_method_type(tm);
-    llvm::Function* wrapper = llvm::Function::Create(wrapper_ty, llvm::GlobalValue::InternalLinkage, symbol, module_.get());
-    dyn_wrappers_.insert({symbol, wrapper});
-
-    // Wrapper body: call the concrete impl with `self` forwarded (as ptr) and the remaining args.
-    llvm::BasicBlock* entry = llvm::BasicBlock::Create(ctx_, "entry", wrapper);
-    llvm::IRBuilder<> b(entry);
-
-    std::vector<llvm::Value*> args{};
-    args.reserve(wrapper->arg_size());
-    for (llvm::Argument& a : wrapper->args()) args.push_back(&a);
-
-    llvm::Function* callee = llvm_fn(impl_fn);
-    if (!callee) {
-      b.CreateUnreachable();
-      return wrapper;
-    }
-
-    llvm::CallInst* call = b.CreateCall(callee->getFunctionType(), callee, args);
-    if (call->getType()->isVoidTy()) {
-      b.CreateRetVoid();
-    } else {
-      b.CreateRet(call);
-    }
-    return wrapper;
-  }
-
-  void build_trait_vtables_and_wrappers() {
-    std::unordered_set<std::string> emitted_vtables{};
-
-    for (const auto& [key, impl_methods] : crate_.trait_impl_methods) {
-      if (!key.trait || !key.type) continue;
-      auto tset_it = checked_.trait_methods.find(key.trait);
-      if (tset_it == checked_.trait_methods.end()) continue;
-      const TraitMethodSet& set = tset_it->second;
-
-      ModuleId mid = locator_.module_of(key.type);
-      if (!impl_methods.empty() && impl_methods.begin()->second) {
-        mid = locator_.module_of(static_cast<const Item*>(impl_methods.begin()->second));
-      }
-      std::string vt_sym = vtable_global_sym(key.trait, key.type, mid);
-      if (emitted_vtables.contains(vt_sym)) continue;
-      emitted_vtables.insert(vt_sym);
-
-      llvm::StructType* vt_ty = llvm_vtable_type(key.trait);
-      if (!vt_ty) continue;
-
-      std::vector<llvm::Constant*> fields{};
-      fields.reserve(set.order.size());
-
-      for (const std::string& method_name : set.order) {
-        auto mi = set.methods.find(method_name);
-        if (mi == set.methods.end()) {
-          fields.push_back(llvm::ConstantPointerNull::get(ptr_ty()));
-          continue;
-        }
-        const TraitMethodInfo& tm = mi->second;
-        if (!tm.object_safe) {
-          fields.push_back(llvm::ConstantPointerNull::get(ptr_ty()));
-          continue;
-        }
-        auto impl_it = impl_methods.find(method_name);
-        if (impl_it == impl_methods.end() || !impl_it->second) {
-          fields.push_back(llvm::ConstantPointerNull::get(ptr_ty()));
-          continue;
-        }
-
-        const ItemFn* impl_fn = impl_it->second;
-        std::string w_sym = wrapper_sym(key.trait, key.type, method_name, mid);
-        llvm::Function* wrapper = get_or_create_dyn_wrapper(w_sym, impl_fn, tm);
-        fields.push_back(wrapper);
-      }
-
-      llvm::Constant* init = llvm::ConstantStruct::get(vt_ty, fields);
-      (void)new llvm::GlobalVariable(
-          *module_, vt_ty, /*isConstant=*/true, llvm::GlobalValue::InternalLinkage, init, vt_sym);
-    }
-  }
-
   void build_function_bodies() {
     for (ModuleId mid = 0; mid < crate_.modules.size(); mid++) {
       for (const Item* item : crate_.modules[mid].items) {
@@ -696,10 +535,6 @@ class LlvmBackend {
         if (item->kind == AstNodeKind::ItemFn) emit_function(static_cast<const ItemFn*>(item), mid);
         if (item->kind == AstNodeKind::ItemImplInherent) {
           auto* impl = static_cast<const ItemImplInherent*>(item);
-          for (const ItemFn* m : impl->methods) emit_function(m, mid);
-        }
-        if (item->kind == AstNodeKind::ItemImplTrait) {
-          auto* impl = static_cast<const ItemImplTrait*>(item);
           for (const ItemFn* m : impl->methods) emit_function(m, mid);
         }
       }
@@ -760,6 +595,124 @@ class LlvmBackend {
 
   llvm::Constant* zero_init(llvm::Type* ty) { return llvm::Constant::getNullValue(ty); }
 
+  llvm::GlobalVariable* get_or_create_static_global(const ItemStatic* st) {
+    if (!st) return nullptr;
+    if (auto it = static_globals_.find(st); it != static_globals_.end()) return it->second;
+
+    auto ty_it = checked_.static_types.find(st);
+    if (ty_it == checked_.static_types.end()) {
+      error(st->span, "internal error: missing type for `static " + st->name + "` in LLVM backend");
+      return nullptr;
+    }
+    TypeId ty = ty_it->second;
+    llvm::Type* ll_ty = llvm_type(ty);
+    if (ll_ty->isVoidTy()) {
+      error(st->span, "`static` of type `()` is not supported in LLVM backend");
+      return nullptr;
+    }
+
+    llvm::Constant* init = zero_init(ll_ty);
+    if (auto v = eval_.eval_static(st)) {
+      if (llvm::Constant* c = llvm_const_value(ty, *v, st->span)) init = c;
+    }
+
+    std::string name = locator_.symbol_for_static(st);
+    auto* g = new llvm::GlobalVariable(
+        *module_,
+        ll_ty,
+        /*isConstant=*/true,
+        llvm::GlobalValue::InternalLinkage,
+        init,
+        llvm::StringRef(name.data(), name.size()));
+
+    if (auto al = layout_.align_of(ty, st->span)) g->setAlignment(llvm::Align(*al));
+    static_globals_.insert({st, g});
+    return g;
+  }
+
+  llvm::Constant* llvm_const_value(TypeId ty, const ComptimeValue& v, Span use_site) {
+    llvm::Type* ll_ty = llvm_type(ty);
+    if (ll_ty->isVoidTy()) return nullptr;
+
+    const TypeData& td = checked_.types.get(ty);
+    switch (v.kind) {
+      case ComptimeValue::Kind::Error:
+        return zero_init(ll_ty);
+      case ComptimeValue::Kind::Unit:
+        return zero_init(ll_ty);
+      case ComptimeValue::Kind::Bool:
+        if (td.kind != TypeKind::Bool) return zero_init(ll_ty);
+        return llvm::ConstantInt::get(llvm::Type::getInt1Ty(ctx_), v.bool_value ? 1 : 0);
+      case ComptimeValue::Kind::Int:
+        if (td.kind != TypeKind::Int) return zero_init(ll_ty);
+        return llvm::ConstantInt::get(ll_ty, static_cast<std::uint64_t>(v.int_value), /*isSigned=*/true);
+      case ComptimeValue::Kind::String: {
+        if (td.kind != TypeKind::Ptr) {
+          error(use_site, "string comptime value requires a pointer type");
+          return zero_init(ll_ty);
+        }
+        const TypeData& pd = checked_.types.get(td.pointee);
+
+        const llvm::StringRef bytes{v.string_value.data(), v.string_value.size()};
+
+        // `const* u8`: C string pointer (NUL-terminated).
+        if (pd.kind == TypeKind::Int && pd.int_kind == IntKind::U8) {
+          llvm::Constant* data = llvm::ConstantDataArray::getString(ctx_, bytes, /*AddNull=*/true);
+          auto* g = new llvm::GlobalVariable(
+              *module_,
+              data->getType(),
+              /*isConstant=*/true,
+              llvm::GlobalValue::PrivateLinkage,
+              data,
+              "cstr");
+          g->setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::Global);
+          g->setAlignment(llvm::Align(1));
+
+          llvm::Constant* z = llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx_), 0);
+          std::array<llvm::Constant*, 2> idxs{z, z};
+          llvm::Constant* gep = llvm::ConstantExpr::getInBoundsGetElementPtr(g->getValueType(), g, idxs);
+          return llvm::ConstantExpr::getBitCast(gep, ptr_ty());
+        }
+
+        // `const* [u8]`: slice pointer { ptr, len }.
+        if (pd.kind == TypeKind::Slice) {
+          const TypeData& ed = checked_.types.get(pd.elem);
+          if (ed.kind != TypeKind::Int || ed.int_kind != IntKind::U8) {
+            error(use_site, "string comptime value only supports `u8` slices in LLVM backend");
+            return zero_init(ll_ty);
+          }
+
+          llvm::Constant* ptr = llvm::ConstantPointerNull::get(ptr_ty());
+          if (!bytes.empty()) {
+            llvm::Constant* data = llvm::ConstantDataArray::getString(ctx_, bytes, /*AddNull=*/false);
+            auto* g = new llvm::GlobalVariable(
+                *module_,
+                data->getType(),
+                /*isConstant=*/true,
+                llvm::GlobalValue::PrivateLinkage,
+                data,
+                "str");
+            g->setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::Global);
+            g->setAlignment(llvm::Align(1));
+
+            llvm::Constant* z = llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx_), 0);
+            std::array<llvm::Constant*, 2> idxs{z, z};
+            llvm::Constant* gep = llvm::ConstantExpr::getInBoundsGetElementPtr(g->getValueType(), g, idxs);
+            ptr = llvm::ConstantExpr::getBitCast(gep, ptr_ty());
+          }
+          llvm::Constant* len = llvm::ConstantInt::get(llvm_int_ty(IntKind::Usize), static_cast<std::uint64_t>(bytes.size()));
+          return llvm::ConstantStruct::get(llvm::cast<llvm::StructType>(ll_ty), {ptr, len});
+        }
+
+        error(use_site, "string comptime value requires `const* u8` or `const* [u8]`");
+        return zero_init(ll_ty);
+      }
+      default:
+        error(use_site, "unsupported comptime value in LLVM constant lowering");
+        return zero_init(ll_ty);
+    }
+  }
+
   llvm::Value* emit_load(TypeId ty, llvm::Value* ptr) {
     llvm::Type* ll_ty = llvm_type(ty);
     if (ll_ty->isVoidTy()) return nullptr;
@@ -792,6 +745,15 @@ class LlvmBackend {
     return std::nullopt;
   }
 
+  std::optional<std::int64_t> enum_variant_discriminant(const ItemEnum* def, std::string_view name) const {
+    if (!def) return std::nullopt;
+    auto it = checked_.enum_info.find(def);
+    if (it == checked_.enum_info.end()) return std::nullopt;
+    if (auto di = it->second.discriminants.find(std::string(name)); di != it->second.discriminants.end()) return di->second;
+    if (auto idx = enum_variant_index(def, name)) return static_cast<std::int64_t>(*idx);
+    return std::nullopt;
+  }
+
   const VariantInfo* enum_variant_info(const ItemEnum* def, std::string_view name) const {
     if (!def) return nullptr;
     auto it = checked_.enum_info.find(def);
@@ -811,16 +773,16 @@ class LlvmBackend {
     auto enum_layout = layout_.enum_layout(def, Span{});
     if (!enum_layout) return CgValue{.type = enum_ty, .value = llvm::UndefValue::get(llvm_type(enum_ty))};
 
-    auto variant_index = enum_variant_index(def, variant);
+    auto disc_value = enum_variant_discriminant(def, variant);
     const VariantInfo* variant_info = enum_variant_info(def, variant);
-    if (!variant_index || !variant_info) return CgValue{.type = enum_ty, .value = llvm::UndefValue::get(llvm_type(enum_ty))};
+    if (!disc_value || !variant_info) return CgValue{.type = enum_ty, .value = llvm::UndefValue::get(llvm_type(enum_ty))};
 
     llvm::StructType* ll_enum = llvm::cast<llvm::StructType>(llvm_type(enum_ty));
     llvm::AllocaInst* slot = create_entry_alloca(f.llvm_fn, ll_enum, "enum.tmp");
 
     llvm::Value* tag_ptr = builder_.CreateStructGEP(ll_enum, slot, 0);
     llvm::Type* tag_ty = llvm_tag_int_bytes(enum_layout->tag_size);
-    llvm::Value* tag_value = llvm::ConstantInt::get(tag_ty, *variant_index);
+    llvm::Value* tag_value = llvm::ConstantInt::get(tag_ty, static_cast<std::uint64_t>(*disc_value), /*isSigned=*/true);
     builder_.CreateStore(tag_value, tag_ptr);
 
     if (!variant_info->payload.empty() && enum_layout->payload_size != 0) {
@@ -897,15 +859,16 @@ class LlvmBackend {
 
         if (!path || path->segments.empty()) return builder_.getFalse();
         std::string_view variant_name = path->segments.back()->text;
-        auto variant_index = enum_variant_index(def, variant_name);
+        auto disc_value = enum_variant_discriminant(def, variant_name);
         const VariantInfo* variant_info = enum_variant_info(def, variant_name);
-        if (!variant_index || !variant_info) return builder_.getFalse();
+        if (!disc_value || !variant_info) return builder_.getFalse();
 
         llvm::StructType* ll_enum = llvm::cast<llvm::StructType>(llvm_type(scrut_ty));
         llvm::Value* tag_ptr = builder_.CreateStructGEP(ll_enum, scrut_ptr, 0);
         llvm::Type* tag_ty = llvm_tag_int_bytes(enum_layout->tag_size);
         llvm::Value* tag_val = builder_.CreateLoad(tag_ty, tag_ptr);
-        llvm::Value* tag_ok = builder_.CreateICmpEQ(tag_val, llvm::ConstantInt::get(tag_ty, *variant_index));
+        llvm::Value* tag_ok =
+            builder_.CreateICmpEQ(tag_val, llvm::ConstantInt::get(tag_ty, static_cast<std::uint64_t>(*disc_value), /*isSigned=*/true));
 
         if (!args || args->empty()) return tag_ok;
 
@@ -1091,6 +1054,7 @@ class LlvmBackend {
         TypeId ptr_ty_id = type_of(u->expr);
         const TypeData& ptr_td = checked_.types.get(ptr_ty_id);
         if (ptr_td.kind != TypeKind::Ptr) return std::nullopt;
+        if (checked_.types.get(ptr_td.pointee).kind == TypeKind::Slice) return std::nullopt;
         CgValue pv = emit_expr(f, u->expr);
         if (!pv.value) return std::nullopt;
         return std::pair<TypeId, llvm::Value*>{ptr_td.pointee, pv.value};
@@ -1141,47 +1105,12 @@ class LlvmBackend {
     const TypeData& from_d = checked_.types.get(from_ty);
     const TypeData& to_d = checked_.types.get(to_ty);
 
-    // Trait object unsizing cast: `*T as *dyn Trait`.
-    if (from_d.kind == TypeKind::Ptr && to_d.kind == TypeKind::Ptr && checked_.types.get(to_d.pointee).kind == TypeKind::DynTrait) {
-      const TypeData& dyn_d = checked_.types.get(to_d.pointee);
-      const ItemTrait* tr = dyn_d.trait_def;
-      if (!tr) return CgValue{.type = to_ty, .value = llvm::UndefValue::get(llvm_type(to_ty))};
-
-      const TypeData& from_pointee = checked_.types.get(from_d.pointee);
-      const Item* type_item = nullptr;
-      if (from_pointee.kind == TypeKind::Struct) type_item = static_cast<const Item*>(from_pointee.struct_def);
-      if (from_pointee.kind == TypeKind::Enum) type_item = static_cast<const Item*>(from_pointee.enum_def);
-      if (!type_item) {
-        error(Span{}, "dyn cast requires a nominal source pointer");
-        return CgValue{.type = to_ty, .value = llvm::UndefValue::get(llvm_type(to_ty))};
-      }
-
-      TraitImplKey key{.trait = tr, .type = type_item};
-      auto impl_it = crate_.trait_impl_methods.find(key);
-      if (impl_it == crate_.trait_impl_methods.end()) {
-        error(Span{}, "no impl for dyn cast target trait");
-        return CgValue{.type = to_ty, .value = llvm::UndefValue::get(llvm_type(to_ty))};
-      }
-
-      ModuleId mid = 0;
-      if (!impl_it->second.empty() && impl_it->second.begin()->second) {
-        mid = locator_.module_of(static_cast<const Item*>(impl_it->second.begin()->second));
-      } else {
-        mid = locator_.module_of(type_item);
-      }
-      std::string vt_sym = vtable_global_sym(tr, type_item, mid);
-      llvm::GlobalVariable* vtable = module_->getNamedGlobal(vt_sym);
-      if (!vtable) {
-        error(Span{}, "missing vtable global in dyn cast");
-        return CgValue{.type = to_ty, .value = llvm::UndefValue::get(llvm_type(to_ty))};
-      }
-
-      llvm::StructType* dyn_ty = llvm_dyn_type(tr);
-      llvm::Value* agg = llvm::UndefValue::get(dyn_ty);
-      agg = builder_.CreateInsertValue(agg, from.value, {0});
-      agg = builder_.CreateInsertValue(agg, vtable, {1});
-      return CgValue{.type = to_ty, .value = agg};
-    }
+    auto is_slice_ptr = [&](const TypeData& d) -> bool {
+      if (d.kind != TypeKind::Ptr) return false;
+      return checked_.types.get(d.pointee).kind == TypeKind::Slice;
+    };
+    const bool from_is_slice_ptr = is_slice_ptr(from_d);
+    const bool to_is_slice_ptr = is_slice_ptr(to_d);
 
     llvm::Type* dst_ll_ty = llvm_type(to_ty);
     if (from_d.kind == TypeKind::Int && to_d.kind == TypeKind::Int) {
@@ -1197,14 +1126,41 @@ class LlvmBackend {
     }
 
     if (from_d.kind == TypeKind::Int && to_d.kind == TypeKind::Ptr) {
+      if (to_is_slice_ptr) {
+        llvm::Value* p = builder_.CreateIntToPtr(from.value, ptr_ty());
+        llvm::Value* len = llvm::ConstantInt::get(llvm_int_ty(IntKind::Usize), 0);
+        llvm::Value* agg = llvm::UndefValue::get(llvm_type(to_ty));
+        agg = builder_.CreateInsertValue(agg, p, {0});
+        agg = builder_.CreateInsertValue(agg, len, {1});
+        return CgValue{.type = to_ty, .value = agg};
+      }
       return CgValue{.type = to_ty, .value = builder_.CreateIntToPtr(from.value, ptr_ty())};
     }
 
     if (from_d.kind == TypeKind::Ptr && to_d.kind == TypeKind::Int) {
+      if (from_is_slice_ptr) {
+        llvm::Value* p = builder_.CreateExtractValue(from.value, {0});
+        return CgValue{.type = to_ty, .value = builder_.CreatePtrToInt(p, dst_ll_ty)};
+      }
       return CgValue{.type = to_ty, .value = builder_.CreatePtrToInt(from.value, dst_ll_ty)};
     }
 
     if (from_d.kind == TypeKind::Ptr && to_d.kind == TypeKind::Ptr) {
+      if (from_is_slice_ptr && to_is_slice_ptr) {
+        return CgValue{.type = to_ty, .value = from.value};
+      }
+      if (from_is_slice_ptr && !to_is_slice_ptr) {
+        llvm::Value* p = builder_.CreateExtractValue(from.value, {0});
+        return CgValue{.type = to_ty, .value = builder_.CreateBitCast(p, ptr_ty())};
+      }
+      if (!from_is_slice_ptr && to_is_slice_ptr) {
+        llvm::Value* len = llvm::ConstantInt::get(llvm_int_ty(IntKind::Usize), 0);
+        llvm::Value* agg = llvm::UndefValue::get(llvm_type(to_ty));
+        agg = builder_.CreateInsertValue(agg, from.value, {0});
+        agg = builder_.CreateInsertValue(agg, len, {1});
+        return CgValue{.type = to_ty, .value = agg};
+      }
+
       // Opaque pointers make this a no-op; keep it explicit for readability in IR dumps.
       return CgValue{.type = to_ty, .value = builder_.CreateBitCast(from.value, ptr_ty())};
     }
@@ -1232,11 +1188,50 @@ class LlvmBackend {
       }
       case AstNodeKind::ExprString: {
         auto* s = static_cast<const ExprString*>(e);
-        llvm::GlobalVariable* g = builder_.CreateGlobalString(llvm::StringRef(s->value), "str", /*AddressSpace=*/0, module_.get());
-        llvm::Constant* z = llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx_), 0);
-        std::array<llvm::Constant*, 2> idxs{z, z};
-        llvm::Constant* v = llvm::ConstantExpr::getInBoundsGetElementPtr(g->getValueType(), g, idxs);
-        return CgValue{.type = ty, .value = builder_.CreateBitCast(v, ptr_ty())};
+        const llvm::StringRef bytes{s->value.data(), s->value.size()};
+        if (s->is_c_string) {
+          llvm::Constant* data = llvm::ConstantDataArray::getString(ctx_, bytes, /*AddNull=*/true);
+          auto* g = new llvm::GlobalVariable(
+              *module_,
+              data->getType(),
+              /*isConstant=*/true,
+              llvm::GlobalValue::PrivateLinkage,
+              data,
+              "cstr");
+          g->setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::Global);
+          g->setAlignment(llvm::Align(1));
+
+          llvm::Constant* z = llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx_), 0);
+          std::array<llvm::Constant*, 2> idxs{z, z};
+          llvm::Constant* v = llvm::ConstantExpr::getInBoundsGetElementPtr(g->getValueType(), g, idxs);
+          return CgValue{.type = ty, .value = builder_.CreateBitCast(v, ptr_ty())};
+        }
+
+        // `"..."` is a `const* [u8]` slice pointer { ptr, len }.
+        llvm::Constant* ptr = llvm::ConstantPointerNull::get(ptr_ty());
+        if (!bytes.empty()) {
+          llvm::Constant* data = llvm::ConstantDataArray::getString(ctx_, bytes, /*AddNull=*/false);
+          auto* g = new llvm::GlobalVariable(
+              *module_,
+              data->getType(),
+              /*isConstant=*/true,
+              llvm::GlobalValue::PrivateLinkage,
+              data,
+              "str");
+          g->setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::Global);
+          g->setAlignment(llvm::Align(1));
+
+          llvm::Constant* z = llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx_), 0);
+          std::array<llvm::Constant*, 2> idxs{z, z};
+          llvm::Constant* v = llvm::ConstantExpr::getInBoundsGetElementPtr(g->getValueType(), g, idxs);
+          ptr = llvm::ConstantExpr::getBitCast(v, ptr_ty());
+        }
+        llvm::Constant* len = llvm::ConstantInt::get(llvm_int_ty(IntKind::Usize), static_cast<std::uint64_t>(bytes.size()));
+
+        llvm::Value* slice = llvm::UndefValue::get(llvm_type(ty));
+        slice = builder_.CreateInsertValue(slice, ptr, {0});
+        slice = builder_.CreateInsertValue(slice, len, {1});
+        return CgValue{.type = ty, .value = slice};
       }
       case AstNodeKind::ExprStructLit: {
         auto* sl = static_cast<const ExprStructLit*>(e);
@@ -1281,12 +1276,15 @@ class LlvmBackend {
           if (item->kind == AstNodeKind::ItemConst) {
             auto v = eval_.eval_const(static_cast<const ItemConst*>(item));
             if (!v) return CgValue{.type = ty, .value = zero_init(llvm_type(ty))};
-            if (v->kind == ComptimeValue::Kind::Int) {
-              return CgValue{.type = ty, .value = llvm::ConstantInt::get(llvm_type(ty), static_cast<std::uint64_t>(v->int_value), true)};
-            }
-            if (v->kind == ComptimeValue::Kind::Bool) {
-              return CgValue{.type = ty, .value = llvm::ConstantInt::get(llvm::Type::getInt1Ty(ctx_), v->bool_value ? 1 : 0)};
-            }
+            if (llvm::Constant* c = llvm_const_value(ty, *v, e->span)) return CgValue{.type = ty, .value = c};
+            return CgValue{.type = ty, .value = zero_init(llvm_type(ty))};
+          }
+          if (item->kind == AstNodeKind::ItemStatic) {
+            auto* st = static_cast<const ItemStatic*>(item);
+            llvm::GlobalVariable* g = get_or_create_static_global(st);
+            if (!g) return CgValue{.type = ty, .value = zero_init(llvm_type(ty))};
+            llvm::Value* v = emit_load(ty, g);
+            return CgValue{.type = ty, .value = v};
           }
         }
 
@@ -1300,7 +1298,7 @@ class LlvmBackend {
             }
           }
         }
-
+        dump_ast(std::cout, e);
         error(e->span, "unsupported path expression in codegen");
         return CgValue{.type = ty, .value = zero_init(llvm_type(ty))};
       }
@@ -1472,6 +1470,15 @@ class LlvmBackend {
       }
       case AstNodeKind::ExprUnary: {
         auto* u = static_cast<const ExprUnary*>(e);
+        if (u->op == UnaryOp::AddrOf || u->op == UnaryOp::AddrOfMut) {
+          auto place = emit_place_ptr(f, u->expr);
+          if (!place) {
+            error(e->span, "unsupported address-of operand in codegen");
+            return CgValue{.type = ty, .value = zero_init(llvm_type(ty))};
+          }
+          return CgValue{.type = ty, .value = builder_.CreateBitCast(place->second, ptr_ty())};
+        }
+
         CgValue v = emit_expr(f, u->expr);
         if (!v.value) return v;
 
@@ -1485,6 +1492,10 @@ class LlvmBackend {
           TypeId ptr_ty_id = type_of(u->expr);
           const TypeData& pd = checked_.types.get(ptr_ty_id);
           if (pd.kind != TypeKind::Ptr) return CgValue{.type = ty, .value = zero_init(llvm_type(ty))};
+          if (checked_.types.get(pd.pointee).kind == TypeKind::Slice) {
+            error(e->span, "deref of a slice pointer is not supported in codegen yet");
+            return CgValue{.type = ty, .value = zero_init(llvm_type(ty))};
+          }
           llvm::Value* loaded = emit_load(pd.pointee, v.value);
           return CgValue{.type = pd.pointee, .value = loaded};
         }
@@ -1566,58 +1577,7 @@ class LlvmBackend {
         TypeId nominal = recv_ty;
         if (recv_td.kind == TypeKind::Ptr) nominal = recv_td.pointee;
         const TypeData& nominal_td = checked_.types.get(nominal);
-
-        // dyn Trait call.
-        if (nominal_td.kind == TypeKind::DynTrait && nominal_td.trait_def) {
-          const ItemTrait* tr = nominal_td.trait_def;
-          auto tset_it = checked_.trait_methods.find(tr);
-          if (tset_it == checked_.trait_methods.end()) {
-            error(e->span, "unknown trait in dyn call codegen");
-            return CgValue{.type = ty, .value = zero_init(llvm_type(ty))};
-          }
-          const TraitMethodSet& set = tset_it->second;
-          auto mi = set.methods.find(mc->method);
-          if (mi == set.methods.end()) {
-            error(e->span, "unknown dyn method in codegen");
-            return CgValue{.type = ty, .value = zero_init(llvm_type(ty))};
-          }
-          const TraitMethodInfo& tm = mi->second;
-          if (!tm.object_safe) {
-            error(e->span, "dyn call to non-object-safe method");
-            return CgValue{.type = ty, .value = zero_init(llvm_type(ty))};
-          }
-
-          size_t method_index = 0;
-          bool found = false;
-          for (size_t i = 0; i < set.order.size(); i++) {
-            if (set.order[i] == mc->method) {
-              method_index = i;
-              found = true;
-              break;
-            }
-          }
-          if (!found) return CgValue{.type = ty, .value = zero_init(llvm_type(ty))};
-
-          CgValue recv = emit_expr(f, mc->receiver);
-          llvm::Value* data_ptr = builder_.CreateExtractValue(recv.value, {0});
-          llvm::Value* vtable_ptr = builder_.CreateExtractValue(recv.value, {1});
-
-          llvm::StructType* vt_ty = llvm_vtable_type(tr);
-          llvm::Value* fn_ptr_ptr = builder_.CreateStructGEP(vt_ty, vtable_ptr, static_cast<unsigned>(method_index));
-          llvm::Value* fn_ptr = builder_.CreateLoad(ptr_ty(), fn_ptr_ptr);
-
-          std::vector<llvm::Value*> args{};
-          args.reserve(mc->args.size() + 1);
-          args.push_back(data_ptr);
-          for (Expr* arg_expr : mc->args) args.push_back(emit_expr(f, arg_expr).value);
-
-          llvm::FunctionType* callee_ty = llvm_dyn_method_type(tm);
-          llvm::CallInst* call = builder_.CreateCall(callee_ty, fn_ptr, args);
-          if (call->getType()->isVoidTy()) return CgValue{.type = checked_.types.unit(), .value = nullptr};
-          return CgValue{.type = tm.sig.ret, .value = call};
-        }
-
-        // Static dispatch (inherent or trait impl).
+        // Inherent dispatch.
         const Item* def = nullptr;
         if (nominal_td.kind == TypeKind::Struct) def = static_cast<const Item*>(nominal_td.struct_def);
         if (nominal_td.kind == TypeKind::Enum) def = static_cast<const Item*>(nominal_td.enum_def);
@@ -1629,21 +1589,6 @@ class LlvmBackend {
         const ItemFn* method = nullptr;
         if (auto it = crate_.inherent_methods.find(def); it != crate_.inherent_methods.end()) {
           if (auto mi = it->second.find(mc->method); mi != it->second.end()) method = mi->second;
-        }
-
-        if (!method) {
-          const Module& m = crate_.modules[f.mid];
-          for (const auto& [_, ty_item] : m.types) {
-            if (!ty_item || ty_item->kind != AstNodeKind::ItemTrait) continue;
-            TraitImplKey key{.trait = static_cast<const ItemTrait*>(ty_item), .type = def};
-            auto impl_it = crate_.trait_impl_methods.find(key);
-            if (impl_it == crate_.trait_impl_methods.end()) continue;
-            auto mi = impl_it->second.find(mc->method);
-            if (mi != impl_it->second.end()) {
-              method = mi->second;
-              break;
-            }
-          }
         }
 
         if (!method) {
@@ -1712,20 +1657,6 @@ class LlvmBackend {
             return CgValue{.type = ty,
                            .value = llvm::ConstantInt::get(llvm_type(ty), static_cast<std::uint64_t>(v->int_value), /*isSigned=*/true)};
           }
-          return CgValue{.type = ty, .value = zero_init(llvm_type(ty))};
-        }
-
-        if (callee->segments.size() == 2 && callee->segments[0]->text == "builtin" &&
-            (callee->segments[1]->text == "addr_of" || callee->segments[1]->text == "addr_of_mut")) {
-          if (call->args.size() != 1) return CgValue{.type = ty, .value = zero_init(llvm_type(ty))};
-          if (call->args[0]->kind == AstNodeKind::ExprPath) {
-            const Path* ap = static_cast<const ExprPath*>(call->args[0])->path;
-            if (ap && ap->segments.size() == 1) {
-              auto local = lookup_local(f, ap->segments[0]->text);
-              if (local && local->alloca) return CgValue{.type = ty, .value = local->alloca};
-            }
-          }
-          error(e->span, "builtin::addr_of requires a local path in codegen v0");
           return CgValue{.type = ty, .value = zero_init(llvm_type(ty))};
         }
 

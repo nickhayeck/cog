@@ -1,0 +1,15 @@
+// `match` with `|` pattern alternatives and guards.
+
+fn classify(x: i32) -> i32 {
+    match x {
+        0 | 1 => 10,
+        2 | 3 => 20,
+        _ if x < 0 => 30,
+        _ => 40,
+    }
+}
+
+fn main() -> i32 {
+    classify(3)
+}
+

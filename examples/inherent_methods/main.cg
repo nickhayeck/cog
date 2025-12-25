@@ -1,4 +1,4 @@
-// v0.0.9 (early): static method calls + struct field updates in LLVM codegen.
+// Inherent methods + method call lowering (originally v0.0.9).
 
 mod util;
 
@@ -10,4 +10,3 @@ fn main() -> i32 {
     c.inc(37);
     c.get()
 }
-

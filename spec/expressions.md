@@ -149,6 +149,15 @@ An implementation may diagnose obvious cases of “conflicting accesses” (e.g.
 
 Runtime checks for null/misalignment follow `spec/build_modes.md`.
 
+### Unary `&` / `&mut` (address-of)
+
+`&place` takes the address of a place expression.
+
+- `&place` has type `const* T` where `place` has type `T`.
+- `&mut place` has type `mut* T` and requires `place` be mutable.
+
+Because Cog has no lifetime checking, the resulting pointer may dangle if the pointed-to storage goes away (e.g. after moving/dropping); this is permitted but may cause UB when dereferenced.
+
 ### `as` casts
 
 See `spec/types.md`.

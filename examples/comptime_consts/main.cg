@@ -1,4 +1,4 @@
-// v0.0.6: comptime evaluation for const/static initializers and array lengths.
+// Comptime const/static initializers + array lengths (originally v0.0.6).
 
 mod util;
 

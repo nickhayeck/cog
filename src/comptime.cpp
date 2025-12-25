@@ -61,6 +61,8 @@ TypeId ComptimeEvaluator::lower_type(ModuleId mid, const Type* ty, bool allow_un
       return types_->type_type();
     case AstNodeKind::TypeUnit:
       return types_->unit();
+    case AstNodeKind::TypeNever:
+      return types_->never();
     case AstNodeKind::TypePtr: {
       auto* p = static_cast<const TypePtr*>(ty);
       return types_->ptr(p->mutability, lower_type(mid, p->pointee, /*allow_unsized=*/true));
@@ -81,21 +83,9 @@ TypeId ComptimeEvaluator::lower_type(ModuleId mid, const Type* ty, bool allow_un
       auto* t = static_cast<const TypeTuple*>(ty);
       std::vector<TypeId> elems{};
       elems.reserve(t->elems.size());
-      for (const Type* e : t->elems) elems.push_back(lower_type(mid, e, /*allow_unsized=*/false));
-      return types_->tuple(std::move(elems));
-    }
-    case AstNodeKind::TypeDyn: {
-      if (!allow_unsized) {
-        error(ty->span, "unsized `dyn Trait` types are not allowed here");
-        return types_->error();
-      }
-      const Item* tr_item = resolve_type_item(mid, static_cast<const TypeDyn*>(ty)->trait);
-      if (!tr_item || tr_item->kind != AstNodeKind::ItemTrait) {
-        error(ty->span, "unknown trait in `dyn` type");
-        return types_->error();
-      }
-      return types_->dyn_trait(static_cast<const ItemTrait*>(tr_item));
-    }
+	      for (const Type* e : t->elems) elems.push_back(lower_type(mid, e, /*allow_unsized=*/false));
+	      return types_->tuple(std::move(elems));
+	    }
     default:
       error(ty->span, "unsupported type at comptime");
       return types_->error();
@@ -127,9 +117,6 @@ TypeId ComptimeEvaluator::lower_type_path(ModuleId mid, const Path* path, bool a
       auto* ta = static_cast<const ItemTypeAlias*>(item);
       return lower_type(mid, ta->aliased, allow_unsized);
     }
-    case AstNodeKind::ItemTrait:
-      error(path->span, "traits are only usable via `dyn Trait`");
-      return types_->error();
     default:
       break;
   }
@@ -555,6 +542,10 @@ std::optional<ComptimeEvaluator::Flow> ComptimeEvaluator::eval_expr_inner(Module
         case UnaryOp::Deref:
           error(expr->span, "pointer dereference is not supported at comptime yet");
           return std::nullopt;
+        case UnaryOp::AddrOf:
+        case UnaryOp::AddrOfMut:
+          error(expr->span, "address-of is not supported at comptime yet");
+          return std::nullopt;
       }
       return std::nullopt;
     }
@@ -722,7 +713,7 @@ std::optional<ComptimeEvaluator::Flow> ComptimeEvaluator::eval_expr_inner(Module
       }
 
       if (path_is_builtin(callee, "addr_of") || path_is_builtin(callee, "addr_of_mut")) {
-        error(expr->span, "builtin::addr_of is not supported at comptime yet");
+        error(expr->span, "builtin::addr_of was removed; use `&place` / `&mut place` (not supported at comptime yet)");
         return std::nullopt;
       }
 

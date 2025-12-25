@@ -1,4 +1,4 @@
-// v0.0.3: out-of-line modules + use trees.
+// Modules + `use` trees (originally v0.0.3).
 
 mod util;
 
@@ -9,4 +9,3 @@ fn main() -> i32 {
     let y: i32 = sub(x, 1);
     y
 }
-

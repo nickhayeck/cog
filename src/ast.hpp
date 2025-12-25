@@ -13,10 +13,10 @@
 
 namespace cog {
 
-enum class Visibility : std::uint8_t { Private, Pub };
+enum class Visibility : std::uint8_t { Private, Pub, PubCrate };
 enum class Mutability : std::uint8_t { Const, Mut };
 
-enum class UnaryOp : std::uint8_t { Neg, Not, Deref };
+enum class UnaryOp : std::uint8_t { Neg, Not, Deref, AddrOf, AddrOfMut };
 enum class BinaryOp : std::uint8_t {
   Add,
   Sub,
@@ -43,12 +43,12 @@ enum class AstNodeKind : std::uint16_t {
   // Types
   TypePath,
   TypePtr,
-  TypeDyn,
   TypeSlice,
   TypeArray,
   TypeTuple,
   TypeUnit,
   TypeType,
+  TypeNever,
 
   // Items
   UseTree,
@@ -57,9 +57,7 @@ enum class AstNodeKind : std::uint16_t {
   ItemModDecl,
   ItemStruct,
   ItemEnum,
-  ItemTrait,
   ItemImplInherent,
-  ItemImplTrait,
   ItemFn,
   ItemConst,
   ItemStatic,
@@ -155,9 +153,13 @@ struct Path final : AstNode {
 
 struct Attr final : AstNode {
   Path* name = nullptr;
-  Path* arg = nullptr;  // optional; null means none
-  explicit Attr(Span span, Path* name, Path* arg = nullptr)
-      : AstNode(AstNodeKind::Attr, span), name(name), arg(arg) {}
+  Path* arg_path = nullptr;  // optional; null means none
+  std::optional<std::string> arg_string{};
+  explicit Attr(Span span, Path* name) : AstNode(AstNodeKind::Attr, span), name(name) {}
+  explicit Attr(Span span, Path* name, Path* arg_path)
+      : AstNode(AstNodeKind::Attr, span), name(name), arg_path(arg_path) {}
+  explicit Attr(Span span, Path* name, std::string arg_string)
+      : AstNode(AstNodeKind::Attr, span), name(name), arg_string(std::move(arg_string)) {}
 };
 
 // ---- Types ----
@@ -176,11 +178,6 @@ struct TypePtr final : Type {
   Type* pointee = nullptr;
   explicit TypePtr(Span span, Mutability mutability, Type* pointee)
       : Type(AstNodeKind::TypePtr, span), mutability(mutability), pointee(pointee) {}
-};
-
-struct TypeDyn final : Type {
-  Path* trait = nullptr;
-  explicit TypeDyn(Span span, Path* trait) : Type(AstNodeKind::TypeDyn, span), trait(trait) {}
 };
 
 struct TypeSlice final : Type {
@@ -209,6 +206,10 @@ struct TypeUnit final : Type {
 
 struct TypeType final : Type {
   explicit TypeType(Span span) : Type(AstNodeKind::TypeType, span) {}
+};
+
+struct TypeNever final : Type {
+  explicit TypeNever(Span span) : Type(AstNodeKind::TypeNever, span) {}
 };
 
 // ---- Expr / Stmt / Pattern ----
@@ -323,8 +324,9 @@ struct ExprBool final : Expr {
 
 struct ExprString final : Expr {
   std::string value{};
-  explicit ExprString(Span span, std::string value)
-      : Expr(AstNodeKind::ExprString, span), value(std::move(value)) {}
+  bool is_c_string = false;
+  explicit ExprString(Span span, std::string value, bool is_c_string = false)
+      : Expr(AstNodeKind::ExprString, span), value(std::move(value)), is_c_string(is_c_string) {}
 };
 
 struct ExprUnit final : Expr {
@@ -517,8 +519,12 @@ struct FieldDecl final : AstNode {
 struct VariantDecl final : AstNode {
   std::string name{};
   std::vector<Type*> payload{};
-  explicit VariantDecl(Span span, std::string name, std::vector<Type*> payload)
-      : AstNode(AstNodeKind::VariantDecl, span), name(std::move(name)), payload(std::move(payload)) {}
+  Expr* discriminant = nullptr;  // optional; null means implicit
+  explicit VariantDecl(Span span, std::string name, std::vector<Type*> payload, Expr* discriminant = nullptr)
+      : AstNode(AstNodeKind::VariantDecl, span),
+        name(std::move(name)),
+        payload(std::move(payload)),
+        discriminant(discriminant) {}
 };
 
 struct UseTree final : AstNode {
@@ -578,15 +584,6 @@ struct ItemEnum final : Item {
         variants(std::move(variants)) {}
 };
 
-struct ItemTrait final : Item {
-  std::string name{};
-  std::vector<FnDecl*> methods{};
-  explicit ItemTrait(Span span, std::vector<Attr*> attrs, Visibility vis, std::string name, std::vector<FnDecl*> methods)
-      : Item(AstNodeKind::ItemTrait, span, std::move(attrs), vis),
-        name(std::move(name)),
-        methods(std::move(methods)) {}
-};
-
 struct ItemFn final : Item {
   FnDecl* decl = nullptr;
   Block* body = nullptr;
@@ -631,23 +628,6 @@ struct ItemImplInherent final : Item {
   explicit ItemImplInherent(Span span, std::vector<Attr*> attrs, Visibility vis, Path* type_name, std::vector<ItemFn*> methods)
       : Item(AstNodeKind::ItemImplInherent, span, std::move(attrs), vis),
         type_name(type_name),
-        methods(std::move(methods)) {}
-};
-
-struct ItemImplTrait final : Item {
-  Path* trait_name = nullptr;
-  Path* for_type_name = nullptr;
-  std::vector<ItemFn*> methods{};
-  explicit ItemImplTrait(
-      Span span,
-      std::vector<Attr*> attrs,
-      Visibility vis,
-      Path* trait_name,
-      Path* for_type_name,
-      std::vector<ItemFn*> methods)
-      : Item(AstNodeKind::ItemImplTrait, span, std::move(attrs), vis),
-        trait_name(trait_name),
-        for_type_name(for_type_name),
         methods(std::move(methods)) {}
 };
 

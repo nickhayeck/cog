@@ -18,7 +18,6 @@ struct CheckedCrate {
 
   std::unordered_map<const ItemStruct*, StructInfo> struct_info{};
   std::unordered_map<const ItemEnum*, EnumInfo> enum_info{};
-  std::unordered_map<const ItemTrait*, TraitMethodSet> trait_methods{};
 
   std::unordered_map<const ItemConst*, TypeId> const_types{};
   std::unordered_map<const ItemStatic*, TypeId> static_types{};

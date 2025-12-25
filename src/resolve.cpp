@@ -135,7 +135,6 @@ class Resolver {
     switch (item->kind) {
       case AstNodeKind::ItemStruct:
       case AstNodeKind::ItemEnum:
-      case AstNodeKind::ItemTrait:
       case AstNodeKind::ItemTypeAlias:
         return true;
       default:
@@ -161,8 +160,6 @@ class Resolver {
         return static_cast<const ItemStruct*>(item)->name;
       case AstNodeKind::ItemEnum:
         return static_cast<const ItemEnum*>(item)->name;
-      case AstNodeKind::ItemTrait:
-        return static_cast<const ItemTrait*>(item)->name;
       case AstNodeKind::ItemTypeAlias:
         return static_cast<const ItemTypeAlias*>(item)->name;
       case AstNodeKind::ItemConst:
@@ -353,16 +350,6 @@ class Resolver {
     return ty;
   }
 
-  ItemTrait* resolve_trait_path(ModuleId from, const Path* path) {
-    Item* ty = resolve_type_path(from, path);
-    if (!ty) return nullptr;
-    if (ty->kind != AstNodeKind::ItemTrait) {
-      error(path->span, "expected a trait in this position");
-      return nullptr;
-    }
-    return static_cast<ItemTrait*>(ty);
-  }
-
   void index_inherent_impl(ModuleId module_id, ItemImplInherent* impl) {
     if (!impl) return;
     Item* ty = resolve_type_path(module_id, impl->type_name);
@@ -380,26 +367,6 @@ class Resolver {
     }
   }
 
-  void index_trait_impl(ModuleId module_id, ItemImplTrait* impl) {
-    if (!impl) return;
-    ItemTrait* tr = resolve_trait_path(module_id, impl->trait_name);
-    if (!tr) return;
-    Item* ty = resolve_type_path(module_id, impl->for_type_name);
-    if (!ty) return;
-
-    TraitImplKey key{.trait = tr, .type = ty};
-    auto& table = crate_.trait_impl_methods[key];
-    for (ItemFn* m : impl->methods) {
-      if (!m || !m->decl) continue;
-      std::string name = m->decl->name;
-      if (table.contains(name)) {
-        error(m->span, "duplicate trait method `" + name + "` in impl");
-        continue;
-      }
-      table.insert({name, m});
-    }
-  }
-
   void collect_all_impls() {
     for (ModuleId mid = 0; mid < crate_.modules.size(); mid++) {
       Module& m = crate_.modules[mid];
@@ -408,9 +375,6 @@ class Resolver {
         switch (item->kind) {
           case AstNodeKind::ItemImplInherent:
             index_inherent_impl(mid, static_cast<ItemImplInherent*>(item));
-            break;
-          case AstNodeKind::ItemImplTrait:
-            index_trait_impl(mid, static_cast<ItemImplTrait*>(item));
             break;
           default:
             break;

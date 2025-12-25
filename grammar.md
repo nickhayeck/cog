@@ -1,12 +1,13 @@
-# Cog v0.0.12 prototype grammar (draft)
+# Cog v0.0.15 prototype grammar (draft)
 
-This is an **approximate** EBNF aligned with the v0.0.12 prototype parser (`src/parser.y` + `src/lexer.l`). It describes the subset that currently parses; it is not intended to be a complete Rust grammar.
+This is an **approximate** EBNF aligned with the v0.0.15 prototype parser (`src/parser.y` + `src/lexer.l`). It describes the subset that currently parses; it is not intended to be a complete Rust grammar.
 
-Core language grammar (v0.1 draft) lives in `spec/syntax.md`. The prototype grammar differs in a few places (notably `fn[extern]` vs `fn[extern(C)]`, and legacy dynamic dispatch keywords that are not part of the v0.1 core spec).
+Core language grammar (v0.1 draft) lives in `spec/syntax.md`. The prototype grammar is intended to be close to `spec/`, but remains incomplete and may accept or reject programs differently in edge cases.
 
 Notes:
-- No generics (types/items/traits).
-- Item tags are written after the keyword: `struct[repr(C)] Name { ... }`, `fn[extern] foo(...);`.
+- No generics.
+- No traits/dyn (removed in v0.0.14).
+- Item tags are written after the keyword: `struct[repr(C)] Name { ... }`, `fn[extern(C)] foo(...);`.
 - To make `use a::{b,c};` parse reliably, the lexer emits a dedicated token for `::{` (`TOK_COLONCOLON_LBRACE` in the implementation).
 - Expression parsing is precedence-based: assignment, `||`, `&&`, equality, comparisons, `+/-`, `*//%`, `as`, unary, postfix.
  - `builtin::...` names are ordinary paths syntactically; they are handled specially during type checking / comptime evaluation.
@@ -14,7 +15,7 @@ Notes:
 ## Lexical notes
 - Identifiers: `[A-Za-z_][A-Za-z0-9_]*`
 - Integers: `[0-9]+` (decimal only)
-- Strings: `"..."` (v0.0.x supports basic escapes: `\\n`, `\\r`, `\\t`, `\\\"`, `\\\\`)
+- Strings: `"..."` and `c"..."` (v0.0.x supports basic escapes: `\\n`, `\\r`, `\\t`, `\\0`, `\\\"`, `\\\\`)
 - Comments: `// ...` and `/* ... */`
 
 ## EBNF (approximate)
@@ -27,29 +28,26 @@ program       := item*
 ### Items
 ```
 item          := vis? item_core
-vis           := "pub" | ε
+vis           := "pub" | "pub" "(" "crate" ")" | ε
 
 tags          := "[" tag_list? "]"
 tag_list      := tag ("," tag)* ","?
 tag           := path
               | path "(" path ")"
+              | path "(" STRING ")"
 
 item_core     := "use" tags? use_tree ";"
               | "mod" tags? IDENT "{" item* "}"
               | "mod" tags? IDENT ";"
               | "struct" tags? IDENT "{" field_decl* "}"
               | "enum" tags? IDENT "{" variant_decl* "}"
-              | "trait" tags? IDENT "{" trait_item* "}"
               | "impl" tags? path "{" impl_item* "}"
-              | "impl" tags? path "for" path "{" impl_item* "}"
               | "fn" tags? IDENT "(" params? ")" ret? (block | ";")
               | "const" tags? IDENT ":" type "=" expr ";"
               | "static" tags? IDENT ":" type "=" expr ";"
               | "type" tags? IDENT "=" type ";"
 
-trait_item    := fn_decl ";"
 impl_item     := vis? "fn" tags? IDENT "(" params? ")" ret? block
-fn_decl       := "fn" IDENT "(" params? ")" ret?
 ret           := "->" type
 ```
 
@@ -66,6 +64,7 @@ use_trees     := use_tree ("," use_tree)* ","?
 field_decl    := vis? IDENT ":" type ","?
 
 variant_decl  := IDENT ","?
+              | IDENT "=" expr ","?
               | IDENT "(" types? ")" ","?
 ```
 
@@ -88,9 +87,9 @@ qpath         := path_seg "::" path_seg ("::" path_seg)*   // at least 2 segment
 ```
 type          := path
               | "type"
+              | "!"
               | "const" "*" type
               | "mut" "*" type
-              | "dyn" path
               | "[" type "]"              // slice type (unsized)
               | "[" type ";" expr "]"     // array type
               | "(" ")"                   // unit
@@ -117,7 +116,7 @@ let_stmt      := "let" pattern (":" type)? ("=" expr)?
 ### Expressions (precedence-shaped)
 ```
 expr          := assign_expr
-assign_expr   := postfix_expr "=" assign_expr
+assign_expr   := unary_expr "=" assign_expr
               | logical_or_expr
 
 logical_or_expr  := logical_or_expr "||" logical_and_expr
@@ -141,7 +140,8 @@ multiplicative_expr := multiplicative_expr ("*" | "/" | "%") cast_expr
 cast_expr     := cast_expr "as" type
               | unary_expr
 
-unary_expr    := ("-" | "!" | "*") unary_expr
+unary_expr    := ("-" | "!" | "*" | "&") unary_expr
+              | "&" "mut" unary_expr
               | postfix_expr
 
 postfix_expr  := primary_expr

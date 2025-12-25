@@ -1,4 +1,4 @@
-// v0.0.9 (early): LLVM IR emission smoke test.
+// Basic LLVM codegen smoke test (originally v0.0.9).
 
 fn add(a: i32, b: i32) -> i32 {
     a + b
@@ -12,4 +12,3 @@ fn main() -> i32 {
         0
     }
 }
-

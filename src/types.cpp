@@ -28,6 +28,12 @@ TypeId TypeStore::bool_() {
   return *cached_bool_;
 }
 
+TypeId TypeStore::never() {
+  if (cached_never_) return *cached_never_;
+  cached_never_ = make(TypeData{.kind = TypeKind::Never});
+  return *cached_never_;
+}
+
 TypeId TypeStore::type_type() {
   if (cached_type_type_) return *cached_type_type_;
   cached_type_type_ = make(TypeData{.kind = TypeKind::TypeType});
@@ -79,13 +85,6 @@ TypeId TypeStore::enum_(const ItemEnum* def) {
   return id;
 }
 
-TypeId TypeStore::dyn_trait(const ItemTrait* def) {
-  if (auto it = cached_dyn_traits_.find(def); it != cached_dyn_traits_.end()) return it->second;
-  TypeId id = make(TypeData{.kind = TypeKind::DynTrait, .trait_def = def});
-  cached_dyn_traits_.insert({def, id});
-  return id;
-}
-
 static bool vec_equal(const TypeStore& ts, const std::vector<TypeId>& a, const std::vector<TypeId>& b) {
   if (a.size() != b.size()) return false;
   for (size_t i = 0; i < a.size(); i++) {
@@ -104,6 +103,7 @@ bool TypeStore::equal(TypeId a, TypeId b) const {
     case TypeKind::Error:
     case TypeKind::Unit:
     case TypeKind::Bool:
+    case TypeKind::Never:
     case TypeKind::TypeType:
     case TypeKind::Self:
       return true;
@@ -121,8 +121,6 @@ bool TypeStore::equal(TypeId a, TypeId b) const {
       return ta.struct_def == tb.struct_def;
     case TypeKind::Enum:
       return ta.enum_def == tb.enum_def;
-    case TypeKind::DynTrait:
-      return ta.trait_def == tb.trait_def;
   }
   return false;
 }
@@ -145,6 +143,7 @@ bool TypeStore::is_sized(TypeId t) const {
     case TypeKind::Unit:
     case TypeKind::Bool:
     case TypeKind::Int:
+    case TypeKind::Never:
     case TypeKind::TypeType:
     case TypeKind::Ptr:
     case TypeKind::Array:
@@ -154,7 +153,6 @@ bool TypeStore::is_sized(TypeId t) const {
     case TypeKind::Self:
       return true;
     case TypeKind::Slice:
-    case TypeKind::DynTrait:
       return false;
   }
   return true;
@@ -168,11 +166,11 @@ bool TypeStore::is_copy(TypeId t) const {
     case TypeKind::Unit:
     case TypeKind::Bool:
     case TypeKind::Int:
+    case TypeKind::Never:
     case TypeKind::TypeType:
     case TypeKind::Ptr:
       return true;
     case TypeKind::Slice:
-    case TypeKind::DynTrait:
       return false;
     case TypeKind::Array:
       return is_copy(d.elem);
@@ -230,6 +228,8 @@ std::string TypeStore::to_string(TypeId t) const {
       return "bool";
     case TypeKind::Int:
       return std::string(int_name(d.int_kind));
+    case TypeKind::Never:
+      return "!";
     case TypeKind::TypeType:
       return "type";
     case TypeKind::Self:
@@ -265,11 +265,6 @@ std::string TypeStore::to_string(TypeId t) const {
       return d.struct_def ? d.struct_def->name : "<struct>";
     case TypeKind::Enum:
       return d.enum_def ? d.enum_def->name : "<enum>";
-    case TypeKind::DynTrait: {
-      std::ostringstream out;
-      out << "dyn " << (d.trait_def ? d.trait_def->name : "<trait>");
-      return out.str();
-    }
   }
   return "<type>";
 }
@@ -291,4 +286,3 @@ std::optional<IntKind> TypeStore::parse_int_kind(std::string_view name) const {
 }
 
 }  // namespace cog
-

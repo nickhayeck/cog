@@ -35,6 +35,7 @@ enum class TypeKind : std::uint8_t {
   Unit,
   Bool,
   Int,
+  Never,
   TypeType,
   Ptr,
   Slice,
@@ -42,7 +43,6 @@ enum class TypeKind : std::uint8_t {
   Tuple,
   Struct,
   Enum,
-  DynTrait,
   Self,
 };
 
@@ -66,7 +66,6 @@ struct TypeData {
   // Nominal
   const ItemStruct* struct_def = nullptr;
   const ItemEnum* enum_def = nullptr;
-  const ItemTrait* trait_def = nullptr;
 };
 
 class TypeStore {
@@ -76,6 +75,7 @@ class TypeStore {
   TypeId error();
   TypeId unit();
   TypeId bool_();
+  TypeId never();
   TypeId type_type();
   TypeId self();
 
@@ -86,7 +86,6 @@ class TypeStore {
   TypeId tuple(std::vector<TypeId> elems);
   TypeId struct_(const ItemStruct* def);
   TypeId enum_(const ItemEnum* def);
-  TypeId dyn_trait(const ItemTrait* def);
 
   const TypeData& get(TypeId id) const { return types_.at(static_cast<size_t>(id)); }
 
@@ -104,13 +103,13 @@ class TypeStore {
   std::optional<TypeId> cached_error_{};
   std::optional<TypeId> cached_unit_{};
   std::optional<TypeId> cached_bool_{};
+  std::optional<TypeId> cached_never_{};
   std::optional<TypeId> cached_type_type_{};
   std::optional<TypeId> cached_self_{};
 
   std::unordered_map<IntKind, TypeId> cached_ints_{};
   std::unordered_map<const ItemStruct*, TypeId> cached_structs_{};
   std::unordered_map<const ItemEnum*, TypeId> cached_enums_{};
-  std::unordered_map<const ItemTrait*, TypeId> cached_dyn_traits_{};
 
   TypeId make(TypeData d);
 };

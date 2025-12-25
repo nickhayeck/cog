@@ -146,7 +146,7 @@ The value must be serializable (see `spec/comptime.md`). Otherwise compilation f
 
 ### Address-of a const
 
-`builtin::addr_of(ANSWER)` is permitted, but the resulting address is not required to be stable:
+`&ANSWER` is permitted, but the resulting address is not required to be stable:
 - the compiler may materialize a private static for the constant
 - different uses may or may not yield the same address
 

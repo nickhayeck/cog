@@ -1,0 +1,37 @@
+// C-interop tags + `enum[tag(..)]` + string literals (originally v0.0.15).
+
+fn[extern(C), extern_name("malloc")] c_malloc(size: usize) -> mut* u8;
+fn[extern(C), extern_name("free")] c_free(p: mut* u8);
+fn[extern(C)] printf(fmt: const* u8, ...) -> i32;
+
+pub(crate) const MAGIC: i32 = 42;
+
+pub enum Mode {
+    Off = 0,
+    On = 1,
+    Error = 2,
+}
+
+const HELLO_SLICE: const* [u8] = "hello";
+
+fn[export(C), export_name("cog_add_one")] add_one(x: i32) -> i32 {
+    x + 1
+}
+
+fn main() -> i32 {
+    // `"..."` is a slice pointer (`const* [u8]`).
+    let _s: const* [u8] = HELLO_SLICE;
+
+    // `c"..."` is a C string pointer (`const* u8`) suitable for `printf`.
+    printf(c"magic=%d\n", MAGIC);
+
+    let p: mut* u8 = c_malloc(1);
+    c_free(p);
+
+    let m: Mode = Mode::On;
+    match m {
+        Mode::Off => 0,
+        Mode::On => 1,
+        Mode::Error => 2,
+    }
+}

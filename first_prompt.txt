@@ -36,7 +36,7 @@ Allow comptime parameters: fn f(comptime N: usize, ...) specializing on constant
 Support comptime returning values usable in const init, array lengths, and type aliases.
 Comptime as generics: we want to support comptime functions returning
 Reflection: builtin::type_info(type) -> TypeInfo, provides comptime reflection for types
-Other builtins: builtin::size_of(type), builtin::align_of(type), builtin::compile_error(msg), builtin::addr_of(x)->const* T, builtin::addr_of_mut(x)->mut* T.
+Other builtins: builtin::size_of(type), builtin::align_of(type), builtin::compile_error(msg). Address-of uses unary `&` / `&mut`.
 
 # Misc.
 Build modes: similar ideas to Zig here - we want Debug, ReleaseSafe, ReleaseFast modes that provide runtime checking for

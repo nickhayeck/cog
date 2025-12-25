@@ -49,7 +49,8 @@ static std::vector<T*> take_vec(std::vector<T*>* v) {
 
 %union {
   long long int_val;
-  char* str;
+  char* cstr;
+  std::string* str_lit;
   cog::Visibility vis;
 
   cog::FileAst* file;
@@ -65,7 +66,6 @@ static std::vector<T*> take_vec(std::vector<T*>* v) {
   cog::VariantDecl* variant_decl;
 
   cog::Param* param;
-  cog::FnDecl* fn_decl;
   cog::FnSig* sig;
 
   cog::Type* type;
@@ -85,7 +85,6 @@ static std::vector<T*> take_vec(std::vector<T*>* v) {
   std::vector<cog::FieldDecl*>* field_decls;
   std::vector<cog::VariantDecl*>* variant_decls;
   std::vector<cog::Param*>* params;
-  std::vector<cog::FnDecl*>* fn_decls;
   std::vector<cog::Type*>* types;
   std::vector<cog::Stmt*>* stmts;
   std::vector<cog::Expr*>* exprs;
@@ -95,13 +94,14 @@ static std::vector<T*> take_vec(std::vector<T*>* v) {
   std::vector<cog::PatField*>* pat_fields;
 }
 
-%token <str> IDENT
-%token <str> STRING
+%token <cstr> IDENT
+%token <str_lit> STRING
+%token <str_lit> CSTRING
 %token <int_val> INT
 
-%token KW_FN KW_STRUCT KW_ENUM KW_TRAIT KW_IMPL KW_FOR KW_TYPE KW_CONST KW_STATIC
+%token KW_FN KW_STRUCT KW_ENUM KW_IMPL KW_TYPE KW_CONST KW_STATIC
 %token KW_MOD KW_USE KW_PUB KW_AS KW_LET KW_MUT KW_IF KW_ELSE KW_WHILE
-%token KW_LOOP KW_MATCH KW_RETURN KW_BREAK KW_CONTINUE KW_COMPTIME KW_DYN KW_SELF_TYPE
+%token KW_LOOP KW_MATCH KW_RETURN KW_BREAK KW_CONTINUE KW_COMPTIME KW_SELF_TYPE KW_CRATE
 %token KW_TRUE KW_FALSE
 
 %token TOK_COLONCOLON TOK_COLONCOLON_LBRACE TOK_ARROW TOK_FATARROW TOK_EQEQ TOK_NEQ TOK_LE TOK_GE TOK_ANDAND TOK_OROR TOK_ELLIPSIS
@@ -120,7 +120,7 @@ static std::vector<T*> take_vec(std::vector<T*>* v) {
 
 %type <use_tree> use_tree
 %type <use_trees> use_trees_opt use_trees
-%type <str> use_alias_opt
+%type <cstr> use_alias_opt
 
 %type <type> type ret_opt
 %type <types> types_opt types
@@ -128,7 +128,6 @@ static std::vector<T*> take_vec(std::vector<T*>* v) {
 %type <param> param
 %type <params> params
 %type <sig> fn_sig
-%type <fn_decl> fn_decl
 
 %type <field_decl> field_decl
 %type <field_decls> fields_opt fields
@@ -159,7 +158,6 @@ static std::vector<T*> take_vec(std::vector<T*>* v) {
 
 %type <item_fns> impl_items_opt impl_items
 %type <item_fn> impl_item
-%type <fn_decls> trait_items_opt trait_items
 
 %start program
 
@@ -173,8 +171,9 @@ static std::vector<T*> take_vec(std::vector<T*>* v) {
 %left KW_AS
 %right UNARY
 
-%destructor { free($$); } IDENT STRING use_alias_opt
-%destructor { delete $$; } items tags tags_list_opt tags_list path_segments qpath_segments use_trees_opt use_trees fields_opt fields variants_opt variants params trait_items_opt trait_items impl_items_opt impl_items stmts args_opt args field_inits_opt field_inits match_arms_opt match_arms pat_list_opt pat_list pat_fields_opt pat_fields
+%destructor { free($$); } IDENT use_alias_opt
+%destructor { delete $$; } STRING CSTRING
+%destructor { delete $$; } items tags tags_list_opt tags_list path_segments qpath_segments use_trees_opt use_trees fields_opt fields variants_opt variants params impl_items_opt impl_items stmts args_opt args field_inits_opt field_inits match_arms_opt match_arms pat_list_opt pat_list pat_fields_opt pat_fields
 
 %%
 
@@ -202,6 +201,7 @@ item
 vis_opt
   : /* empty */ { $$ = cog::Visibility::Private; }
   | KW_PUB { $$ = cog::Visibility::Pub; }
+  | KW_PUB '(' KW_CRATE ')' { $$ = cog::Visibility::PubCrate; }
   ;
 
 tags
@@ -220,8 +220,9 @@ tags_list
   ;
 
 tag
-  : path { $$ = MK(cog::Attr, @$, $1, nullptr); }
+  : path { $$ = MK(cog::Attr, @$, $1); }
   | path '(' path ')' { $$ = MK(cog::Attr, @$, $1, $3); }
+  | path '(' STRING ')' { $$ = MK(cog::Attr, @$, $1, cog::take_string($3)); }
   ;
 
 item_core
@@ -264,15 +265,6 @@ item_core
       std::vector<cog::VariantDecl*> vs = take_vec($5);
       $$ = MK(cog::ItemEnum, @$, take_vec($2), cog::Visibility::Private, cog::take_str($3), std::move(vs));
     }
-  | KW_TRAIT IDENT '{' trait_items_opt '}' {
-      std::vector<cog::FnDecl*> ms = take_vec($4);
-      $$ = MK(
-          cog::ItemTrait, @$, std::vector<cog::Attr*>{}, cog::Visibility::Private, cog::take_str($2), std::move(ms));
-    }
-  | KW_TRAIT tags IDENT '{' trait_items_opt '}' {
-      std::vector<cog::FnDecl*> ms = take_vec($5);
-      $$ = MK(cog::ItemTrait, @$, take_vec($2), cog::Visibility::Private, cog::take_str($3), std::move(ms));
-    }
   | KW_IMPL path '{' impl_items_opt '}' {
       std::vector<cog::ItemFn*> ms = take_vec($4);
       $$ = MK(cog::ItemImplInherent, @$, std::vector<cog::Attr*>{}, cog::Visibility::Private, $2, std::move(ms));
@@ -280,14 +272,6 @@ item_core
   | KW_IMPL tags path '{' impl_items_opt '}' {
       std::vector<cog::ItemFn*> ms = take_vec($5);
       $$ = MK(cog::ItemImplInherent, @$, take_vec($2), cog::Visibility::Private, $3, std::move(ms));
-    }
-  | KW_IMPL path KW_FOR path '{' impl_items_opt '}' {
-      std::vector<cog::ItemFn*> ms = take_vec($6);
-      $$ = MK(cog::ItemImplTrait, @$, std::vector<cog::Attr*>{}, cog::Visibility::Private, $2, $4, std::move(ms));
-    }
-  | KW_IMPL tags path KW_FOR path '{' impl_items_opt '}' {
-      std::vector<cog::ItemFn*> ms = take_vec($7);
-      $$ = MK(cog::ItemImplTrait, @$, take_vec($2), cog::Visibility::Private, $3, $5, std::move(ms));
     }
   | KW_FN IDENT fn_sig block {
       cog::FnDecl* decl = MK(cog::FnDecl, @$, cog::take_str($2), $3);
@@ -355,16 +339,6 @@ use_trees
   | use_tree { $$ = vec1($1); }
   ;
 
-trait_items_opt
-  : /* empty */ { $$ = vec_new<cog::FnDecl>(); }
-  | trait_items { $$ = $1; }
-  ;
-
-trait_items
-  : trait_items fn_decl ';' { $$ = vec_push($1, $2); }
-  | fn_decl ';' { $$ = vec1($1); }
-  ;
-
 impl_items_opt
   : /* empty */ { $$ = vec_new<cog::ItemFn>(); }
   | impl_items { $$ = $1; }
@@ -384,12 +358,6 @@ impl_item
       std::vector<cog::Attr*> tags = take_vec($3);
       cog::FnDecl* decl = MK(cog::FnDecl, @$, cog::take_str($4), $5);
       $$ = MK(cog::ItemFn, @$, std::move(tags), $1, decl, $6);
-    }
-  ;
-
-fn_decl
-  : KW_FN IDENT fn_sig {
-      $$ = MK(cog::FnDecl, @$, cog::take_str($2), $3);
     }
   ;
 
@@ -443,9 +411,9 @@ qpath_segments
 type
   : path { $$ = MK(cog::TypePath, @$, $1); }
   | KW_TYPE { $$ = MK(cog::TypeType, @$); }
+  | '!' { $$ = MK(cog::TypeNever, @$); }
   | KW_CONST '*' type { $$ = MK(cog::TypePtr, @$, cog::Mutability::Const, $3); }
   | KW_MUT '*' type { $$ = MK(cog::TypePtr, @$, cog::Mutability::Mut, $3); }
-  | KW_DYN path { $$ = MK(cog::TypeDyn, @$, $2); }
   | '[' type ']' { $$ = MK(cog::TypeSlice, @$, $2); }
   | '[' type ';' expr ']' { $$ = MK(cog::TypeArray, @$, $2, $4); }
   | '(' ')' { $$ = MK(cog::TypeUnit, @$); }
@@ -504,13 +472,15 @@ variants
   ;
 
 variant_decl
-  : IDENT ',' { $$ = MK(cog::VariantDecl, @$, cog::take_str($1), std::vector<cog::Type*>{}); }
-  | IDENT { $$ = MK(cog::VariantDecl, @$, cog::take_str($1), std::vector<cog::Type*>{}); }
+  : IDENT ',' { $$ = MK(cog::VariantDecl, @$, cog::take_str($1), std::vector<cog::Type*>{}, nullptr); }
+  | IDENT { $$ = MK(cog::VariantDecl, @$, cog::take_str($1), std::vector<cog::Type*>{}, nullptr); }
+  | IDENT '=' expr ',' { $$ = MK(cog::VariantDecl, @$, cog::take_str($1), std::vector<cog::Type*>{}, $3); }
+  | IDENT '=' expr { $$ = MK(cog::VariantDecl, @$, cog::take_str($1), std::vector<cog::Type*>{}, $3); }
   | IDENT '(' types_opt ')' ',' {
-      $$ = MK(cog::VariantDecl, @$, cog::take_str($1), take_vec($3));
+      $$ = MK(cog::VariantDecl, @$, cog::take_str($1), take_vec($3), nullptr);
     }
   | IDENT '(' types_opt ')' {
-      $$ = MK(cog::VariantDecl, @$, cog::take_str($1), take_vec($3));
+      $$ = MK(cog::VariantDecl, @$, cog::take_str($1), take_vec($3), nullptr);
     }
   ;
 
@@ -594,7 +564,7 @@ expr_nostruct
 
 assign_expr
   : logical_or_expr { $$ = $1; }
-  | postfix_expr '=' assign_expr { $$ = MK(cog::ExprAssign, @$, $1, $3); }
+  | unary_expr '=' assign_expr { $$ = MK(cog::ExprAssign, @$, $1, $3); }
   ;
 
 logical_or_expr
@@ -643,6 +613,8 @@ unary_expr
   : '-' unary_expr { $$ = MK(cog::ExprUnary, @$, cog::UnaryOp::Neg, $2); }
   | '*' unary_expr { $$ = MK(cog::ExprUnary, @$, cog::UnaryOp::Deref, $2); }
   | '!' unary_expr { $$ = MK(cog::ExprUnary, @$, cog::UnaryOp::Not, $2); }
+  | '&' unary_expr { $$ = MK(cog::ExprUnary, @$, cog::UnaryOp::AddrOf, $2); }
+  | '&' KW_MUT unary_expr { $$ = MK(cog::ExprUnary, @$, cog::UnaryOp::AddrOfMut, $3); }
   | postfix_expr { $$ = $1; }
   ;
 
@@ -656,7 +628,8 @@ postfix_expr
 
 primary_expr
   : INT { $$ = MK(cog::ExprInt, @$, static_cast<std::int64_t>($1)); }
-  | STRING { $$ = MK(cog::ExprString, @$, cog::take_str($1)); }
+  | STRING { $$ = MK(cog::ExprString, @$, cog::take_string($1), /*is_c_string=*/false); }
+  | CSTRING { $$ = MK(cog::ExprString, @$, cog::take_string($1), /*is_c_string=*/true); }
   | KW_TRUE { $$ = MK(cog::ExprBool, @$, true); }
   | KW_FALSE { $$ = MK(cog::ExprBool, @$, false); }
   | '(' ')' { $$ = MK(cog::ExprUnit, @$); }

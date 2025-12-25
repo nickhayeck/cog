@@ -1,0 +1,18 @@
+// `builtin::size_of` / `builtin::align_of` on named types (including arrays via type aliases).
+
+struct Pair {
+    a: i32,
+    b: i32,
+}
+
+type Buf16 = [u8; 16];
+
+fn main() -> i32 {
+    let a: usize = builtin::size_of(Pair);
+    let b: usize = builtin::align_of(Pair);
+    let c: usize = builtin::size_of(Buf16);
+    let d: usize = builtin::align_of(Buf16);
+
+    (a + b + c + d) as i32
+}
+
