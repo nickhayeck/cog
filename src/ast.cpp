@@ -102,6 +102,8 @@ std::string_view ast_kind_name(AstNodeKind kind) {
             return "FieldInit";
         case AstNodeKind::ExprInt:
             return "ExprInt";
+        case AstNodeKind::ExprFloat:
+            return "ExprFloat";
         case AstNodeKind::ExprBool:
             return "ExprBool";
         case AstNodeKind::ExprString:
@@ -142,6 +144,10 @@ std::string_view ast_kind_name(AstNodeKind kind) {
             return "ExprStructLit";
         case AstNodeKind::ExprTuple:
             return "ExprTuple";
+        case AstNodeKind::ExprArrayLit:
+            return "ExprArrayLit";
+        case AstNodeKind::ExprArrayRepeat:
+            return "ExprArrayRepeat";
     }
     return "Unknown";
 }
@@ -511,6 +517,17 @@ void dump_ast(std::ostream& os, const AstNode* node, int indent) {
         case AstNodeKind::ExprTuple: {
             auto* n = static_cast<const ExprTuple*>(node);
             for (const Expr* e : n->elems) dump_ast(os, e, indent + 1);
+            return;
+        }
+        case AstNodeKind::ExprArrayLit: {
+            auto* n = static_cast<const ExprArrayLit*>(node);
+            for (const Expr* e : n->elems) dump_ast(os, e, indent + 1);
+            return;
+        }
+        case AstNodeKind::ExprArrayRepeat: {
+            auto* n = static_cast<const ExprArrayRepeat*>(node);
+            dump_ast(os, n->elem, indent + 1);
+            dump_ast(os, n->count, indent + 1);
             return;
         }
         default:

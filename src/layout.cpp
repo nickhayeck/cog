@@ -199,6 +199,20 @@ std::optional<Layout> LayoutEngine::compute_layout(TypeId ty, Span use_site) {
                 std::max<std::uint64_t>(int_align(d.int_kind), 1);
             return Layout{.size = size, .align = align, .sized = true};
         }
+        case TypeKind::Float: {
+            std::uint64_t size = 0;
+            switch (d.float_kind) {
+                case FloatKind::F32:
+                    size = 4;
+                    break;
+                case FloatKind::F64:
+                    size = 8;
+                    break;
+            }
+            // For now, use the natural alignment for the float size.
+            std::uint64_t align = std::max<std::uint64_t>(size, 1);
+            return Layout{.size = size, .align = align, .sized = true};
+        }
         case TypeKind::Never:
             return Layout{.size = 0, .align = 1, .sized = true};
         case TypeKind::TypeType:
@@ -227,7 +241,8 @@ std::optional<Layout> LayoutEngine::compute_layout(TypeId ty, Span use_site) {
                 error(use_site, "array element type must be sized");
                 return std::nullopt;
             }
-            auto len = array_len_value(d.array_len_expr);
+            std::optional<std::uint64_t> len = d.array_len_value;
+            if (!len) len = array_len_value(d.array_len_expr);
             if (!len) {
                 error(use_site,
                       "array length is not a known comptime constant");

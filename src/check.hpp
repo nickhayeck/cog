@@ -23,6 +23,7 @@ struct CheckedCrate {
     std::unordered_map<const ItemStatic*, TypeId> static_types{};
     std::unordered_map<const ItemFn*, FnInfo> fn_info{};
 
+    std::unordered_map<const PatBinding*, TypeId> binding_types{};
     std::unordered_map<const Expr*, TypeId> expr_types{};
     std::unordered_map<const Expr*, std::uint64_t> array_lens{};
 };

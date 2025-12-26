@@ -96,7 +96,7 @@ is resolved as follows:
    - If `receiver` is `const* T`, it may call only methods requiring `const* Self`.
    - If `receiver` is `T`, it may call methods requiring `Self` (by value), or pointer receivers via implicit address-taking (below).
 
-There is no overloading by argument types in v0.1; name + arity must match.
+There is no overloading by argument types.
 
 ### Method call desugaring
 
@@ -121,8 +121,6 @@ where `self_arg` is computed based on the receiver type required by the selected
   - if `receiver` already has type `mut* T`, pass it
   - else take the mutable address of `receiver`:
     - `receiver` must be a mutable place expression, or compilation fails
-
-Because Cog has no lifetime checking, taking the address of a temporary may yield a pointer that later dangles if it escapes; this is permitted but may cause UB when used.
 
 ## Constants (`const`)
 

@@ -1,0 +1,23 @@
+// v0.0.19: arrays + floats + bitwise + numeric literal ergonomics.
+
+fn[extern(C)] printf(fmt: const* u8, ...) -> i32;
+
+fn main() -> i32 {
+    let a: [i32; 3] = [1, 2, 3];
+    let sum: i32 = a[0] + a[1] + a[2];
+
+    let fill: [u8; 8] = [0xFF; 8];
+    let first: u8 = fill[0];
+
+    let bits: u32 = (0b1010_1010 as u32) << (3 as u32);
+    let masked: u32 = bits ^ (0xFF00_FF00 as u32);
+
+    let x: f64 = 1.5 + 2.25;
+    let y: f32 = 3.0;
+    let z: f32 = (x as f32) * y;
+
+    // Touch values so they don't get optimized away in Debug builds.
+    printf(c"sum=%d first=%u masked=%u z=%f\n", sum, first as u32, masked, z as f64);
+    0
+}
+

@@ -71,7 +71,7 @@ fn Foo() -> Foo { Foo { x: 0 } } // type Foo and value Foo can coexist
 Each item has a visibility:
 
 - **Private** (default): visible within the defining module and its descendant modules.
-- `pub`: visible from any module (within the crate).
+- `pub`: visible from any module.
 - `pub(crate)`: visible from any module in the crate.
 
 Notes:

@@ -7,6 +7,18 @@ version: 0.1.0-draft
 
 This chapter lists features that are explicitly *not* fully specified for v0.1, but are part of Cog’s intended trajectory.
 
+## Char literals
+
+Char literals are planned but not required for early v0.1 implementations.
+
+If implemented, a char literal has the form:
+
+```
+CHAR := "'" (non-quote char | escape) "'"
+```
+
+and has type `char` (a Unicode scalar value).
+
 ## Additional literals
 
 - Char literals (and the `char` type) with full Unicode escape support.
@@ -111,6 +123,21 @@ Intended representation model (subject to revision):
 Open design question (must be resolved before stabilizing closures):
 - capture semantics (by value vs by pointer) in a language without borrow checking.
 
+### Sugar: local type declarations
+
+Something like:
+
+```cog
+pub fn Vec(comptime T: type) -> type {
+    struct Vec_ { ptr: mut* T, len: usize, cap: usize }
+    impl Vec_ { fn push(self: mut* Self, x: T) -> () { ... } }
+    return Vec_;
+}
+```
+
+This is intended to desugar to type-construction builtins, not to introduce a second “template system”.
+
+
 ## Arbitrary bit-width integers (planned)
 
 Cog intends to support integer types like `u1`, `u2`, … and `i1`, `i2`, … up to
@@ -129,3 +156,46 @@ some maximum (likely `128`) for both computation and layout control.
 
 - Zig-style `build.cg` as the primary build description.
 - A `gear` tool that generates `build.cg` and provides a Cargo-like UX.
+
+## Tests-in-source (planned)
+
+Cog intends to support a Rust-like “tests in source” workflow.
+
+This feature is planned for after the core parsing/type-checking pipeline is stable, but the surface syntax is reserved now to avoid compatibility traps.
+
+### `mod[test]`
+
+A module tagged `test` is a test-only module:
+
+```cog
+mod[test] tests {
+    fn add_works() -> () {
+        if add(1, 2) != 3 { builtin::compile_error("add failed") };
+    }
+}
+```
+
+Semantics (intended):
+- Test modules are not compiled in normal builds.
+- Test modules are compiled when the compiler is invoked in “test mode” (e.g. `cogc --test`).
+
+### Test function discovery
+
+In test mode, the compiler discovers test functions by:
+- enumerating all `fn` items inside `mod[test]` modules
+- selecting those with signature `fn() -> ()`
+
+The discovery rules may be refined later (e.g. allow submodules, naming conventions, or additional tags).
+
+### Execution model (options)
+
+One of these models should be chosen before stabilizing v0.1:
+
+1) **Generated test runner (Rust-like)**
+   - compiler generates a `main` that calls tests in a deterministic order
+   - a failing test aborts the process
+
+2) **Library + runtime runner**
+   - compiler emits metadata; a runtime runner enumerates and executes
+
+preference is (1) for simplicity and debuggability.

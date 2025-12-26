@@ -1,8 +1,10 @@
 #include "check.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <functional>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -30,6 +32,7 @@ struct VarInfo {
 
 struct Env {
     std::vector<std::unordered_map<std::string, VarInfo>> scopes{};
+    std::optional<TypeId> fn_ret{};
 
     Env() { scopes.emplace_back(); }
 
@@ -175,6 +178,7 @@ class Checker {
         predeclare_nominals();
         collect_type_layouts();
         collect_signatures();
+        init_comptime_support();
         check_comptime();
         check_bodies();
         return !session_.has_errors();
@@ -188,6 +192,7 @@ class Checker {
         out.const_types = std::move(const_types_);
         out.static_types = std::move(static_types_);
         out.fn_info = std::move(fn_info_);
+        out.binding_types = std::move(binding_types_);
         out.expr_types = std::move(expr_types_);
         out.array_lens = std::move(array_lens_);
         return out;
@@ -204,10 +209,13 @@ class Checker {
     std::unordered_map<const ItemConst*, TypeId> const_types_{};
     std::unordered_map<const ItemStatic*, TypeId> static_types_{};
     std::unordered_map<const ItemFn*, FnInfo> fn_info_{};
+    std::unordered_map<const PatBinding*, TypeId> binding_types_{};
     std::unordered_map<const Expr*, TypeId> expr_types_{};
     std::unordered_map<const Expr*, std::uint64_t> array_lens_{};
 
     const ItemStruct* typeinfo_struct_ = nullptr;
+    std::unique_ptr<LayoutEngine> layout_engine_{};
+    std::unique_ptr<ComptimeEvaluator> comptime_eval_{};
 
     void error(Span span, std::string message) {
         session_.diags.push_back(Diagnostic{.severity = Severity::Error,
@@ -228,6 +236,14 @@ class Checker {
     TypeId typeinfo_type() {
         if (!typeinfo_struct_) return types_.error();
         return types_.struct_(typeinfo_struct_);
+    }
+
+    void init_comptime_support() {
+        if (layout_engine_ && comptime_eval_) return;
+        layout_engine_ = std::make_unique<LayoutEngine>(
+            session_, types_, struct_info_, enum_info_, array_lens_, target_layout_);
+        comptime_eval_ = std::make_unique<ComptimeEvaluator>(
+            session_, crate_, &types_, layout_engine_.get());
     }
 
     static bool path_is_ident(const Path* p, std::string_view name) {
@@ -735,6 +751,8 @@ class Checker {
             }
             if (name == "bool") return types_.bool_();
             if (auto ik = types_.parse_int_kind(name)) return types_.int_(*ik);
+            if (auto fk = types_.parse_float_kind(name))
+                return types_.float_(*fk);
         }
 
         const Item* item = resolve_type_item(mid, path, /*emit_errors=*/true);
@@ -794,10 +812,8 @@ class Checker {
 
     void check_comptime() {
         if (session_.has_errors()) return;
-
-        LayoutEngine layout(session_, types_, struct_info_, enum_info_,
-                            array_lens_, target_layout_);
-        ComptimeEvaluator eval(session_, crate_, &types_, &layout);
+        if (!comptime_eval_) return;
+        ComptimeEvaluator& eval = *comptime_eval_;
 
         // Evaluate array lengths that appear in item signatures and layouts.
         for (ModuleId mid = 0; mid < crate_.modules.size(); mid++) {
@@ -1043,8 +1059,10 @@ class Checker {
                     (void)check_expr(mid, a->len, env,
                                      types_.int_(IntKind::Usize));
                     if (!session_.has_errors()) {
-                        if (auto v = eval.eval_usize(mid, a->len))
+                        if (auto v = eval.eval_usize(mid, a->len)) {
                             array_lens_[a->len] = *v;
+                            types_.set_array_len_value(a->len, *v);
+                        }
                     }
                 }
                 check_type_arrays(mid, a->elem, eval);
@@ -1084,6 +1102,7 @@ class Checker {
 
         TypeId ret_ty = it->second.ret;
         Env env{};
+        env.fn_ret = ret_ty;
         env.push_scope();
 
         // Params
@@ -1139,7 +1158,12 @@ class Checker {
                 return {.type = types_.unit()};
             case AstNodeKind::StmtReturn: {
                 auto* r = static_cast<const StmtReturn*>(stmt);
-                TypeId expected = expected_ret.value_or(types_.unit());
+                if (!env.fn_ret) {
+                    error(stmt->span,
+                          "`return` is only allowed inside function bodies");
+                }
+                TypeId expected =
+                    env.fn_ret.value_or(expected_ret.value_or(types_.unit()));
                 TypeId got = r->value
                                  ? check_expr(mid, r->value, env, expected).type
                                  : types_.unit();
@@ -1164,6 +1188,8 @@ class Checker {
         TypeId ann = s->type_ann ? lower_type(mid, s->type_ann, false,
                                               std::nullopt, false)
                                  : types_.error();
+        if (s->type_ann && comptime_eval_ && !session_.has_errors())
+            check_type_arrays(mid, s->type_ann, *comptime_eval_);
         std::optional<TypeId> expected =
             s->type_ann ? std::optional<TypeId>(ann) : std::nullopt;
 
@@ -1195,6 +1221,7 @@ class Checker {
                 return;
             case AstNodeKind::PatBinding: {
                 auto* b = static_cast<const PatBinding*>(pat);
+                binding_types_[b] = scrutinee;
                 env.declare(b->name, VarInfo{.type = scrutinee,
                                              .is_mut = b->is_mut,
                                              .state = init_state});
@@ -1354,6 +1381,27 @@ class Checker {
                 r = {.type = chosen};
                 break;
             }
+            case AstNodeKind::ExprFloat: {
+                auto* lit = static_cast<const ExprFloat*>(expr);
+                TypeId chosen = types_.float_(FloatKind::F64);
+                if (expected && types_.get(*expected).kind == TypeKind::Float)
+                    chosen = *expected;
+                const TypeData& td = types_.get(chosen);
+                if (td.kind == TypeKind::Float) {
+                    if (!std::isfinite(lit->value)) {
+                        error(expr->span, "float literal is not finite");
+                    } else if (td.float_kind == FloatKind::F32) {
+                        double a = std::abs(lit->value);
+                        if (a > static_cast<double>(
+                                    std::numeric_limits<float>::max())) {
+                            error(expr->span,
+                                  "float literal does not fit in `f32`");
+                        }
+                    }
+                }
+                r = {.type = chosen};
+                break;
+            }
             case AstNodeKind::ExprString:
                 // v0.0.15: `"..."` is a byte slice pointer (`const* [u8]`);
                 // `c"..."` is a C string pointer (`const* u8`).
@@ -1388,6 +1436,15 @@ class Checker {
             case AstNodeKind::ExprTuple:
                 r = check_tuple_expr(mid, static_cast<const ExprTuple*>(expr),
                                      env, expected);
+                break;
+            case AstNodeKind::ExprArrayLit:
+                r = check_array_lit(mid, static_cast<const ExprArrayLit*>(expr),
+                                    env, expected);
+                break;
+            case AstNodeKind::ExprArrayRepeat:
+                r = check_array_repeat(
+                    mid, static_cast<const ExprArrayRepeat*>(expr), env,
+                    expected);
                 break;
             case AstNodeKind::ExprField:
                 r = check_field_expr(mid, static_cast<const ExprField*>(expr),
@@ -1588,6 +1645,133 @@ class Checker {
         return {.type = types_.tuple(std::move(elems))};
     }
 
+    std::optional<std::uint64_t> array_len_value(ModuleId mid, TypeId arr_ty) {
+        const TypeData& d = types_.get(arr_ty);
+        if (d.kind != TypeKind::Array) return std::nullopt;
+        if (d.array_len_value) return d.array_len_value;
+        if (!d.array_len_expr) return std::nullopt;
+        if (auto it = array_lens_.find(d.array_len_expr); it != array_lens_.end())
+            return it->second;
+        if (!comptime_eval_) return std::nullopt;
+        if (auto v = comptime_eval_->eval_usize(mid, d.array_len_expr)) {
+            array_lens_[d.array_len_expr] = *v;
+            types_.set_array_len_value(d.array_len_expr, *v);
+            return *v;
+        }
+        return std::nullopt;
+    }
+
+    ExprResult check_array_lit(ModuleId mid, const ExprArrayLit* a, Env& env,
+                               std::optional<TypeId> expected) {
+        const size_t n_elems = a ? a->elems.size() : 0;
+        const std::uint64_t n = static_cast<std::uint64_t>(n_elems);
+
+        if (expected && types_.get(*expected).kind == TypeKind::Array) {
+            const TypeData& ed = types_.get(*expected);
+            if (auto len = array_len_value(mid, *expected)) {
+                if (*len != n) {
+                    error(a ? a->span : Span{},
+                          "array literal length mismatch: expected " +
+                              std::to_string(*len) + ", got " +
+                              std::to_string(n));
+                }
+            }
+            if (!types_.is_sized(ed.elem)) {
+                error(a ? a->span : Span{}, "array element type must be sized");
+                return {.type = types_.error()};
+            }
+            for (const Expr* e : a->elems) {
+                TypeId got = check_expr(mid, e, env, ed.elem).type;
+                if (!types_.can_coerce(got, ed.elem)) {
+                    error(e ? e->span : Span{},
+                          "array element type mismatch: expected `" +
+                              types_.to_string(ed.elem) + "`, got `" +
+                              types_.to_string(got) + "`");
+                }
+            }
+            return {.type = *expected};
+        }
+
+        if (n == 0) {
+            error(a ? a->span : Span{},
+                  "empty array literal requires an expected `[T; 0]` type");
+            return {.type = types_.error()};
+        }
+
+        TypeId elem_ty = check_expr(mid, a->elems[0], env, std::nullopt).type;
+        if (!types_.is_sized(elem_ty)) {
+            error(a ? a->span : Span{}, "array element type must be sized");
+            return {.type = types_.error()};
+        }
+        for (size_t i = 1; i < a->elems.size(); i++) {
+            TypeId got = check_expr(mid, a->elems[i], env, elem_ty).type;
+            if (!types_.can_coerce(got, elem_ty)) {
+                error(a->elems[i] ? a->elems[i]->span : Span{},
+                      "array element type mismatch: expected `" +
+                          types_.to_string(elem_ty) + "`, got `" +
+                          types_.to_string(got) + "`");
+            }
+        }
+
+        TypeId out = types_.array(elem_ty, a);
+        array_lens_[a] = n;
+        types_.set_array_len_value(a, n);
+        return {.type = out};
+    }
+
+    ExprResult check_array_repeat(ModuleId mid, const ExprArrayRepeat* a,
+                                  Env& env, std::optional<TypeId> expected) {
+        TypeId usize_ty = types_.int_(IntKind::Usize);
+        (void)check_expr(mid, a->count, env, usize_ty);
+
+        std::optional<std::uint64_t> n{};
+        if (comptime_eval_ && !session_.has_errors()) {
+            if (auto v = comptime_eval_->eval_usize(mid, a->count)) {
+                n = *v;
+                array_lens_[a->count] = *v;
+                types_.set_array_len_value(a->count, *v);
+            }
+        }
+
+        std::optional<TypeId> expected_elem{};
+        if (expected && types_.get(*expected).kind == TypeKind::Array)
+            expected_elem = types_.get(*expected).elem;
+
+        TypeId elem_ty = check_expr(mid, a->elem, env, expected_elem).type;
+        if (expected_elem && !types_.can_coerce(elem_ty, *expected_elem)) {
+            error(a->elem ? a->elem->span : Span{},
+                  "array repeat element type mismatch: expected `" +
+                      types_.to_string(*expected_elem) + "`, got `" +
+                      types_.to_string(elem_ty) + "`");
+        }
+        if (!types_.is_sized(elem_ty)) {
+            error(a ? a->span : Span{}, "array element type must be sized");
+            return {.type = types_.error()};
+        }
+
+        if (n && *n >= 2 && !types_.is_copy(elem_ty)) {
+            error(a ? a->span : Span{},
+                  "array repeat requires a `Copy` element type when N >= 2");
+        }
+
+        if (expected && types_.get(*expected).kind == TypeKind::Array) {
+            if (n) {
+                if (auto len = array_len_value(mid, *expected)) {
+                    if (*len != *n) {
+                        error(a ? a->span : Span{},
+                              "array repeat count mismatch: expected " +
+                                  std::to_string(*len) + ", got " +
+                                  std::to_string(*n));
+                    }
+                }
+            }
+            return {.type = *expected};
+        }
+
+        TypeId out = types_.array(elem_ty, a->count);
+        return {.type = out};
+    }
+
     Place check_place(ModuleId mid, const Expr* e, Env& env,
                       bool allow_reinit_local = false) {
         if (!e) return {.type = types_.error()};
@@ -1671,6 +1855,13 @@ class Checker {
                         base.root_local.clear();
                         base.writable = (bd.mutability == Mutability::Mut);
                         return {.type = pd.elem,
+                                .writable = base.writable,
+                                .root_local = base.root_local};
+                    }
+                    if (types_.is_sized(bd.pointee)) {
+                        base.root_local.clear();
+                        base.writable = (bd.mutability == Mutability::Mut);
+                        return {.type = bd.pointee,
                                 .writable = base.writable,
                                 .root_local = base.root_local};
                     }
@@ -1781,15 +1972,16 @@ class Checker {
         }
 
         // Allow indexing into rvalues when the base is an array value or a
-        // pointer-to-slice.
+        // pointer value (including slice pointers).
         TypeId base_ty = check_expr(mid, ix->base, env, std::nullopt).type;
         const TypeData& bd = types_.get(base_ty);
         if (bd.kind == TypeKind::Array) return {.type = bd.elem};
         if (bd.kind == TypeKind::Ptr) {
             const TypeData& pd = types_.get(bd.pointee);
             if (pd.kind == TypeKind::Slice) return {.type = pd.elem};
+            if (types_.is_sized(bd.pointee)) return {.type = bd.pointee};
         }
-        error(ix->span, "indexing requires an array or slice pointer");
+        error(ix->span, "indexing requires an array, slice pointer, or pointer");
         return {.type = types_.error()};
     }
 
@@ -1817,8 +2009,9 @@ class Checker {
         switch (u->op) {
             case UnaryOp::Neg: {
                 TypeId t = check_expr(mid, u->expr, env, expected).type;
-                if (types_.get(t).kind != TypeKind::Int)
-                    error(u->span, "unary `-` requires an integer");
+                const TypeData& td = types_.get(t);
+                if (td.kind != TypeKind::Int && td.kind != TypeKind::Float)
+                    error(u->span, "unary `-` requires an integer or float");
                 return {.type = t};
             }
             case UnaryOp::Not: {
@@ -1826,6 +2019,12 @@ class Checker {
                 if (!types_.equal(t, types_.bool_()))
                     error(u->span, "unary `!` requires bool");
                 return {.type = types_.bool_()};
+            }
+            case UnaryOp::BitNot: {
+                TypeId t = check_expr(mid, u->expr, env, expected).type;
+                if (types_.get(t).kind != TypeKind::Int)
+                    error(u->span, "unary `~` requires an integer");
+                return {.type = t};
             }
             case UnaryOp::Deref: {
                 TypeId t = check_expr(mid, u->expr, env, std::nullopt).type;
@@ -1862,14 +2061,38 @@ class Checker {
             case BinaryOp::Add:
             case BinaryOp::Sub:
             case BinaryOp::Mul:
-            case BinaryOp::Div:
+            case BinaryOp::Div: {
+                TypeId lhs = check_expr(mid, b->lhs, env, expected).type;
+                TypeId rhs = check_expr(mid, b->rhs, env, lhs).type;
+                const TypeData& ld = types_.get(lhs);
+                if ((ld.kind != TypeKind::Int && ld.kind != TypeKind::Float) ||
+                    !types_.can_coerce(rhs, lhs)) {
+                    error(b->span,
+                          "binary arithmetic requires matching numeric types");
+                }
+                return {.type = lhs};
+            }
             case BinaryOp::Mod: {
                 TypeId lhs = check_expr(mid, b->lhs, env, expected).type;
                 TypeId rhs = check_expr(mid, b->rhs, env, lhs).type;
                 if (types_.get(lhs).kind != TypeKind::Int ||
                     !types_.can_coerce(rhs, lhs)) {
                     error(b->span,
-                          "binary arithmetic requires matching integer types");
+                          "binary `%` requires matching integer types");
+                }
+                return {.type = lhs};
+            }
+            case BinaryOp::BitAnd:
+            case BinaryOp::BitOr:
+            case BinaryOp::BitXor:
+            case BinaryOp::Shl:
+            case BinaryOp::Shr: {
+                TypeId lhs = check_expr(mid, b->lhs, env, expected).type;
+                TypeId rhs = check_expr(mid, b->rhs, env, lhs).type;
+                if (types_.get(lhs).kind != TypeKind::Int ||
+                    !types_.can_coerce(rhs, lhs)) {
+                    error(b->span,
+                          "bitwise operators require matching integer types");
                 }
                 return {.type = lhs};
             }
@@ -1881,9 +2104,25 @@ class Checker {
             case BinaryOp::Ge: {
                 TypeId lhs = check_expr(mid, b->lhs, env, std::nullopt).type;
                 TypeId rhs = check_expr(mid, b->rhs, env, lhs).type;
-                if (!types_.can_coerce(rhs, lhs))
+                if (!types_.can_coerce(rhs, lhs)) {
                     error(b->span,
                           "comparison operands must have matching types");
+                } else {
+                    const TypeData& ld = types_.get(lhs);
+                    bool ok = false;
+                    if (b->op == BinaryOp::Eq || b->op == BinaryOp::Ne) {
+                        ok = (ld.kind == TypeKind::Int ||
+                              ld.kind == TypeKind::Float ||
+                              ld.kind == TypeKind::Bool ||
+                              ld.kind == TypeKind::Ptr);
+                    } else {
+                        ok = (ld.kind == TypeKind::Int ||
+                              ld.kind == TypeKind::Float ||
+                              ld.kind == TypeKind::Bool);
+                    }
+                    if (!ok)
+                        error(b->span, "unsupported operand type in comparison");
+                }
                 return {.type = types_.bool_()};
             }
             case BinaryOp::And:
@@ -1901,14 +2140,31 @@ class Checker {
     }
 
     ExprResult check_cast_expr(ModuleId mid, const ExprCast* c, Env& env) {
-        TypeId src = check_expr(mid, c->value, env, std::nullopt).type;
         TypeId dst = lower_type(mid, c->to, false, std::nullopt, false);
+
+        std::optional<TypeId> expected_src = std::nullopt;
+        const TypeData& dd_pre = types_.get(dst);
+        if (c->value && c->value->kind == AstNodeKind::ExprInt &&
+            dd_pre.kind == TypeKind::Int) {
+            expected_src = dst;
+        } else if (c->value && c->value->kind == AstNodeKind::ExprFloat &&
+                   dd_pre.kind == TypeKind::Float) {
+            expected_src = dst;
+        } else if (c->value && c->value->kind == AstNodeKind::ExprInt &&
+                   dd_pre.kind == TypeKind::Ptr) {
+            expected_src = types_.int_(IntKind::Usize);
+        }
+
+        TypeId src = check_expr(mid, c->value, env, expected_src).type;
 
         const TypeData& sd = types_.get(src);
         const TypeData& dd = types_.get(dst);
 
         bool ok = false;
         if (sd.kind == TypeKind::Int && dd.kind == TypeKind::Int) ok = true;
+        if (sd.kind == TypeKind::Float && dd.kind == TypeKind::Float) ok = true;
+        if (sd.kind == TypeKind::Int && dd.kind == TypeKind::Float) ok = true;
+        if (sd.kind == TypeKind::Float && dd.kind == TypeKind::Int) ok = true;
         if (sd.kind == TypeKind::Int && dd.kind == TypeKind::Ptr) ok = true;
         if (sd.kind == TypeKind::Ptr && dd.kind == TypeKind::Int) ok = true;
         if (sd.kind == TypeKind::Ptr && dd.kind == TypeKind::Ptr) ok = true;
@@ -1918,19 +2174,6 @@ class Checker {
             error(c->span, "invalid cast from `" + types_.to_string(src) +
                                "` to `" + types_.to_string(dst) + "`");
             return {.type = types_.error()};
-        }
-
-        // For now, enforce fit checks only when the source is an integer
-        // literal.
-        if (sd.kind == TypeKind::Int && dd.kind == TypeKind::Int) {
-            if (c->value && c->value->kind == AstNodeKind::ExprInt) {
-                auto* lit = static_cast<const ExprInt*>(c->value);
-                if (!fits_in_int_kind_value(lit->value, dd.int_kind,
-                                            target_layout_.pointer_bits)) {
-                    error(c->span, "integer literal does not fit in `" +
-                                       types_.to_string(dst) + "`");
-                }
-            }
         }
 
         return {.type = dst};
@@ -2227,6 +2470,7 @@ class Checker {
                 switch (gd.kind) {
                     case TypeKind::Bool:
                     case TypeKind::Int:
+                    case TypeKind::Float:
                         ok = true;
                         break;
                     case TypeKind::Ptr: {

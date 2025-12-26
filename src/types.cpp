@@ -54,6 +54,14 @@ TypeId TypeStore::int_(IntKind k) {
     return id;
 }
 
+TypeId TypeStore::float_(FloatKind k) {
+    if (auto it = cached_floats_.find(k); it != cached_floats_.end())
+        return it->second;
+    TypeId id = make(TypeData{.kind = TypeKind::Float, .float_kind = k});
+    cached_floats_.insert({k, id});
+    return id;
+}
+
 TypeId TypeStore::ptr(Mutability mut, TypeId pointee) {
     return make(
         TypeData{.kind = TypeKind::Ptr, .mutability = mut, .pointee = pointee});
@@ -65,7 +73,10 @@ TypeId TypeStore::slice(TypeId elem) {
 
 TypeId TypeStore::array(TypeId elem, const Expr* len_expr) {
     return make(TypeData{
-        .kind = TypeKind::Array, .elem = elem, .array_len_expr = len_expr});
+        .kind = TypeKind::Array,
+        .elem = elem,
+        .array_len_expr = len_expr,
+        .array_len_value = std::nullopt});
 }
 
 TypeId TypeStore::tuple(std::vector<TypeId> elems) {
@@ -122,14 +133,18 @@ bool TypeStore::equal(TypeId a, TypeId b) const {
             return true;
         case TypeKind::Int:
             return ta.int_kind == tb.int_kind;
+        case TypeKind::Float:
+            return ta.float_kind == tb.float_kind;
         case TypeKind::Ptr:
             return ta.mutability == tb.mutability &&
                    equal(ta.pointee, tb.pointee);
         case TypeKind::Slice:
             return equal(ta.elem, tb.elem);
         case TypeKind::Array:
-            return equal(ta.elem, tb.elem) &&
-                   ta.array_len_expr == tb.array_len_expr;
+            if (!equal(ta.elem, tb.elem)) return false;
+            if (ta.array_len_value && tb.array_len_value)
+                return *ta.array_len_value == *tb.array_len_value;
+            return ta.array_len_expr == tb.array_len_expr;
         case TypeKind::Tuple:
             return vec_equal(*this, ta.tuple_elems, tb.tuple_elems);
         case TypeKind::Fn:
@@ -152,6 +167,22 @@ bool TypeStore::can_coerce(TypeId from, TypeId to) const {
         f.mutability == Mutability::Mut && t.mutability == Mutability::Const) {
         return equal(f.pointee, t.pointee);
     }
+
+    // Array-to-slice pointer coercion:
+    // - const* [T; N] -> const* [T]
+    // - mut*   [T; N] -> mut*   [T]
+    // - mut*   [T; N] -> const* [T]
+    if (f.kind == TypeKind::Ptr && t.kind == TypeKind::Ptr) {
+        const TypeData& fp = get(f.pointee);
+        const TypeData& tp = get(t.pointee);
+        if (fp.kind == TypeKind::Array && tp.kind == TypeKind::Slice) {
+            if (!equal(fp.elem, tp.elem)) return false;
+            if (f.mutability == t.mutability) return true;
+            if (f.mutability == Mutability::Mut &&
+                t.mutability == Mutability::Const)
+                return true;
+        }
+    }
     return false;
 }
 
@@ -162,6 +193,7 @@ bool TypeStore::is_sized(TypeId t) const {
         case TypeKind::Unit:
         case TypeKind::Bool:
         case TypeKind::Int:
+        case TypeKind::Float:
         case TypeKind::Never:
         case TypeKind::TypeType:
         case TypeKind::Ptr:
@@ -186,6 +218,7 @@ bool TypeStore::is_copy(TypeId t) const {
         case TypeKind::Unit:
         case TypeKind::Bool:
         case TypeKind::Int:
+        case TypeKind::Float:
         case TypeKind::Never:
         case TypeKind::TypeType:
         case TypeKind::Ptr:
@@ -239,6 +272,16 @@ static std::string_view int_name(IntKind k) {
     return "i32";
 }
 
+static std::string_view float_name(FloatKind k) {
+    switch (k) {
+        case FloatKind::F32:
+            return "f32";
+        case FloatKind::F64:
+            return "f64";
+    }
+    return "f64";
+}
+
 std::string TypeStore::to_string(TypeId t) const {
     const TypeData& d = get(t);
     switch (d.kind) {
@@ -250,6 +293,8 @@ std::string TypeStore::to_string(TypeId t) const {
             return "bool";
         case TypeKind::Int:
             return std::string(int_name(d.int_kind));
+        case TypeKind::Float:
+            return std::string(float_name(d.float_kind));
         case TypeKind::Never:
             return "!";
         case TypeKind::TypeType:
@@ -269,7 +314,13 @@ std::string TypeStore::to_string(TypeId t) const {
         }
         case TypeKind::Array: {
             std::ostringstream out;
-            out << "[" << to_string(d.elem) << "; _]";
+            out << "[" << to_string(d.elem) << "; ";
+            if (d.array_len_value) {
+                out << *d.array_len_value;
+            } else {
+                out << "_";
+            }
+            out << "]";
             return out.str();
         }
         case TypeKind::Tuple: {
@@ -317,6 +368,21 @@ std::optional<IntKind> TypeStore::parse_int_kind(std::string_view name) const {
     if (name == "u128") return IntKind::U128;
     if (name == "usize") return IntKind::Usize;
     return std::nullopt;
+}
+
+std::optional<FloatKind> TypeStore::parse_float_kind(
+    std::string_view name) const {
+    if (name == "f32") return FloatKind::F32;
+    if (name == "f64") return FloatKind::F64;
+    return std::nullopt;
+}
+
+void TypeStore::set_array_len_value(const Expr* expr, std::uint64_t len) {
+    for (TypeData& t : types_) {
+        if (t.kind != TypeKind::Array) continue;
+        if (t.array_len_expr != expr) continue;
+        t.array_len_value = len;
+    }
 }
 
 }  // namespace cog

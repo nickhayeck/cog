@@ -22,7 +22,9 @@ struct ComptimeValue {
         Unit,
         Bool,
         Int,
+        Float,
         Ptr,
+        Array,
         Tuple,
         Struct,
         Enum,
@@ -33,9 +35,13 @@ struct ComptimeValue {
 
     bool bool_value = false;
     std::int64_t int_value = 0;
+    double float_value = 0.0;
     std::uint64_t ptr_value = 0;
 
     std::string string_value{};
+
+    // Array
+    std::vector<ComptimeValue> array_elems{};
 
     // Tuple
     std::vector<ComptimeValue> tuple_elems{};
@@ -57,8 +63,17 @@ struct ComptimeValue {
     static ComptimeValue int_(std::int64_t i) {
         return ComptimeValue{.kind = Kind::Int, .int_value = i};
     }
+    static ComptimeValue float_(double f) {
+        return ComptimeValue{.kind = Kind::Float, .float_value = f};
+    }
     static ComptimeValue ptr_(std::uint64_t p) {
         return ComptimeValue{.kind = Kind::Ptr, .ptr_value = p};
+    }
+    static ComptimeValue array(std::vector<ComptimeValue> elems) {
+        ComptimeValue v{};
+        v.kind = Kind::Array;
+        v.array_elems = std::move(elems);
+        return v;
     }
     static ComptimeValue string(std::string s) {
         ComptimeValue v{};

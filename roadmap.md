@@ -1,6 +1,6 @@
 # Cog compiler roadmap
 
-Status: **v0.0.18-main is implemented** (comptime calls/params + core typing additions + executable entrypoint handling). The v0.1 core language spec lives in `spec/README.md`.
+Status: **v0.0.19-main is implemented** (everyday literals/operators + indexing + float/bitwise surface). The v0.1 core language spec lives in `spec/README.md`.
 
 ## Completed
 
@@ -132,8 +132,6 @@ Goal: fill in core type semantics required for v0.1.
   - allow `const* fn(...) -> R` values and calls through them
 - LLVM backend: add tuple expressions + `.0`/`.1` indexing and indirect calls through function pointers.
 
-## Next milestones
-
 ### Mini milestone: v0.0.18-main — bring the main function into specification (done)
 Goal: allow the full range of `main` functions specified by `spec/layout_abi.md`.
 
@@ -143,7 +141,7 @@ Goal: allow the full range of `main` functions specified by `spec/layout_abi.md`
   - otherwise synthesize a C ABI wrapper for Cog ABI `main` (`fn main() -> ()` or `fn main() -> i32`)
 - Emit clear diagnostics when `main` is missing or has an invalid signature.
 
-### v0.0.19 — Core literals + operators + indexing
+### v0.0.19 — Core literals + operators + indexing (done)
 Goal: cover “everyday” expression surface required for v0.1 examples.
 
 - Array literals:
@@ -162,6 +160,12 @@ Goal: cover “everyday” expression surface required for v0.1 examples.
   - codegen for `a[i]` on arrays and slice pointers
   - raw pointer indexing `ptr[i]` (C-like)
   - array-to-slice pointer coercion: `const* [T; N]` → `const* [T]` and `mut* [T; N]` → `mut* [T]`
+- Comptime:
+  - array literal construction + indexing/assignment in comptime evaluation (enables LUT/table generation)
+- Examples:
+  - add `examples/numerics_arrays_floats/` and `examples/crc32_tool/`
+
+## Next milestones
 
 ### v0.0.20 — Type expressions + minimal shipped `core` + `?`
 Goal: unlock `core::Option(T)` / `core::Result(T, E)` and the `?` operator (`spec/stdlib.md`).
@@ -210,52 +214,6 @@ Goal: freeze the v0.1 subset and make it pleasant to use.
 - Polish diagnostics (module paths, “did you mean”, span rendering) enough for day-to-day use.
 
 ## Release target: v0.1.0
-v0.1.0 should be the first “useful” release: you can compile and run small programs, and the surface subset is stable enough to build examples against.
-
-**v0.1.0 exit criteria (must-have)**
-- End-to-end pipeline: `cogc` compiles and links an executable for a stable subset.
-- Docs: a stable core spec under `spec/` + a practical `README.md`.
-- Stable subset support:
-  - modules (`mod` inline/out-of-line) + `use` trees
-  - visibility: private-by-default, `pub`, `pub(crate)`
-  - literals and operators: arrays, ints/floats, bitwise ops, indexing
-  - structs/enums + `match` (at least ints + enums)
-  - functions + calls + methods via `impl`
-  - `fn[extern(C)]` / `fn[export(C)]` + extern-only `...` varargs
-  - `const`/`static` + array lengths with deterministic comptime evaluation
-  - string literals: `"..."` (`const* [u8]`) and `c"..."` (`const* u8`)
-  - function pointers: `const* fn(...) -> R`
-  - `!` type and diverging expressions
-  - `core::Option(T)` / `core::Result(T, E)` + `?`
-- ABI story:
-  - default `repr(cog)` is implemented (layout is implementation-defined)
-  - `struct[repr(C)]` structs for C interop are supported
-  - `enum[tag(IntType)]` (fieldless enums) for C-like enums
-  - pointer/slice representations are specified and implemented
-- Diagnostics and stability:
-  - no crashes on malformed programs; clear span-based errors
-  - basic test coverage (smoke tests + a few negative tests)
-
-**v0.1.0 nice-to-have**
-- Better `match` checking (exhaustiveness + unreachable arms) for small domains.
-- A richer prelude/core surface (more integer ops and helpers).
-
-**Open design questions (non-gating)**
-- C enums: representation + casts (`enum[tag(i32)]` and friends).
-- Unions: do we want them, and how do they interact with `match`/pattern syntax?
-- `repr(cog)` policy boundaries: what is guaranteed vs compiler-defined?
-- Meta-typing + builtins for type-parametric programming (reflection and type construction).
-- Allocation API direction.
-- Variadic arguments beyond extern-only C varargs.
-- Testing story (built-in test runner vs library/framework).
-
-## Planned for v0.2.0 (spec only today)
-- Control-flow sugar: `if let`, `while let`.
-- Range expressions: `a..b`, `a..=b`.
-- Struct literal shorthand: `Point { x, y }`.
-- Enum struct variants: `E::V { x: 1 }` + matching patterns.
-
-## C interop track (ongoing; subject to revision)
-- Define surface syntax for linking control (e.g. link names, calling conventions, libraries).
-- Define `repr(C)` coverage (structs first; fieldless enums via `tag(<int>)`).
-- Add symbol/link control tags (e.g. `link_name(...)`, `link_lib(...)`).
+This should be the first “useful” release conforming to the `spec/`. In addition, we expect the compiler to mature into having:
+    - no crashes on malformed programs; clear span-based errors
+    - reasonable test coverage

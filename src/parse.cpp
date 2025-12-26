@@ -54,6 +54,8 @@ static const char* token_name(int tok) {
             return "CSTRING";
         case INT:
             return "INT";
+        case FLOAT:
+            return "FLOAT";
 
         case KW_FN:
             return "fn";
@@ -128,6 +130,10 @@ static const char* token_name(int tok) {
             return "&&";
         case TOK_OROR:
             return "||";
+        case TOK_SHL:
+            return "<<";
+        case TOK_SHR:
+            return ">>";
     }
     return nullptr;
 }
@@ -212,6 +218,9 @@ void dump_tokens(FileId file_id, const char* path, std::ostream& os) {
             }
             case INT:
                 os << " " << yylval.int_val;
+                break;
+            case FLOAT:
+                os << " " << yylval.float_val;
                 break;
             default:
                 break;

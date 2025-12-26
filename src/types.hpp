@@ -30,11 +30,17 @@ enum class IntKind : std::uint8_t {
     Usize,
 };
 
+enum class FloatKind : std::uint8_t {
+    F32,
+    F64,
+};
+
 enum class TypeKind : std::uint8_t {
     Error,
     Unit,
     Bool,
     Int,
+    Float,
     Never,
     TypeType,
     Ptr,
@@ -53,6 +59,9 @@ struct TypeData {
     // Int
     IntKind int_kind{};
 
+    // Float
+    FloatKind float_kind{};
+
     // Ptr
     Mutability mutability{};
     TypeId pointee = 0;
@@ -60,6 +69,7 @@ struct TypeData {
     // Slice/Array
     TypeId elem = 0;
     const Expr* array_len_expr = nullptr;
+    std::optional<std::uint64_t> array_len_value{};
 
     // Tuple
     std::vector<TypeId> tuple_elems{};
@@ -85,6 +95,7 @@ class TypeStore {
     TypeId self();
 
     TypeId int_(IntKind k);
+    TypeId float_(FloatKind k);
     TypeId ptr(Mutability mut, TypeId pointee);
     TypeId slice(TypeId elem);
     TypeId array(TypeId elem, const Expr* len_expr);
@@ -104,6 +115,9 @@ class TypeStore {
     std::string to_string(TypeId t) const;
 
     std::optional<IntKind> parse_int_kind(std::string_view name) const;
+    std::optional<FloatKind> parse_float_kind(std::string_view name) const;
+
+    void set_array_len_value(const Expr* expr, std::uint64_t len);
 
    private:
     std::vector<TypeData> types_{};
@@ -116,6 +130,7 @@ class TypeStore {
     std::optional<TypeId> cached_self_{};
 
     std::unordered_map<IntKind, TypeId> cached_ints_{};
+    std::unordered_map<FloatKind, TypeId> cached_floats_{};
     std::unordered_map<const ItemStruct*, TypeId> cached_structs_{};
     std::unordered_map<const ItemEnum*, TypeId> cached_enums_{};
 

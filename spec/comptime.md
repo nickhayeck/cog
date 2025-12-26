@@ -91,7 +91,7 @@ Cog comptime evaluation has access to a conceptual “comptime heap” for build
 
 When a comptime value is embedded into runtime code (e.g. a `const`, a `static`, an array length, or a residual constant), it must be **serializable**:
 
-Serializable values (v0.1):
+Serializable values:
 - integers, floats, bool
 - enums/structs/tuples/arrays whose components are serializable
 - pointers *only* when they point to:
@@ -117,7 +117,7 @@ Early v0.1 implementations may restrict this (e.g. only allow a small interprete
 
 `type` is comptime-only. A value of type `type` represents a runtime type.
 
-### Constructing types at comptime (hard option)
+### Constructing types at comptime
 
 Cog intends to support constructing arbitrary types at comptime via builtins.
 
@@ -132,20 +132,6 @@ fn Option(comptime T: type) -> type {
 ```
 
 The exact builtin surface for type construction is unstable in v0.1. A v0.1 implementation may provide a minimal subset and expand it over time.
-
-### Planned sugar: local type declarations
-
-Planned (not required for early v0.1):
-
-```cog
-pub fn Vec(comptime T: type) -> type {
-    struct Vec_ { ptr: mut* T, len: usize, cap: usize }
-    impl Vec_ { fn push(self: mut* Self, x: T) -> () { ... } }
-    return Vec_;
-}
-```
-
-This is intended to desugar to type-construction builtins, not to introduce a second “template system”.
 
 ## Reflection
 

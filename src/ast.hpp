@@ -16,7 +16,14 @@ namespace cog {
 enum class Visibility : std::uint8_t { Private, Pub, PubCrate };
 enum class Mutability : std::uint8_t { Const, Mut };
 
-enum class UnaryOp : std::uint8_t { Neg, Not, Deref, AddrOf, AddrOfMut };
+enum class UnaryOp : std::uint8_t {
+    Neg,
+    Not,
+    BitNot,
+    Deref,
+    AddrOf,
+    AddrOfMut,
+};
 enum class BinaryOp : std::uint8_t {
     Add,
     Sub,
@@ -29,8 +36,13 @@ enum class BinaryOp : std::uint8_t {
     Le,
     Gt,
     Ge,
-    And,
-    Or,
+    And,  // &&
+    Or,   // ||
+    BitAnd,
+    BitOr,
+    BitXor,
+    Shl,
+    Shr,
 };
 
 enum class AstNodeKind : std::uint16_t {
@@ -96,6 +108,7 @@ enum class AstNodeKind : std::uint16_t {
     FieldInit,
 
     ExprInt,
+    ExprFloat,
     ExprBool,
     ExprString,
     ExprUnit,
@@ -116,6 +129,8 @@ enum class AstNodeKind : std::uint16_t {
     ExprAssign,
     ExprStructLit,
     ExprTuple,
+    ExprArrayLit,
+    ExprArrayRepeat,
 };
 
 struct AstNode {
@@ -354,6 +369,12 @@ struct ExprInt final : Expr {
         : Expr(AstNodeKind::ExprInt, span), value(value) {}
 };
 
+struct ExprFloat final : Expr {
+    double value = 0.0;
+    explicit ExprFloat(Span span, double value)
+        : Expr(AstNodeKind::ExprFloat, span), value(value) {}
+};
+
 struct ExprBool final : Expr {
     bool value = false;
     explicit ExprBool(Span span, bool value)
@@ -504,6 +525,19 @@ struct ExprTuple final : Expr {
     std::vector<Expr*> elems{};
     explicit ExprTuple(Span span, std::vector<Expr*> elems)
         : Expr(AstNodeKind::ExprTuple, span), elems(std::move(elems)) {}
+};
+
+struct ExprArrayLit final : Expr {
+    std::vector<Expr*> elems{};
+    explicit ExprArrayLit(Span span, std::vector<Expr*> elems)
+        : Expr(AstNodeKind::ExprArrayLit, span), elems(std::move(elems)) {}
+};
+
+struct ExprArrayRepeat final : Expr {
+    Expr* elem = nullptr;
+    Expr* count = nullptr;
+    explicit ExprArrayRepeat(Span span, Expr* elem, Expr* count)
+        : Expr(AstNodeKind::ExprArrayRepeat, span), elem(elem), count(count) {}
 };
 
 // ---- Statements ----

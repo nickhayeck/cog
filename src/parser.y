@@ -49,6 +49,7 @@ static std::vector<T*> take_vec(std::vector<T*>* v) {
 
 %union {
   long long int_val;
+  double float_val;
   char* cstr;
   std::string* str_lit;
   cog::Visibility vis;
@@ -98,13 +99,14 @@ static std::vector<T*> take_vec(std::vector<T*>* v) {
 %token <str_lit> STRING
 %token <str_lit> CSTRING
 %token <int_val> INT
+%token <float_val> FLOAT
 
 %token KW_FN KW_STRUCT KW_ENUM KW_IMPL KW_TYPE KW_CONST KW_STATIC
 %token KW_MOD KW_USE KW_PUB KW_AS KW_LET KW_MUT KW_IF KW_ELSE KW_WHILE
 %token KW_LOOP KW_MATCH KW_RETURN KW_BREAK KW_CONTINUE KW_COMPTIME KW_SELF_TYPE KW_CRATE
 %token KW_TRUE KW_FALSE
 
-%token TOK_COLONCOLON TOK_COLONCOLON_LBRACE TOK_ARROW TOK_FATARROW TOK_EQEQ TOK_NEQ TOK_LE TOK_GE TOK_ANDAND TOK_OROR TOK_ELLIPSIS
+%token TOK_COLONCOLON TOK_COLONCOLON_LBRACE TOK_ARROW TOK_FATARROW TOK_EQEQ TOK_NEQ TOK_LE TOK_GE TOK_ANDAND TOK_OROR TOK_SHL TOK_SHR TOK_ELLIPSIS
 
 %type <file> program
 %type <items> items
@@ -141,7 +143,7 @@ static std::vector<T*> take_vec(std::vector<T*>* v) {
 %type <stmt> stmt let_stmt
 
 %type <expr> expr expr_nostruct expr_or_block guard_opt else_opt init_opt
-%type <expr> assign_expr logical_or_expr logical_and_expr equality_expr relational_expr additive_expr multiplicative_expr
+%type <expr> assign_expr logical_or_expr logical_and_expr equality_expr relational_expr bit_or_expr bit_xor_expr bit_and_expr shift_expr additive_expr multiplicative_expr
 %type <expr> cast_expr unary_expr postfix_expr primary_expr
 %type <type> type_ann_opt
 %type <exprs> args_opt args
@@ -166,6 +168,10 @@ static std::vector<T*> take_vec(std::vector<T*>* v) {
 %left TOK_ANDAND
 %left TOK_EQEQ TOK_NEQ
 %left '<' '>' TOK_LE TOK_GE
+%left '|'
+%left '^'
+%left '&'
+%left TOK_SHL TOK_SHR
 %left '+' '-'
 %left '*' '/' '%'
 %left KW_AS
@@ -604,10 +610,31 @@ equality_expr
   ;
 
 relational_expr
-  : relational_expr '<' additive_expr { $$ = MK(cog::ExprBinary, @$, cog::BinaryOp::Lt, $1, $3); }
-  | relational_expr '>' additive_expr { $$ = MK(cog::ExprBinary, @$, cog::BinaryOp::Gt, $1, $3); }
-  | relational_expr TOK_LE additive_expr { $$ = MK(cog::ExprBinary, @$, cog::BinaryOp::Le, $1, $3); }
-  | relational_expr TOK_GE additive_expr { $$ = MK(cog::ExprBinary, @$, cog::BinaryOp::Ge, $1, $3); }
+  : relational_expr '<' bit_or_expr { $$ = MK(cog::ExprBinary, @$, cog::BinaryOp::Lt, $1, $3); }
+  | relational_expr '>' bit_or_expr { $$ = MK(cog::ExprBinary, @$, cog::BinaryOp::Gt, $1, $3); }
+  | relational_expr TOK_LE bit_or_expr { $$ = MK(cog::ExprBinary, @$, cog::BinaryOp::Le, $1, $3); }
+  | relational_expr TOK_GE bit_or_expr { $$ = MK(cog::ExprBinary, @$, cog::BinaryOp::Ge, $1, $3); }
+  | bit_or_expr { $$ = $1; }
+  ;
+
+bit_or_expr
+  : bit_or_expr '|' bit_xor_expr { $$ = MK(cog::ExprBinary, @$, cog::BinaryOp::BitOr, $1, $3); }
+  | bit_xor_expr { $$ = $1; }
+  ;
+
+bit_xor_expr
+  : bit_xor_expr '^' bit_and_expr { $$ = MK(cog::ExprBinary, @$, cog::BinaryOp::BitXor, $1, $3); }
+  | bit_and_expr { $$ = $1; }
+  ;
+
+bit_and_expr
+  : bit_and_expr '&' shift_expr { $$ = MK(cog::ExprBinary, @$, cog::BinaryOp::BitAnd, $1, $3); }
+  | shift_expr { $$ = $1; }
+  ;
+
+shift_expr
+  : shift_expr TOK_SHL additive_expr { $$ = MK(cog::ExprBinary, @$, cog::BinaryOp::Shl, $1, $3); }
+  | shift_expr TOK_SHR additive_expr { $$ = MK(cog::ExprBinary, @$, cog::BinaryOp::Shr, $1, $3); }
   | additive_expr { $$ = $1; }
   ;
 
@@ -633,6 +660,7 @@ unary_expr
   : '-' unary_expr { $$ = MK(cog::ExprUnary, @$, cog::UnaryOp::Neg, $2); }
   | '*' unary_expr { $$ = MK(cog::ExprUnary, @$, cog::UnaryOp::Deref, $2); }
   | '!' unary_expr { $$ = MK(cog::ExprUnary, @$, cog::UnaryOp::Not, $2); }
+  | '~' unary_expr { $$ = MK(cog::ExprUnary, @$, cog::UnaryOp::BitNot, $2); }
   | '&' unary_expr { $$ = MK(cog::ExprUnary, @$, cog::UnaryOp::AddrOf, $2); }
   | '&' KW_MUT unary_expr { $$ = MK(cog::ExprUnary, @$, cog::UnaryOp::AddrOfMut, $3); }
   | postfix_expr { $$ = $1; }
@@ -649,10 +677,13 @@ postfix_expr
 
 primary_expr
   : INT { $$ = MK(cog::ExprInt, @$, static_cast<std::int64_t>($1)); }
+  | FLOAT { $$ = MK(cog::ExprFloat, @$, $1); }
   | STRING { $$ = MK(cog::ExprString, @$, cog::take_string($1), /*is_c_string=*/false); }
   | CSTRING { $$ = MK(cog::ExprString, @$, cog::take_string($1), /*is_c_string=*/true); }
   | KW_TRUE { $$ = MK(cog::ExprBool, @$, true); }
   | KW_FALSE { $$ = MK(cog::ExprBool, @$, false); }
+  | '[' args_opt ']' { $$ = MK(cog::ExprArrayLit, @$, take_vec($2)); }
+  | '[' expr ';' expr ']' { $$ = MK(cog::ExprArrayRepeat, @$, $2, $4); }
   | '(' ')' { $$ = MK(cog::ExprUnit, @$); }
   | '(' expr ')' { $$ = $2; }
   | '(' expr ',' args_opt ')' {

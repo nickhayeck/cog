@@ -1,6 +1,6 @@
-# Cog v0.0.18 prototype grammar (draft)
+# Cog v0.0.19 prototype grammar (draft)
 
-This is an **approximate** EBNF aligned with the v0.0.18 prototype parser (`src/parser.y` + `src/lexer.l`). It describes the subset that currently parses; it is not intended to be a complete Rust grammar.
+This is an **approximate** EBNF aligned with the v0.0.19 prototype parser (`src/parser.y` + `src/lexer.l`). It describes the subset that currently parses; it is not intended to be a complete Rust grammar.
 
 Core language grammar (v0.1 draft) lives in `spec/syntax.md`. The prototype grammar is intended to be close to `spec/`, but remains incomplete and may accept or reject programs differently in edge cases.
 
@@ -14,7 +14,8 @@ Notes:
 
 ## Lexical notes
 - Identifiers: `[A-Za-z_][A-Za-z0-9_]*`
-- Integers: `[0-9]+` (decimal only)
+- Integers: decimal/hex/octal/binary with `_` separators (e.g. `123`, `1_000`, `0xff`, `0o755`, `0b1010_0001`)
+- Floats: Rust-like float literals with optional exponent (e.g. `1.0`, `1_000.5`, `2e3`, `2.5e-2`)
 - Strings: `"..."` and `c"..."` (v0.0.x supports basic escapes: `\\n`, `\\r`, `\\t`, `\\0`, `\\\"`, `\\\\`)
 - Comments: `// ...` and `/* ... */`
 
@@ -130,8 +131,20 @@ logical_and_expr := logical_and_expr "&&" equality_expr
 equality_expr := equality_expr ("==" | "!=") relational_expr
               | relational_expr
 
-relational_expr := relational_expr ("<" | "<=" | ">" | ">=") additive_expr
-                | additive_expr
+relational_expr := relational_expr ("<" | "<=" | ">" | ">=") bit_or_expr
+                | bit_or_expr
+
+bit_or_expr   := bit_or_expr "|" bit_xor_expr
+              | bit_xor_expr
+
+bit_xor_expr  := bit_xor_expr "^" bit_and_expr
+              | bit_and_expr
+
+bit_and_expr  := bit_and_expr "&" shift_expr
+              | shift_expr
+
+shift_expr    := shift_expr ("<<" | ">>") additive_expr
+              | additive_expr
 
 additive_expr := additive_expr ("+" | "-") multiplicative_expr
               | multiplicative_expr
@@ -142,7 +155,7 @@ multiplicative_expr := multiplicative_expr ("*" | "/" | "%") cast_expr
 cast_expr     := cast_expr "as" type
               | unary_expr
 
-unary_expr    := ("-" | "!" | "*" | "&") unary_expr
+unary_expr    := ("-" | "!" | "~" | "*" | "&") unary_expr
               | "&" "mut" unary_expr
               | postfix_expr
 
@@ -159,9 +172,12 @@ args          := expr ("," expr)* ","?
 Primary expressions:
 ```
 primary_expr  := INT | STRING | "true" | "false"
+              | FLOAT
               | "(" ")"                         // unit
               | "(" expr ")"                    // parens
               | "(" expr "," args? ")"          // tuple expr (trailing comma allowed)
+              | "[" args? "]"                   // array literal
+              | "[" expr ";" expr "]"           // repeat array literal
               | path
               | path "{" field_inits? "}"       // struct literal
               | block

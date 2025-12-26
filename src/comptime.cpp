@@ -130,6 +130,7 @@ TypeId ComptimeEvaluator::lower_type_path(ModuleId mid, const Path* path,
         std::string_view name = path->segments[0]->text;
         if (name == "bool") return types_->bool_();
         if (auto ik = types_->parse_int_kind(name)) return types_->int_(*ik);
+        if (auto fk = types_->parse_float_kind(name)) return types_->float_(*fk);
     }
     const Item* item = resolve_type_item(mid, path);
     if (!item) {
@@ -410,6 +411,10 @@ std::optional<ComptimeEvaluator::Flow> ComptimeEvaluator::eval_expr_inner(
             return Flow{.control = Control::None,
                         .value = ComptimeValue::int_(
                             static_cast<const ExprInt*>(expr)->value)};
+        case AstNodeKind::ExprFloat:
+            return Flow{.control = Control::None,
+                        .value = ComptimeValue::float_(
+                            static_cast<const ExprFloat*>(expr)->value)};
         case AstNodeKind::ExprString: {
             auto* s = static_cast<const ExprString*>(expr);
             // Coarse comptime heap accounting: charge by byte length (plus a
@@ -476,6 +481,51 @@ std::optional<ComptimeEvaluator::Flow> ComptimeEvaluator::eval_expr_inner(
                 out.tuple_elems.push_back(std::move(ev->value));
             }
             return Flow{.control = Control::None, .value = std::move(out)};
+        }
+
+        case AstNodeKind::ExprArrayLit: {
+            auto* a = static_cast<const ExprArrayLit*>(expr);
+            if (!consume_heap(
+                    expr->span,
+                    /*units=*/8 + static_cast<std::uint64_t>(a->elems.size())))
+                return std::nullopt;
+            std::vector<ComptimeValue> elems{};
+            elems.reserve(a->elems.size());
+            for (const Expr* e : a->elems) {
+                auto ev = eval_expr_inner(mid, e, env, loop_depth);
+                if (!ev || ev->control != Control::None) return std::nullopt;
+                elems.push_back(std::move(ev->value));
+            }
+            return Flow{.control = Control::None,
+                        .value = ComptimeValue::array(std::move(elems))};
+        }
+
+        case AstNodeKind::ExprArrayRepeat: {
+            auto* a = static_cast<const ExprArrayRepeat*>(expr);
+            auto count_v = eval_expr_inner(mid, a->count, env, loop_depth);
+            if (!count_v || count_v->control != Control::None) return std::nullopt;
+            if (count_v->value.kind != ComptimeValue::Kind::Int) {
+                error(expr->span, "array repeat count must be an integer at comptime");
+                return std::nullopt;
+            }
+            if (count_v->value.int_value < 0) {
+                error(expr->span, "array repeat count must be non-negative at comptime");
+                return std::nullopt;
+            }
+            std::uint64_t n =
+                static_cast<std::uint64_t>(count_v->value.int_value);
+
+            auto elem_v = eval_expr_inner(mid, a->elem, env, loop_depth);
+            if (!elem_v || elem_v->control != Control::None) return std::nullopt;
+
+            if (!consume_heap(expr->span, /*units=*/8 + n)) return std::nullopt;
+            std::vector<ComptimeValue> elems{};
+            elems.reserve(static_cast<size_t>(n));
+            for (std::uint64_t i = 0; i < n; i++) {
+                elems.push_back(elem_v->value);
+            }
+            return Flow{.control = Control::None,
+                        .value = ComptimeValue::array(std::move(elems))};
         }
 
         case AstNodeKind::ExprStructLit: {
@@ -659,14 +709,19 @@ std::optional<ComptimeEvaluator::Flow> ComptimeEvaluator::eval_expr_inner(
             if (!v || v->control != Control::None) return std::nullopt;
             switch (u->op) {
                 case UnaryOp::Neg:
-                    if (v->value.kind != ComptimeValue::Kind::Int) {
-                        error(expr->span,
-                              "unary `-` requires integer at comptime");
-                        return std::nullopt;
+                    if (v->value.kind == ComptimeValue::Kind::Int) {
+                        return Flow{
+                            .control = Control::None,
+                            .value = ComptimeValue::int_(-v->value.int_value)};
                     }
-                    return Flow{
-                        .control = Control::None,
-                        .value = ComptimeValue::int_(-v->value.int_value)};
+                    if (v->value.kind == ComptimeValue::Kind::Float) {
+                        return Flow{
+                            .control = Control::None,
+                            .value = ComptimeValue::float_(-v->value.float_value)};
+                    }
+                    error(expr->span,
+                          "unary `-` requires integer or float at comptime");
+                    return std::nullopt;
                 case UnaryOp::Not:
                     if (v->value.kind != ComptimeValue::Kind::Bool) {
                         error(expr->span,
@@ -676,6 +731,18 @@ std::optional<ComptimeEvaluator::Flow> ComptimeEvaluator::eval_expr_inner(
                     return Flow{
                         .control = Control::None,
                         .value = ComptimeValue::bool_(!v->value.bool_value)};
+                case UnaryOp::BitNot: {
+                    if (v->value.kind != ComptimeValue::Kind::Int) {
+                        error(expr->span,
+                              "unary `~` requires integer at comptime");
+                        return std::nullopt;
+                    }
+                    std::uint64_t x =
+                        static_cast<std::uint64_t>(v->value.int_value);
+                    return Flow{.control = Control::None,
+                                .value = ComptimeValue::int_(
+                                    static_cast<std::int64_t>(~x))};
+                }
                 case UnaryOp::Deref:
                     error(
                         expr->span,
@@ -722,62 +789,172 @@ std::optional<ComptimeEvaluator::Flow> ComptimeEvaluator::eval_expr_inner(
             if (lhs->control != Control::None || rhs->control != Control::None)
                 return std::nullopt;
 
-            if (lhs->value.kind != ComptimeValue::Kind::Int ||
-                rhs->value.kind != ComptimeValue::Kind::Int) {
-                error(
-                    expr->span,
-                    "binary operators require integers at comptime (for now)");
-                return std::nullopt;
+            if (lhs->value.kind == ComptimeValue::Kind::Int &&
+                rhs->value.kind == ComptimeValue::Kind::Int) {
+                std::int64_t a = lhs->value.int_value;
+                std::int64_t c = rhs->value.int_value;
+                const std::uint64_t au = static_cast<std::uint64_t>(a);
+                const std::uint64_t cu = static_cast<std::uint64_t>(c);
+
+                auto shift_amount = [&]() -> std::optional<unsigned> {
+                    if (c < 0) return std::nullopt;
+                    if (c >= 64) return std::nullopt;
+                    return static_cast<unsigned>(c);
+                };
+
+                switch (b->op) {
+                    case BinaryOp::Add:
+                        return Flow{.control = Control::None,
+                                    .value = ComptimeValue::int_(a + c)};
+                    case BinaryOp::Sub:
+                        return Flow{.control = Control::None,
+                                    .value = ComptimeValue::int_(a - c)};
+                    case BinaryOp::Mul:
+                        return Flow{.control = Control::None,
+                                    .value = ComptimeValue::int_(a * c)};
+                    case BinaryOp::Div:
+                        if (c == 0) {
+                            error(expr->span, "division by zero at comptime");
+                            return std::nullopt;
+                        }
+                        return Flow{.control = Control::None,
+                                    .value = ComptimeValue::int_(a / c)};
+                    case BinaryOp::Mod:
+                        if (c == 0) {
+                            error(expr->span, "modulo by zero at comptime");
+                            return std::nullopt;
+                        }
+                        return Flow{.control = Control::None,
+                                    .value = ComptimeValue::int_(a % c)};
+                    case BinaryOp::BitAnd:
+                        return Flow{
+                            .control = Control::None,
+                            .value = ComptimeValue::int_(
+                                static_cast<std::int64_t>(au & cu))};
+                    case BinaryOp::BitOr:
+                        return Flow{
+                            .control = Control::None,
+                            .value = ComptimeValue::int_(
+                                static_cast<std::int64_t>(au | cu))};
+                    case BinaryOp::BitXor:
+                        return Flow{
+                            .control = Control::None,
+                            .value = ComptimeValue::int_(
+                                static_cast<std::int64_t>(au ^ cu))};
+                    case BinaryOp::Shl: {
+                        auto sh = shift_amount();
+                        if (!sh) {
+                            error(expr->span, "invalid shift amount at comptime");
+                            return std::nullopt;
+                        }
+                        return Flow{.control = Control::None,
+                                    .value = ComptimeValue::int_(
+                                        static_cast<std::int64_t>(au << *sh))};
+                    }
+                    case BinaryOp::Shr: {
+                        auto sh = shift_amount();
+                        if (!sh) {
+                            error(expr->span, "invalid shift amount at comptime");
+                            return std::nullopt;
+                        }
+                        return Flow{.control = Control::None,
+                                    .value = ComptimeValue::int_(
+                                        static_cast<std::int64_t>(au >> *sh))};
+                    }
+                    case BinaryOp::Eq:
+                        return Flow{.control = Control::None,
+                                    .value = ComptimeValue::bool_(a == c)};
+                    case BinaryOp::Ne:
+                        return Flow{.control = Control::None,
+                                    .value = ComptimeValue::bool_(a != c)};
+                    case BinaryOp::Lt:
+                        return Flow{.control = Control::None,
+                                    .value = ComptimeValue::bool_(a < c)};
+                    case BinaryOp::Le:
+                        return Flow{.control = Control::None,
+                                    .value = ComptimeValue::bool_(a <= c)};
+                    case BinaryOp::Gt:
+                        return Flow{.control = Control::None,
+                                    .value = ComptimeValue::bool_(a > c)};
+                    case BinaryOp::Ge:
+                        return Flow{.control = Control::None,
+                                    .value = ComptimeValue::bool_(a >= c)};
+                    case BinaryOp::And:
+                    case BinaryOp::Or:
+                        break;
+                }
             }
 
-            std::int64_t a = lhs->value.int_value;
-            std::int64_t c = rhs->value.int_value;
-            switch (b->op) {
-                case BinaryOp::Add:
-                    return Flow{.control = Control::None,
-                                .value = ComptimeValue::int_(a + c)};
-                case BinaryOp::Sub:
-                    return Flow{.control = Control::None,
-                                .value = ComptimeValue::int_(a - c)};
-                case BinaryOp::Mul:
-                    return Flow{.control = Control::None,
-                                .value = ComptimeValue::int_(a * c)};
-                case BinaryOp::Div:
-                    if (c == 0) {
-                        error(expr->span, "division by zero at comptime");
-                        return std::nullopt;
-                    }
-                    return Flow{.control = Control::None,
-                                .value = ComptimeValue::int_(a / c)};
-                case BinaryOp::Mod:
-                    if (c == 0) {
-                        error(expr->span, "modulo by zero at comptime");
-                        return std::nullopt;
-                    }
-                    return Flow{.control = Control::None,
-                                .value = ComptimeValue::int_(a % c)};
-                case BinaryOp::Eq:
-                    return Flow{.control = Control::None,
-                                .value = ComptimeValue::bool_(a == c)};
-                case BinaryOp::Ne:
-                    return Flow{.control = Control::None,
-                                .value = ComptimeValue::bool_(a != c)};
-                case BinaryOp::Lt:
-                    return Flow{.control = Control::None,
-                                .value = ComptimeValue::bool_(a < c)};
-                case BinaryOp::Le:
-                    return Flow{.control = Control::None,
-                                .value = ComptimeValue::bool_(a <= c)};
-                case BinaryOp::Gt:
-                    return Flow{.control = Control::None,
-                                .value = ComptimeValue::bool_(a > c)};
-                case BinaryOp::Ge:
-                    return Flow{.control = Control::None,
-                                .value = ComptimeValue::bool_(a >= c)};
-                case BinaryOp::And:
-                case BinaryOp::Or:
-                    break;
+            if (lhs->value.kind == ComptimeValue::Kind::Float &&
+                rhs->value.kind == ComptimeValue::Kind::Float) {
+                double a = lhs->value.float_value;
+                double c = rhs->value.float_value;
+                switch (b->op) {
+                    case BinaryOp::Add:
+                        return Flow{.control = Control::None,
+                                    .value = ComptimeValue::float_(a + c)};
+                    case BinaryOp::Sub:
+                        return Flow{.control = Control::None,
+                                    .value = ComptimeValue::float_(a - c)};
+                    case BinaryOp::Mul:
+                        return Flow{.control = Control::None,
+                                    .value = ComptimeValue::float_(a * c)};
+                    case BinaryOp::Div:
+                        return Flow{.control = Control::None,
+                                    .value = ComptimeValue::float_(a / c)};
+                    case BinaryOp::Eq:
+                        return Flow{.control = Control::None,
+                                    .value = ComptimeValue::bool_(a == c)};
+                    case BinaryOp::Ne:
+                        return Flow{.control = Control::None,
+                                    .value = ComptimeValue::bool_(a != c)};
+                    case BinaryOp::Lt:
+                        return Flow{.control = Control::None,
+                                    .value = ComptimeValue::bool_(a < c)};
+                    case BinaryOp::Le:
+                        return Flow{.control = Control::None,
+                                    .value = ComptimeValue::bool_(a <= c)};
+                    case BinaryOp::Gt:
+                        return Flow{.control = Control::None,
+                                    .value = ComptimeValue::bool_(a > c)};
+                    case BinaryOp::Ge:
+                        return Flow{.control = Control::None,
+                                    .value = ComptimeValue::bool_(a >= c)};
+                    default:
+                        break;
+                }
             }
+
+            if (lhs->value.kind == ComptimeValue::Kind::Bool &&
+                rhs->value.kind == ComptimeValue::Kind::Bool) {
+                bool a = lhs->value.bool_value;
+                bool c = rhs->value.bool_value;
+                switch (b->op) {
+                    case BinaryOp::Eq:
+                        return Flow{.control = Control::None,
+                                    .value = ComptimeValue::bool_(a == c)};
+                    case BinaryOp::Ne:
+                        return Flow{.control = Control::None,
+                                    .value = ComptimeValue::bool_(a != c)};
+                    case BinaryOp::Lt:
+                        return Flow{.control = Control::None,
+                                    .value = ComptimeValue::bool_(!a && c)};
+                    case BinaryOp::Le:
+                        return Flow{.control = Control::None,
+                                    .value = ComptimeValue::bool_(!a || c)};
+                    case BinaryOp::Gt:
+                        return Flow{.control = Control::None,
+                                    .value = ComptimeValue::bool_(a && !c)};
+                    case BinaryOp::Ge:
+                        return Flow{.control = Control::None,
+                                    .value = ComptimeValue::bool_(a || !c)};
+                    default:
+                        break;
+                }
+            }
+
+            error(expr->span,
+                  "unsupported operand types for binary operator at comptime");
             return std::nullopt;
         }
 
@@ -824,33 +1001,95 @@ std::optional<ComptimeEvaluator::Flow> ComptimeEvaluator::eval_expr_inner(
 
         case AstNodeKind::ExprAssign: {
             auto* a = static_cast<const ExprAssign*>(expr);
-            if (!a->lhs || a->lhs->kind != AstNodeKind::ExprPath) {
-                error(
-                    expr->span,
-                    "comptime assignment is only supported to locals for now");
-                return std::nullopt;
+            if (!a->lhs) return std::nullopt;
+
+            // `x = rhs`
+            if (a->lhs->kind == AstNodeKind::ExprPath) {
+                const Path* p = static_cast<const ExprPath*>(a->lhs)->path;
+                if (!p || p->segments.size() != 1) {
+                    error(expr->span,
+                          "comptime assignment is only supported to locals for "
+                          "now");
+                    return std::nullopt;
+                }
+                Binding* b = env.lookup(p->segments[0]->text);
+                if (!b) {
+                    error(expr->span, "assignment to unknown local at comptime");
+                    return std::nullopt;
+                }
+                if (!b->is_mut) {
+                    error(expr->span,
+                          "assignment to immutable local at comptime");
+                    return std::nullopt;
+                }
+                auto rhs = eval_expr_inner(mid, a->rhs, env, loop_depth);
+                if (!rhs || rhs->control != Control::None) return std::nullopt;
+                b->value = rhs->value;
+                return Flow{.control = Control::None,
+                            .value = ComptimeValue::unit()};
             }
-            const Path* p = static_cast<const ExprPath*>(a->lhs)->path;
-            if (!p || p->segments.size() != 1) {
-                error(
-                    expr->span,
-                    "comptime assignment is only supported to locals for now");
-                return std::nullopt;
+
+            // `arr[i] = rhs` (v0.0.19: enough to build lookup tables).
+            if (a->lhs->kind == AstNodeKind::ExprIndex) {
+                auto* ix = static_cast<const ExprIndex*>(a->lhs);
+                if (!ix->base || ix->base->kind != AstNodeKind::ExprPath) {
+                    error(expr->span,
+                          "comptime assignment is only supported to local "
+                          "paths and local array indexing for now");
+                    return std::nullopt;
+                }
+                const Path* p = static_cast<const ExprPath*>(ix->base)->path;
+                if (!p || p->segments.size() != 1) {
+                    error(expr->span,
+                          "comptime assignment is only supported to local "
+                          "paths and local array indexing for now");
+                    return std::nullopt;
+                }
+                Binding* b = env.lookup(p->segments[0]->text);
+                if (!b) {
+                    error(expr->span, "assignment to unknown local at comptime");
+                    return std::nullopt;
+                }
+                if (!b->is_mut) {
+                    error(expr->span,
+                          "assignment to immutable local at comptime");
+                    return std::nullopt;
+                }
+                if (b->value.kind != ComptimeValue::Kind::Array) {
+                    error(expr->span,
+                          "indexed comptime assignment requires an array value");
+                    return std::nullopt;
+                }
+                auto idx_v = eval_expr_inner(mid, ix->index, env, loop_depth);
+                if (!idx_v || idx_v->control != Control::None)
+                    return std::nullopt;
+                if (idx_v->value.kind != ComptimeValue::Kind::Int) {
+                    error(expr->span,
+                          "indexed comptime assignment requires an integer "
+                          "index");
+                    return std::nullopt;
+                }
+                if (idx_v->value.int_value < 0) {
+                    error(expr->span, "index must be non-negative at comptime");
+                    return std::nullopt;
+                }
+                std::uint64_t idx =
+                    static_cast<std::uint64_t>(idx_v->value.int_value);
+                if (idx >= b->value.array_elems.size()) {
+                    error(expr->span, "index out of bounds at comptime");
+                    return std::nullopt;
+                }
+
+                auto rhs = eval_expr_inner(mid, a->rhs, env, loop_depth);
+                if (!rhs || rhs->control != Control::None) return std::nullopt;
+                b->value.array_elems[idx] = rhs->value;
+                return Flow{.control = Control::None,
+                            .value = ComptimeValue::unit()};
             }
-            Binding* b = env.lookup(p->segments[0]->text);
-            if (!b) {
-                error(expr->span, "assignment to unknown local at comptime");
-                return std::nullopt;
-            }
-            if (!b->is_mut) {
-                error(expr->span, "assignment to immutable local at comptime");
-                return std::nullopt;
-            }
-            auto rhs = eval_expr_inner(mid, a->rhs, env, loop_depth);
-            if (!rhs || rhs->control != Control::None) return std::nullopt;
-            b->value = rhs->value;
-            return Flow{.control = Control::None,
-                        .value = ComptimeValue::unit()};
+
+            error(expr->span,
+                  "unsupported assignment target at comptime (v0.0.x)");
+            return std::nullopt;
         }
 
         case AstNodeKind::ExprCall: {
@@ -1073,9 +1312,36 @@ std::optional<ComptimeEvaluator::Flow> ComptimeEvaluator::eval_expr_inner(
             error(expr->span, "method calls at comptime are not supported yet");
             return std::nullopt;
 
-        case AstNodeKind::ExprIndex:
-            error(expr->span, "indexing at comptime is not supported yet");
-            return std::nullopt;
+        case AstNodeKind::ExprIndex: {
+            auto* ix = static_cast<const ExprIndex*>(expr);
+            auto base = eval_expr_inner(mid, ix->base, env, loop_depth);
+            if (!base || base->control != Control::None) return std::nullopt;
+            auto idx_v = eval_expr_inner(mid, ix->index, env, loop_depth);
+            if (!idx_v || idx_v->control != Control::None) return std::nullopt;
+
+            if (idx_v->value.kind != ComptimeValue::Kind::Int) {
+                error(expr->span, "index must be an integer at comptime");
+                return std::nullopt;
+            }
+            if (idx_v->value.int_value < 0) {
+                error(expr->span, "index must be non-negative at comptime");
+                return std::nullopt;
+            }
+            std::uint64_t idx =
+                static_cast<std::uint64_t>(idx_v->value.int_value);
+
+            if (base->value.kind != ComptimeValue::Kind::Array) {
+                error(expr->span,
+                      "indexing at comptime is only supported for arrays");
+                return std::nullopt;
+            }
+            if (idx >= base->value.array_elems.size()) {
+                error(expr->span, "index out of bounds at comptime");
+                return std::nullopt;
+            }
+            return Flow{.control = Control::None,
+                        .value = base->value.array_elems[idx]};
+        }
 
         default:
             break;

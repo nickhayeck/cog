@@ -4,8 +4,11 @@
 #include "parse_state.hpp"
 #include "parser.hpp"
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <cerrno>
+#include <climits>
 #include <string>
 
 int yycolumn = 1;
@@ -83,6 +86,42 @@ static std::string* dup_string_literal_bytes(size_t quote_start) {
   return new std::string(std::move(out));
 }
 
+static bool parse_int_literal(long long& out) {
+  std::string s{yytext, yytext + static_cast<size_t>(yyleng)};
+  s.erase(std::remove(s.begin(), s.end(), '_'), s.end());
+  int base = 10;
+  size_t start = 0;
+  if (s.size() >= 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
+    base = 16;
+    start = 2;
+  } else if (s.size() >= 2 && s[0] == '0' && (s[1] == 'o' || s[1] == 'O')) {
+    base = 8;
+    start = 2;
+  } else if (s.size() >= 2 && s[0] == '0' && (s[1] == 'b' || s[1] == 'B')) {
+    base = 2;
+    start = 2;
+  }
+
+  errno = 0;
+  char* end = nullptr;
+  unsigned long long v = std::strtoull(s.c_str() + start, &end, base);
+  if (errno != 0 || !end || *end != '\0') return false;
+  if (v > static_cast<unsigned long long>(LLONG_MAX)) return false;
+  out = static_cast<long long>(v);
+  return true;
+}
+
+static bool parse_float_literal(double& out) {
+  std::string s{yytext, yytext + static_cast<size_t>(yyleng)};
+  s.erase(std::remove(s.begin(), s.end(), '_'), s.end());
+  errno = 0;
+  char* end = nullptr;
+  double v = std::strtod(s.c_str(), &end);
+  if (errno != 0 || !end || *end != '\0') return false;
+  out = v;
+  return true;
+}
+
 %}
 
 %x COMMENT
@@ -108,6 +147,8 @@ static std::string* dup_string_literal_bytes(size_t quote_start) {
 ">="                     { return TOK_GE; }
 "&&"                     { return TOK_ANDAND; }
 "||"                     { return TOK_OROR; }
+"<<"                     { return TOK_SHL; }
+">>"                     { return TOK_SHR; }
 "..."                    { return TOK_ELLIPSIS; }
 
 "fn"                     { return KW_FN; }
@@ -137,7 +178,31 @@ static std::string* dup_string_literal_bytes(size_t quote_start) {
 "true"                   { return KW_TRUE; }
 "false"                  { return KW_FALSE; }
 
-[0-9]+                   { yylval.int_val = std::atoll(yytext); return INT; }
+[0-9]([0-9_])*\.[0-9]([0-9_])*([eE][+-]?[0-9]([0-9_])*)?  {
+                          if (!parse_float_literal(yylval.float_val)) yylval.float_val = 0.0;
+                          return FLOAT;
+                        }
+[0-9]([0-9_])*[eE][+-]?[0-9]([0-9_])* {
+                          if (!parse_float_literal(yylval.float_val)) yylval.float_val = 0.0;
+                          return FLOAT;
+                        }
+
+0[xX][0-9A-Fa-f]([0-9A-Fa-f_])* {
+                          if (!parse_int_literal(yylval.int_val)) yylval.int_val = 0;
+                          return INT;
+                        }
+0[oO][0-7]([0-7_])*       {
+                          if (!parse_int_literal(yylval.int_val)) yylval.int_val = 0;
+                          return INT;
+                        }
+0[bB][01]([01_])*         {
+                          if (!parse_int_literal(yylval.int_val)) yylval.int_val = 0;
+                          return INT;
+                        }
+[0-9]([0-9_])*            {
+                          if (!parse_int_literal(yylval.int_val)) yylval.int_val = 0;
+                          return INT;
+                        }
 
 c\"([^\"\\]|\\.)*\"      { yylval.str_lit = dup_string_literal_bytes(1); return CSTRING; }
 \"([^\"\\]|\\.)*\"       { yylval.str_lit = dup_string_literal_bytes(0); return STRING; }

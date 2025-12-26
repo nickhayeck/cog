@@ -7,9 +7,9 @@ These are project-local instructions for working in this repo.
 - Prefer correctness and debuggability over cleverness.
 - Avoid “magic” build steps; everything should run via CMake.
 
-## Current compiler pipeline (v0.0.18-main)
+## Current compiler pipeline (v0.0.19-main)
 - `cogc <file.cg>` runs: parse → module loading + `use` resolution → type checking + local move checking → comptime const-eval (for `const`/`static` and array lengths).
-- Comptime extensions (v0.0.16–v0.0.17): comptime function calls (with limits), `comptime` parameters with residualization, and `builtin::type_info(type)`.
+- Comptime extensions (v0.0.16–v0.0.19): comptime function calls (with limits), `comptime` parameters with residualization, `builtin::type_info(type)`, and comptime array construction/indexing.
 - Core typing extensions (v0.0.18): `!`, match exhaustiveness, tuple structs + `.0/.1`, and function pointers.
 - Optional backends:
   - `cogc --emit-llvm <out.ll> <file.cg>` emits LLVM IR.

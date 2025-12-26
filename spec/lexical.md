@@ -100,18 +100,6 @@ Typing:
 
 `true` and `false` are literals of type `bool`.
 
-## Char literals
-
-Char literals are planned but not required for early v0.1 implementations.
-
-If implemented, a char literal has the form:
-
-```
-CHAR := "'" (non-quote char | escape) "'"
-```
-
-and has type `char` (a Unicode scalar value).
-
 ## String literals
 
 Cog has two string literal forms:
@@ -134,7 +122,7 @@ Type: `const* u8` pointing to a NUL-terminated byte sequence.
 
 ### Escapes
 
-For v0.1, the following escapes are required:
+The following escapes are required:
 
 - `\\n` newline (U+000A)
 - `\\r` carriage return (U+000D)
@@ -143,4 +131,4 @@ For v0.1, the following escapes are required:
 - `\\\\` backslash
 - `\\0` NUL byte
 
-Additional escapes (hex, unicode) are planned.
+Additional escapes (hex, unicode) are planned (see `future.md`).
