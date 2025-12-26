@@ -1,19 +1,6 @@
-// Minimal "hello world"
-
 fn[extern(C)] printf(fmt: const* u8, ...) -> i32;
-
-// fn main(argc: i32, argv: const* const* u8) -> i32 {
-//    printf(c"Hello, world!\n");
-//     if argc < 2 {
-//         printf(c"No one to say hi to :(\n");
-//     } else {
-//         let name: const* u8 = argv[1];
-//         printf(c"Hi there, %s!", name);
-//     }
-// }
 
 fn main() -> i32 {
     printf(c"Hello, world!\n");
-    
     0
 }

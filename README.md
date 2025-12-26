@@ -41,3 +41,6 @@ Other emits:
 - `./build/cogc --emit-llvm build/out.ll examples/ffi_tags_strings/main.cg`
 - `./build/cogc --emit-bc build/out.bc examples/ffi_tags_strings/main.cg`
 - `./build/cogc --emit-obj build/out.o examples/ffi_tags_strings/main.cg`
+
+Format:
+- `find . -name "*.cpp" -o -name "*.hpp" | xargs -I {} /opt/homebrew/opt/llvm/bin/clang-format -i {}`

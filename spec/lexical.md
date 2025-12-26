@@ -50,18 +50,27 @@ Cog uses these punctuators/operators (non-exhaustive list):
 
 `!` `&&` `||`
 
-`|` (pattern alternation; also used in closure syntax)
+`&` `^` `~` `<<` `>>`
+
+`|` (bitwise OR; also pattern alternation; also used in closure syntax)
 
 `...` (extern-only C varargs marker in parameter lists)
 
 ## Integer literals
 
-For v0.1, integer literals are decimal. (Hex/binary/octal are planned.)
+For v0.1, integer literals support decimal, hex, octal, and binary.
 
 Syntax:
 
 ```
-INT := [0-9] ([0-9] | "_")*
+INT := DEC_INT | HEX_INT | OCT_INT | BIN_INT
+
+DEC_INT := [0-9] ([0-9] | "_")*
+HEX_INT := "0x" HEX_DIGIT (HEX_DIGIT | "_")*
+OCT_INT := "0o" [0-7] ([0-7] | "_")*
+BIN_INT := "0b" ("0"|"1") ("0"|"1"|"_")*
+
+HEX_DIGIT := [0-9A-Fa-f]
 ```
 
 Underscores are permitted as visual separators and are ignored for value interpretation.
@@ -79,6 +88,8 @@ FLOAT := DIGITS "." DIGITS (EXPONENT)?
        | DIGITS EXPONENT
 
 EXPONENT := ("e"|"E") ("+"|"-")? DIGITS
+
+DIGITS := [0-9] ([0-9] | "_")*
 ```
 
 Typing:

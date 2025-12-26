@@ -42,8 +42,8 @@ In `ReleaseFast`, the above errors are **undefined behavior** unless explicitly 
 ### Integer types
 
 Integer types include:
-- fixed-width signed: `i1..i128`
-- fixed-width unsigned: `u1..u128`
+- fixed-width signed: `i8`, `i16`, `i32`, `i64`, `i128`
+- fixed-width unsigned: `u8`, `u16`, `u32`, `u64`, `u128`
 - pointer-sized: `isize`, `usize`
 
 ### Checked vs wrapping operations
@@ -69,6 +69,7 @@ For `x << y` and `x >> y`:
 
 For indexing:
 - `arr[i]` and `slice[i]` trap in `Debug`/`ReleaseSafe` when out of bounds, UB in `ReleaseFast`.
+- Raw pointer indexing `ptr[i]` does not perform a bounds check (there is no length); it follows the pointer dereference rules below (null/misalignment traps in safe modes, UB in `ReleaseFast`).
 
 ## Pointer dereference checks
 

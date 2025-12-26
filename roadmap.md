@@ -140,10 +140,30 @@ Goal: allow the full range of `main` functions specified by `spec/layout_abi.md`
 - Emit an entrypoint shim only when building an executable (`--emit-exe`).
 - Implement and validate entrypoint selection:
   - accept explicit C ABI `fn[export(C)] main(argc: i32, argv: const* const* u8) -> i32`
-  - otherwise synthesize a C ABI wrapper for Cog ABI `main` in any of the allowed forms
+  - otherwise synthesize a C ABI wrapper for Cog ABI `main` (`fn main() -> ()` or `fn main() -> i32`)
 - Emit clear diagnostics when `main` is missing or has an invalid signature.
 
-### v0.0.19 — Type expressions + minimal shipped `core` + `?`
+### v0.0.19 — Core literals + operators + indexing
+Goal: cover “everyday” expression surface required for v0.1 examples.
+
+- Array literals:
+  - `[e0, e1, ...]` array value literals
+  - `[x; N]` repeat literals (`N` comptime)
+- Numeric literal ergonomics:
+  - underscores in numeric literals
+  - `0x` hex, `0o` octal, `0b` binary integers
+  - float literals (incl. exponent form)
+- Float types + ops:
+  - `f32`/`f64` types
+  - arithmetic + comparisons
+- Bitwise + shifts for integers:
+  - `& | ^ ~ << >>` with Rust-like precedence
+- Indexing/codegen:
+  - codegen for `a[i]` on arrays and slice pointers
+  - raw pointer indexing `ptr[i]` (C-like)
+  - array-to-slice pointer coercion: `const* [T; N]` → `const* [T]` and `mut* [T; N]` → `mut* [T]`
+
+### v0.0.20 — Type expressions + minimal shipped `core` + `?`
 Goal: unlock `core::Option(T)` / `core::Result(T, E)` and the `?` operator (`spec/stdlib.md`).
 
 - Extend the type checker to support **type-level calls** in type positions (e.g. `core::Option(i32)`), evaluated at comptime.
@@ -152,14 +172,14 @@ Goal: unlock `core::Option(T)` / `core::Result(T, E)` and the `?` operator (`spe
   - enough support to type-check and pattern-match the resulting enums
 - Implement `?` for `core::Option(T)` and `core::Result(T, E)` only.
 
-### v0.0.20 — Visibility enforcement + module polish
+### v0.0.21 — Visibility enforcement + module polish
 Goal: match `spec/modules.md` visibility rules and make modules ergonomic.
 
 - Enforce `pub` / `pub(crate)` visibility across modules.
 - Confirm “child modules can see private ancestor items” behavior (and add diagnostics when visibility fails).
 - Tighten `use` diagnostics (fully-qualified suggestions, “did you mean” for missing items).
 
-### v0.0.21 — FFI correctness: C ABI boundaries + repr(C) layout
+### v0.0.22 — FFI correctness: C ABI boundaries + repr(C) layout
 Goal: make extern/export “actually correct” (per `spec/layout_abi.md`).
 
 - Enforce FFI-safe types for `extern(C)`/`export(C)` signatures (v0.1: primitives + raw pointers only).
@@ -170,7 +190,7 @@ Goal: make extern/export “actually correct” (per `spec/layout_abi.md`).
   - `*_name(...)` overrides names
 - Add an end-to-end C interop example using `malloc/free/printf` with `c"..."`.
 
-### v0.0.22 — Build modes (Debug/ReleaseSafe/ReleaseFast) + runtime traps
+### v0.0.23 — Build modes (Debug/ReleaseSafe/ReleaseFast) + runtime traps
 Goal: begin matching `spec/build_modes.md` behavior.
 
 - Add `--build-mode {debug,release_safe,release_fast}` (default: debug for now).
@@ -181,7 +201,7 @@ Goal: begin matching `spec/build_modes.md` behavior.
   - null/misalignment traps for explicit deref
 - In `ReleaseFast`, compile these to UB-friendly IR (no checks).
 
-### v0.0.23 — v0.1.0 release candidate (docs, examples, harness)
+### v0.0.24 — v0.1.0 release candidate (docs, examples, harness)
 Goal: freeze the v0.1 subset and make it pleasant to use.
 
 - Ensure `spec/` and the compiler agree on the v0.1 subset (tag syntax, strings, enums, FFI limits).
@@ -198,6 +218,7 @@ v0.1.0 should be the first “useful” release: you can compile and run small p
 - Stable subset support:
   - modules (`mod` inline/out-of-line) + `use` trees
   - visibility: private-by-default, `pub`, `pub(crate)`
+  - literals and operators: arrays, ints/floats, bitwise ops, indexing
   - structs/enums + `match` (at least ints + enums)
   - functions + calls + methods via `impl`
   - `fn[extern(C)]` / `fn[export(C)]` + extern-only `...` varargs
@@ -227,6 +248,12 @@ v0.1.0 should be the first “useful” release: you can compile and run small p
 - Allocation API direction.
 - Variadic arguments beyond extern-only C varargs.
 - Testing story (built-in test runner vs library/framework).
+
+## Planned for v0.2.0 (spec only today)
+- Control-flow sugar: `if let`, `while let`.
+- Range expressions: `a..b`, `a..=b`.
+- Struct literal shorthand: `Point { x, y }`.
+- Enum struct variants: `E::V { x: 1 }` + matching patterns.
 
 ## C interop track (ongoing; subject to revision)
 - Define surface syntax for linking control (e.g. link names, calling conventions, libraries).

@@ -14,11 +14,11 @@ Cog has:
 
 ### Integers
 
-Signed fixed-width:
-- `i1`, `i2`, …, `i128`
+Signed fixed-width (v0.1):
+- `i8`, `i16`, `i32`, `i64`, `i128`
 
-Unsigned fixed-width:
-- `u1`, `u2`, …, `u128`
+Unsigned fixed-width (v0.1):
+- `u8`, `u16`, `u32`, `u64`, `u128`
 
 Pointer-sized:
 - `isize`, `usize`
@@ -37,7 +37,7 @@ Float NaN semantics are target/IEEE-754-like; exact NaN payload behavior is not 
 
 - `bool` has values `true` and `false`.
 
-### `char` (planned)
+### `char` (planned for 0.2.0)
 
 - `char` is a Unicode scalar value.
 - Char literals are planned but not required for early v0.1 implementations.
@@ -101,6 +101,17 @@ let y: bool = t.1;
 - Slices may only appear behind pointers: `const* [T]` and `mut* [T]`.
 
 ABI for slice pointers is specified in `spec/layout_abi.md`.
+
+#### Array-to-slice pointer coercion
+
+In v0.1, the following implicit coercions exist:
+
+- `const* [T; N]` → `const* [T]`
+- `mut* [T; N]` → `mut* [T]`
+
+This coercion constructs a slice fat pointer `{ ptr, len }` where:
+- `ptr` points to the first element of the array, and
+- `len` is `N` as a `usize`.
 
 ### Structs
 

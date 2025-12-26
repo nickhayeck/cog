@@ -13,4 +13,3 @@ fn repeat_add(comptime n: usize, x: i32) -> i32 {
 fn main() -> i32 {
     repeat_add(4, 3)
 }
-

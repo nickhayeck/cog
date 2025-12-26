@@ -2704,13 +2704,21 @@ class LlvmBackend {
         // Supported Cog ABI mains (v0.1):
         //   a) `fn main() -> ()`
         //   b) `fn main() -> i32`
-        //   c) `fn main(i32, const* const* u8) -> ()`
-        //   d) `fn main(i32, const* const* u8) -> i32`
+        //
+        // `argc`/`argv` are only available via an explicit exported C ABI
+        // entrypoint.
         const bool has_0_params = sig.params.empty();
-        const bool has_2_params =
-            sig.params.size() == 2 && checked_.types.equal(sig.params[0], i32) &&
-            checked_.types.equal(sig.params[1], argv_ty);
-        if (!has_0_params && !has_2_params) {
+        if (!has_0_params) {
+            if (sig.params.size() == 2 &&
+                checked_.types.equal(sig.params[0], i32) &&
+                checked_.types.equal(sig.params[1], argv_ty)) {
+                error(
+                    main_fn->span,
+                    "`argc`/`argv` are only available via an explicit C ABI "
+                    "entry point; write `fn[export(C)] main(argc: i32, argv: "
+                    "const* const* u8) -> i32 { ... }`");
+                return;
+            }
             error(main_fn->span,
                   "invalid `main` signature (see `spec/layout_abi.md`)");
             return;
@@ -2749,10 +2757,6 @@ class LlvmBackend {
         }
 
         std::vector<llvm::Value*> args{};
-        if (has_2_params) {
-            args.push_back(wrapper->getArg(0));  // argc
-            args.push_back(wrapper->getArg(1));  // argv
-        }
 
         llvm::CallInst* call =
             b.CreateCall(callee->getFunctionType(), callee, args);

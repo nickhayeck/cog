@@ -33,6 +33,31 @@ Rules:
 - If no initializer is present, the local is uninitialized and must be assigned before use.
 - `mut` on a binding means the local can be assigned after initialization.
 
+## Array literals
+
+Cog supports two array literal forms:
+
+```cog
+let a: [i32; 3] = [1, 2, 3];
+let z: [u8; 16] = [0; 16];
+```
+
+### `[e0, e1, ...]`
+
+- `[e0, e1, ...]` constructs an array value with type `[T; N]` where:
+  - `N` is the number of elements written, and
+  - `T` is determined by unifying the element types (or by an expected type).
+- Each element expression is evaluated and moved into the array.
+- The order of evaluation of element expressions is **unspecified**.
+- `[]` (the empty array literal) is only permitted when the expected type is `[T; 0]` for some `T`.
+
+### `[x; N]` (repeat)
+
+- `N` must be a comptime `usize`.
+- The element expression `x` is evaluated **once**.
+- The resulting array contains `N` copies of that value.
+- If `N >= 2`, the element type must be `Copy` (see `spec/moves.md`).
+
 ## Control flow
 
 ### `if`
@@ -157,6 +182,48 @@ Runtime checks for null/misalignment follow `spec/build_modes.md`.
 - `&mut place` has type `mut* T` and requires `place` be mutable.
 
 Because Cog has no lifetime checking, the resulting pointer may dangle if the pointed-to storage goes away (e.g. after moving/dropping); this is permitted but may cause UB when dereferenced.
+
+### Unary `~` (bitwise NOT)
+
+`~x` performs bitwise NOT on an integer.
+
+It is an error to apply `~` to a non-integer type.
+
+### Binary arithmetic
+
+For v0.1:
+- `+`, `-`, `*`, `/` are defined for integers and floats.
+- `%` is defined for integers (float remainder is planned).
+
+Integer overflow and other traps/UB are specified in `spec/build_modes.md`.
+
+### Bitwise operators and shifts
+
+For v0.1, the following operators are defined for integer types only:
+
+- `x & y` (bitwise AND)
+- `x ^ y` (bitwise XOR)
+- `x | y` (bitwise OR)
+- `x << y` (shift left)
+- `x >> y` (shift right; arithmetic for signed, logical for unsigned)
+
+It is an error to apply these operators to non-integer types.
+
+Shift range traps/UB are specified in `spec/build_modes.md`.
+
+### Indexing `a[i]`
+
+`a[i]` is a place expression selecting an element.
+
+Supported bases:
+- Arrays: if `a` has type `[T; N]`, then `a[i]` selects an element of type `T`.
+- Slice pointers: if `a` has type `const* [T]` or `mut* [T]`, then `a[i]` selects an element of type `T`.
+- Raw pointers: if `a` has type `const* T` or `mut* T`, then `a[i]` is pointer indexing and is equivalent to dereferencing the element pointer at offset `i` from `a` (like C `a[i]`).
+
+Safety checks:
+- Array and slice bounds checks follow `spec/build_modes.md`.
+- Raw pointer indexing performs **no** bounds check (there is no length).
+- Null/misalignment traps follow the same rules as dereferencing `*p` (see `spec/build_modes.md`).
 
 ### `as` casts
 

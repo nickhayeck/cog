@@ -16,7 +16,10 @@ These are project-local instructions for working in this repo.
   - `cogc --emit-bc <out.bc> <file.cg>` emits LLVM bitcode.
   - `cogc --emit-obj <out.o> <file.cg>` emits an object file.
   - `cogc --emit-exe <out> <file.cg>` emits an object file and links via system `clang`.
-    - When building executables, the compiler enforces/implements `main` entrypoint selection per `spec/layout_abi.md` (including a synthesized C ABI shim for Cog ABI `main`).
+    - When building executables, the compiler enforces/implements `main` entrypoint selection per `spec/layout_abi.md`:
+      - prefer `fn[export(C)] main(argc: i32, argv: const* const* u8) -> i32`
+      - otherwise synthesize a C ABI shim for `fn main() -> ()` / `fn main() -> i32`
+      - `argc`/`argv` are only available via the explicit exported C ABI entry point
 - Debug aids:
   - `cogc --dump-tokens <file.cg>`
   - `cogc --dump-ast <file.cg>` (after successful checking)

@@ -186,8 +186,19 @@ logical_and_expr := logical_and_expr "&&" equality_expr
 
 equality_expr := equality_expr ("==" | "!=") relational_expr
               | relational_expr
-relational_expr := relational_expr ("<" | "<=" | ">" | ">=") additive_expr
-                | additive_expr
+
+relational_expr := relational_expr ("<" | "<=" | ">" | ">=") bit_or_expr
+                | bit_or_expr
+
+bit_or_expr := bit_or_expr "|" bit_xor_expr
+            | bit_xor_expr
+bit_xor_expr := bit_xor_expr "^" bit_and_expr
+             | bit_and_expr
+bit_and_expr := bit_and_expr "&" shift_expr
+             | shift_expr
+shift_expr := shift_expr ("<<" | ">>") additive_expr
+           | additive_expr
+
 additive_expr := additive_expr ("+" | "-") multiplicative_expr
               | multiplicative_expr
 multiplicative_expr := multiplicative_expr ("*" | "/" | "%") cast_expr
@@ -195,7 +206,7 @@ multiplicative_expr := multiplicative_expr ("*" | "/" | "%") cast_expr
 cast_expr := cast_expr "as" type
           | unary_expr
 
-unary_expr := ("-" | "!" | "*" | "&") unary_expr
+unary_expr := ("-" | "!" | "*" | "&" | "~") unary_expr
             | "&" "mut" unary_expr
             | postfix_expr
 
@@ -215,6 +226,7 @@ primary_expr :=
     INT
   | FLOAT
   | STRING
+  | array_lit
   | "true" | "false"
   | "(" ")"                          // unit
   | "(" expr ")"                     // parens
@@ -230,6 +242,12 @@ primary_expr :=
 
 expr_or_block := expr | block
 field_inits   := (IDENT ":" expr) ("," IDENT ":" expr)* ","?
+
+array_lit :=
+    "[" array_elems? "]"
+  | "[" expr ";" expr "]"
+
+array_elems := expr ("," expr)* ","?
 ```
 
 Notes:
@@ -266,4 +284,38 @@ Closure literals (syntax reserved):
 closure_expr := "|" closure_params? "|" expr_or_block
 closure_params := closure_param ("," closure_param)* ","?
 closure_param := IDENT (":" type)?
+```
+
+`if let` / `while let` (planned for 0.2.0):
+
+```
+if_expr :=
+    "if" "let" pattern "=" expr block ("else" expr_or_block)?
+  | "if" expr block ("else" expr_or_block)?
+
+while_expr :=
+    "while" "let" pattern "=" expr block
+  | "while" expr block
+```
+
+Range expressions (planned for 0.2.0):
+
+```
+range_expr := expr ".." expr
+           | expr "..=" expr
+```
+
+Struct literal field init shorthand (planned for 0.2.0):
+
+```
+field_inits := field_init ("," field_init)* ","?
+field_init  := IDENT ":" expr
+            | IDENT
+```
+
+Enum struct variants (planned for 0.2.0):
+
+```
+variant_payload := "(" types? ")"
+               | "{" (IDENT ":" type ","?)* "}"
 ```

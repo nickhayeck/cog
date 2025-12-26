@@ -90,8 +90,6 @@ add_test(NAME compile_tuples              COMMAND cogc --emit-exe test_15.bin ${
 add_test(NAME compile_never_type          COMMAND cogc --emit-exe test_16.bin ${CMAKE_CURRENT_SOURCE_DIR}/examples/never_type/main.cg)
 add_test(NAME compile_match_exhaustiveness COMMAND cogc --emit-exe test_17.bin ${CMAKE_CURRENT_SOURCE_DIR}/examples/match_exhaustiveness/main.cg)
 add_test(NAME compile_main_unit          COMMAND cogc --emit-exe test_18.bin ${CMAKE_CURRENT_SOURCE_DIR}/examples/main_unit/main.cg)
-add_test(NAME compile_main_args_i32      COMMAND cogc --emit-exe test_19.bin ${CMAKE_CURRENT_SOURCE_DIR}/examples/main_args_i32/main.cg)
-add_test(NAME compile_main_args_unit     COMMAND cogc --emit-exe test_20.bin ${CMAKE_CURRENT_SOURCE_DIR}/examples/main_args_unit/main.cg)
 add_test(NAME compile_main_export_c      COMMAND cogc --emit-exe test_21.bin ${CMAKE_CURRENT_SOURCE_DIR}/examples/main_export_c/main.cg)
 
 add_test(NAME fail_non_exhaustive_match   COMMAND cogc --emit-exe test_neg_00.bin ${CMAKE_CURRENT_SOURCE_DIR}/test/negative/non_exhaustive_match.cg)
@@ -100,5 +98,7 @@ add_test(NAME fail_int_literal_does_not_fit COMMAND cogc --emit-exe test_neg_01.
 set_tests_properties(fail_int_literal_does_not_fit PROPERTIES WILL_FAIL TRUE)
 add_test(NAME fail_main_bad_signature    COMMAND cogc --emit-exe test_neg_02.bin ${CMAKE_CURRENT_SOURCE_DIR}/test/negative/main_bad_signature.cg)
 set_tests_properties(fail_main_bad_signature PROPERTIES WILL_FAIL TRUE)
-add_test(NAME fail_no_main              COMMAND cogc --emit-exe test_neg_03.bin ${CMAKE_CURRENT_SOURCE_DIR}/test/negative/no_main.cg)
+add_test(NAME fail_main_args_requires_export COMMAND cogc --emit-exe test_neg_03.bin ${CMAKE_CURRENT_SOURCE_DIR}/test/negative/main_args_requires_export.cg)
+set_tests_properties(fail_main_args_requires_export PROPERTIES WILL_FAIL TRUE)
+add_test(NAME fail_no_main              COMMAND cogc --emit-exe test_neg_04.bin ${CMAKE_CURRENT_SOURCE_DIR}/test/negative/no_main.cg)
 set_tests_properties(fail_no_main PROPERTIES WILL_FAIL TRUE)
