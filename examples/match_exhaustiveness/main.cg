@@ -1,0 +1,21 @@
+// Demonstrates v0.0.18: match typing + exhaustiveness checks (positive cases).
+
+enum E {
+    A,
+    B,
+}
+
+fn main() -> i32 {
+    let x: bool = true;
+    let y: i32 = match x {
+        true => 1,
+        false => 2,
+    };
+
+    let e: E = E::A;
+    match e {
+        E::A => y,
+        E::B => 0,
+    }
+}
+

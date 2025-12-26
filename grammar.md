@@ -1,6 +1,6 @@
-# Cog v0.0.15 prototype grammar (draft)
+# Cog v0.0.18 prototype grammar (draft)
 
-This is an **approximate** EBNF aligned with the v0.0.15 prototype parser (`src/parser.y` + `src/lexer.l`). It describes the subset that currently parses; it is not intended to be a complete Rust grammar.
+This is an **approximate** EBNF aligned with the v0.0.18 prototype parser (`src/parser.y` + `src/lexer.l`). It describes the subset that currently parses; it is not intended to be a complete Rust grammar.
 
 Core language grammar (v0.1 draft) lives in `spec/syntax.md`. The prototype grammar is intended to be close to `spec/`, but remains incomplete and may accept or reject programs differently in edge cases.
 
@@ -40,6 +40,7 @@ item_core     := "use" tags? use_tree ";"
               | "mod" tags? IDENT "{" item* "}"
               | "mod" tags? IDENT ";"
               | "struct" tags? IDENT "{" field_decl* "}"
+              | "struct" tags? IDENT "(" types? ")" ";"
               | "enum" tags? IDENT "{" variant_decl* "}"
               | "impl" tags? path "{" impl_item* "}"
               | "fn" tags? IDENT "(" params? ")" ret? (block | ";")
@@ -88,6 +89,7 @@ qpath         := path_seg "::" path_seg ("::" path_seg)*   // at least 2 segment
 type          := path
               | "type"
               | "!"
+              | "fn" "(" types? ")" ret?
               | "const" "*" type
               | "mut" "*" type
               | "[" type "]"              // slice type (unsized)
@@ -147,6 +149,7 @@ unary_expr    := ("-" | "!" | "*" | "&") unary_expr
 postfix_expr  := primary_expr
               | postfix_expr "(" args? ")"          // call
               | postfix_expr "." IDENT              // field
+              | postfix_expr "." INT                // tuple index
               | postfix_expr "." IDENT "(" args? ")"// method call
               | postfix_expr "[" expr "]"           // index
 

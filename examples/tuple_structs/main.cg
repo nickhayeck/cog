@@ -1,0 +1,14 @@
+// Demonstrates v0.0.18: tuple structs + `.0`/`.1` field access (including rvalues).
+
+struct Pair(i32, i32);
+
+fn sum(p: Pair) -> i32 {
+    p.0 + p.1
+}
+
+fn main() -> i32 {
+    let a: i32 = Pair(1, 2).0;
+    let p: Pair = Pair(40, 2);
+    a + sum(p)
+}
+

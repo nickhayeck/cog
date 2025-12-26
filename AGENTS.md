@@ -7,8 +7,10 @@ These are project-local instructions for working in this repo.
 - Prefer correctness and debuggability over cleverness.
 - Avoid “magic” build steps; everything should run via CMake.
 
-## Current compiler pipeline (v0.0.15)
+## Current compiler pipeline (v0.0.18)
 - `cogc <file.cg>` runs: parse → module loading + `use` resolution → type checking + local move checking → comptime const-eval (for `const`/`static` and array lengths).
+- Comptime extensions (v0.0.16–v0.0.17): comptime function calls (with limits), `comptime` parameters with residualization, and `builtin::type_info(type)`.
+- Core typing extensions (v0.0.18): `!`, match exhaustiveness, tuple structs + `.0/.1`, and function pointers.
 - Optional backends:
   - `cogc --emit-llvm <out.ll> <file.cg>` emits LLVM IR.
   - `cogc --emit-bc <out.bc> <file.cg>` emits LLVM bitcode.
@@ -29,7 +31,7 @@ These are project-local instructions for working in this repo.
 
 ## Layout
 - Source: `src/`
-- Tests: `ctest` currently runs `examples/*` as smoke tests; `test/` is reserved for a future harness.
+- Tests: `ctest` runs a small compile-smoke suite over `examples/` plus a tiny negative suite under `test/negative/`.
 - Examples: `examples/`
 - Generated flex/bison outputs should go into the CMake build directory, not checked into git.
 

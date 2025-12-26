@@ -1,0 +1,16 @@
+// Demonstrates v0.0.17: comptime parameters + residualized call emission.
+
+fn repeat_add(comptime n: usize, x: i32) -> i32 {
+    let mut i: usize = 0;
+    let mut acc: i32 = 0;
+    while i < n {
+        acc = acc + x;
+        i = i + 1;
+    };
+    acc
+}
+
+fn main() -> i32 {
+    repeat_add(4, 3)
+}
+

@@ -1,0 +1,13 @@
+// Demonstrates v0.0.18: function pointer types and indirect calls.
+
+fn add1(x: i32) -> i32 { x + 1 }
+
+fn apply(f: const* fn(i32) -> i32, x: i32) -> i32 {
+    f(x)
+}
+
+fn main() -> i32 {
+    let p: const* fn(i32) -> i32 = add1;
+    apply(p, 41)
+}
+

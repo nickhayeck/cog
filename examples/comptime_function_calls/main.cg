@@ -1,0 +1,24 @@
+// Demonstrates v0.0.16: comptime function calls + builtin::type_info(type).
+
+pub struct Pair {
+    a: i32,
+    b: i32,
+}
+
+fn fib(n: usize) -> usize {
+    if n < 2 {
+        n
+    } else {
+        fib(n - 1) + fib(n - 2)
+    }
+}
+
+const FIB10: usize = fib(10);
+
+const PAIR_SIZE: usize = builtin::type_info(Pair).size;
+const PAIR_ALIGN: usize = builtin::type_info(Pair).align;
+
+fn main() -> i32 {
+    (FIB10 + PAIR_SIZE + PAIR_ALIGN) as i32
+}
+

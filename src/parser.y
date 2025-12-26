@@ -247,6 +247,25 @@ item_core
   | KW_MOD tags IDENT ';' {
       $$ = MK(cog::ItemModDecl, @$, take_vec($2), cog::Visibility::Private, cog::take_str($3));
     }
+  | KW_STRUCT IDENT '(' types_opt ')' ';' {
+      // Tuple struct: synthesize numeric field names ("0", "1", ...) so later passes can treat it as a normal struct.
+      std::vector<cog::Type*> elems = take_vec($4);
+      std::vector<cog::FieldDecl*> fs{};
+      fs.reserve(elems.size());
+      for (size_t i = 0; i < elems.size(); i++) {
+        fs.push_back(MK(cog::FieldDecl, @$, std::vector<cog::Attr*>{}, cog::Visibility::Private, std::to_string(i), elems[i]));
+      }
+      $$ = MK(cog::ItemStruct, @$, std::vector<cog::Attr*>{}, cog::Visibility::Private, cog::take_str($2), std::move(fs));
+    }
+  | KW_STRUCT tags IDENT '(' types_opt ')' ';' {
+      std::vector<cog::Type*> elems = take_vec($5);
+      std::vector<cog::FieldDecl*> fs{};
+      fs.reserve(elems.size());
+      for (size_t i = 0; i < elems.size(); i++) {
+        fs.push_back(MK(cog::FieldDecl, @$, std::vector<cog::Attr*>{}, cog::Visibility::Private, std::to_string(i), elems[i]));
+      }
+      $$ = MK(cog::ItemStruct, @$, take_vec($2), cog::Visibility::Private, cog::take_str($3), std::move(fs));
+    }
   | KW_STRUCT IDENT '{' fields_opt '}' {
       std::vector<cog::FieldDecl*> fs = take_vec($4);
       $$ = MK(
@@ -412,6 +431,7 @@ type
   : path { $$ = MK(cog::TypePath, @$, $1); }
   | KW_TYPE { $$ = MK(cog::TypeType, @$); }
   | '!' { $$ = MK(cog::TypeNever, @$); }
+  | KW_FN '(' types_opt ')' ret_opt { $$ = MK(cog::TypeFn, @$, take_vec($3), $5); }
   | KW_CONST '*' type { $$ = MK(cog::TypePtr, @$, cog::Mutability::Const, $3); }
   | KW_MUT '*' type { $$ = MK(cog::TypePtr, @$, cog::Mutability::Mut, $3); }
   | '[' type ']' { $$ = MK(cog::TypeSlice, @$, $2); }
@@ -622,6 +642,7 @@ postfix_expr
   : primary_expr { $$ = $1; }
   | postfix_expr '(' args_opt ')' { $$ = MK(cog::ExprCall, @$, $1, take_vec($3)); }
   | postfix_expr '.' IDENT { $$ = MK(cog::ExprField, @$, $1, cog::take_str($3)); }
+  | postfix_expr '.' INT { $$ = MK(cog::ExprField, @$, $1, std::to_string(static_cast<std::int64_t>($3))); }
   | postfix_expr '.' IDENT '(' args_opt ')' { $$ = MK(cog::ExprMethodCall, @$, $1, cog::take_str($3), take_vec($5)); }
   | postfix_expr '[' expr ']' { $$ = MK(cog::ExprIndex, @$, $1, $3); }
   ;

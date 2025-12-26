@@ -1,0 +1,14 @@
+// Demonstrates v0.0.18: `!` (never) type unification through control flow.
+
+fn maybe_return(x: bool) -> i32 {
+    if x {
+        return 1;
+    } else {
+        2
+    }
+}
+
+fn main() -> i32 {
+    maybe_return(false)
+}
+

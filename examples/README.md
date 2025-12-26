@@ -10,8 +10,15 @@ These examples are intended to compile with the current prototype compiler.
 - `inherent_methods/`: `impl` methods + method calls.
 - `control_flow/`: `while`/`loop`, `break`/`continue`, and `match` on enums (including payload variants).
 - `comptime_consts/`: comptime const/static initializers + array lengths.
+- `comptime_function_calls/`: comptime function calls + `builtin::type_info(type)`.
+- `comptime_parameters/`: `comptime` parameters + residualization.
 - `match_or_patterns/`: `match` with `|` pattern alternatives and guards.
+- `match_exhaustiveness/`: `match` exhaustiveness (positive cases).
+- `never_type/`: `!` (never) type unification through control flow.
 - `pointers_and_deref/`: `&mut`, deref, and assignment through pointers.
 - `size_align_builtins/`: `builtin::size_of`/`builtin::align_of` + type aliases.
+- `tuple_structs/`: tuple structs + `.0`/`.1` field access.
+- `tuples/`: tuple expressions + `.0`/`.1` indexing.
+- `function_pointers/`: function pointers (`const* fn(...) -> R`) + indirect calls.
 
 `legacy/` contains older examples for removed features (traits/dyn).

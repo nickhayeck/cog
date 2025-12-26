@@ -1,8 +1,8 @@
 #pragma once
 
-#include "parse_state.hpp"
-
 #include <iosfwd>
+
+#include "parse_state.hpp"
 
 namespace cog {
 

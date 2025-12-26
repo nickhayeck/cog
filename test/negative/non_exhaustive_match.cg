@@ -1,0 +1,14 @@
+// This file is intended to fail: match on enums must be exhaustive in v0.1.
+
+enum E {
+    A,
+    B,
+}
+
+fn main() -> i32 {
+    let e: E = E::A;
+    match e {
+        E::A => 1,
+    }
+}
+

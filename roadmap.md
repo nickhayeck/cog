@@ -1,6 +1,6 @@
 # Cog compiler roadmap
 
-Status: **v0.0.15 is implemented** (front-end + layout + LLVM codegen + early C interop + v0.1 surface alignment). The v0.1 core language spec lives in `spec/README.md`.
+Status: **v0.0.18 is implemented** (comptime calls/params + core typing additions + LLVM codegen extensions). The v0.1 core language spec lives in `spec/README.md`.
 
 ## Completed
 
@@ -96,9 +96,7 @@ Status: **v0.0.15 is implemented** (front-end + layout + LLVM codegen + early C 
 - Codegen: emit readonly string globals, lowering `"..."` as `{ptr,len}` and `c"..."` as NUL-terminated.
 - Update `examples/hello_world/main.cg` and add `examples/ffi_tags_strings/main.cg` (renamed from the old `v0_0_15` folder).
 
-## Next milestones
-
-### v0.0.16 — Comptime (step 1): function calls + resource limits + reflection
+### v0.0.16 — Comptime (step 1): function calls + resource limits + reflection (done)
 Goal: make comptime usable beyond literals/blocks.
 
 - Interpreter: support calling non-extern functions at comptime (bounded recursion).
@@ -108,20 +106,18 @@ Goal: make comptime usable beyond literals/blocks.
   - comptime heap budget (even if coarse at first)
 - Add `builtin::type_info(type)` backed by the layout engine (TypeInfo layout unstable).
 
-### v0.0.17 — Comptime (step 2): comptime parameters + residualization
+### v0.0.17 — Comptime (step 2): comptime parameters + residualization (done)
 Goal: implement Zig-style staged evaluation: interpret comptime parts, emit only runtime ops.
 
 - Support `comptime` parameters in function signatures and calls.
 - Implement partial evaluation so a call with comptime args produces residual runtime code with no comptime parameters.
 - Add memoization keyed by canonicalized comptime argument values (compiler optimization only).
-- If needed for residualization, introduce a small typed internal IR (AST→IR→LLVM) to avoid entangling codegen with interpretation.
+- Current limitation: comptime arguments must be directly computable at the call site (forwarding through locals isn’t supported yet).
 
-### v0.0.18 — Core typing: `!`, match exhaustiveness, tuple structs, function pointers
+### v0.0.18 — Core typing: `!`, match exhaustiveness, tuple structs, function pointers (done)
 Goal: fill in core type semantics required for v0.1.
 
-- Numeric literals:
-  - represent integer/float literals as `comptime_int` / `comptime_float` until coerced/cast
-  - enforce “fits in type” rules for coercions and `as` casts
+- Integer literals: enforce “fits in type” checks for coercions and `as` casts (first step toward full `comptime_int` / `comptime_float` semantics).
 - Implement `!` as a real type:
   - diverging expressions (`return`, non-terminating `loop`, `builtin::compile_error`) have type `!`
   - `!` coerces to any type for arm/unification
@@ -134,6 +130,9 @@ Goal: fill in core type semantics required for v0.1.
 - Function types/pointers:
   - type-check `fn(T0, ...) -> R` as a type
   - allow `const* fn(...) -> R` values and calls through them
+- LLVM backend: add tuple expressions + `.0`/`.1` indexing and indirect calls through function pointers.
+
+## Next milestones
 
 ### v0.0.19 — Type expressions + minimal shipped `core` + `?`
 Goal: unlock `core::Option(T)` / `core::Result(T, E)` and the `?` operator (`spec/stdlib.md`).

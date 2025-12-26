@@ -1,0 +1,7 @@
+// Demonstrates v0.0.18: tuple expressions + `.0`/`.1` indexing.
+
+fn main() -> i32 {
+    let t = (40, 2);
+    t.0 + t.1
+}
+

@@ -1,0 +1,7 @@
+// This file is intended to fail: integer literals must fit the destination type.
+
+fn main() -> i32 {
+    let x: u8 = 256;
+    x as i32
+}
+

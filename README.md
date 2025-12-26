@@ -10,9 +10,11 @@ This repo contains an early C++ prototype compiler (`cogc`).
 - Comptime design notes: `comptime_design.md`
 - Examples: `examples/`
 
-## Status (v0.0.15)
+## Status (v0.0.18)
 - Front-end: parse → modules/`use` → type check + local move check → comptime const-eval for `const`/`static` and array lengths.
-- LLVM backend (early): emits runnable code for ints/bools, `if/else`, `while`/`loop` + `break/continue`, `match` on ints/bools/enums, structs, and methods.
+- Comptime: function calls (with resource limits), `comptime` parameters with residualization, and `builtin::type_info(type)`.
+- Core typing: `!` (never) type + match exhaustiveness (bool/enums; `_` required for int matches), tuple structs + `.0/.1`, and function pointers (`const* fn(...) -> R`).
+- LLVM backend (early): adds tuple expressions/indexing and indirect calls through function pointers.
 - C interop surface (early): keyword tags on items, `fn[extern(C)]` declarations, `fn[export(C)]` definitions, `extern_name(...)`/`export_name(...)`, and extern-only `...` varargs.
 - String literals:
   - `"..."` is `const* [u8]` (fat pointer `{ptr,len}`)
