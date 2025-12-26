@@ -20,5 +20,9 @@ These examples are intended to compile with the current prototype compiler.
 - `tuple_structs/`: tuple structs + `.0`/`.1` field access.
 - `tuples/`: tuple expressions + `.0`/`.1` indexing.
 - `function_pointers/`: function pointers (`const* fn(...) -> R`) + indirect calls.
+- `main_unit/`: entry point `fn main() -> ()`.
+- `main_args_i32/`: entry point `fn main(argc: i32, argv: const* const* u8) -> i32`.
+- `main_args_unit/`: entry point `fn main(argc: i32, argv: const* const* u8) -> ()`.
+- `main_export_c/`: entry point `fn[export(C)] main(argc: i32, argv: const* const* u8) -> i32`.
 
 `legacy/` contains older examples for removed features (traits/dyn).

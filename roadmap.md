@@ -1,6 +1,6 @@
 # Cog compiler roadmap
 
-Status: **v0.0.18 is implemented** (comptime calls/params + core typing additions + LLVM codegen extensions). The v0.1 core language spec lives in `spec/README.md`.
+Status: **v0.0.18-main is implemented** (comptime calls/params + core typing additions + executable entrypoint handling). The v0.1 core language spec lives in `spec/README.md`.
 
 ## Completed
 
@@ -133,6 +133,15 @@ Goal: fill in core type semantics required for v0.1.
 - LLVM backend: add tuple expressions + `.0`/`.1` indexing and indirect calls through function pointers.
 
 ## Next milestones
+
+### Mini milestone: v0.0.18-main — bring the main function into specification (done)
+Goal: allow the full range of `main` functions specified by `spec/layout_abi.md`.
+
+- Emit an entrypoint shim only when building an executable (`--emit-exe`).
+- Implement and validate entrypoint selection:
+  - accept explicit C ABI `fn[export(C)] main(argc: i32, argv: const* const* u8) -> i32`
+  - otherwise synthesize a C ABI wrapper for Cog ABI `main` in any of the allowed forms
+- Emit clear diagnostics when `main` is missing or has an invalid signature.
 
 ### v0.0.19 — Type expressions + minimal shipped `core` + `?`
 Goal: unlock `core::Option(T)` / `core::Result(T, E)` and the `?` operator (`spec/stdlib.md`).

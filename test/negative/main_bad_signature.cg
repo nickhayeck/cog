@@ -1,0 +1,6 @@
+// This file is intended to fail: `main` must have a supported entrypoint signature.
+
+fn main(x: i32) -> i32 {
+    x
+}
+

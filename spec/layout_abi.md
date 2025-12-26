@@ -226,6 +226,10 @@ For executables, the implementation should:
 fn[export(C)] main(argc: i32, argv: const* const* u8) -> i32 { ... }
 ```
 
-2) Otherwise, look for a Cog ABI `fn main(...)` and synthesize a C ABI shim.
+2) Otherwise, look for a Cog ABI and synthesize a C ABI shim. The Cog ABI main should be either:
+    a) `fn main() -> () {...}`, 
+    b) `fn main() -> i32 {...}`,
+    c) `fn main(argc: i32, argv: const* const* u8) -> () {...}`,
+    d) `fn main(argc: i32, argv: const* const* u8) -> i32 {...}`,
 
-If no suitable `main` exists, compilation fails.
+If no suitable `main` exists, or if multiple suitable `main` functions exist, compilation fails.

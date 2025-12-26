@@ -1,0 +1,4 @@
+// This file is intended to fail: `--emit-exe` requires a `main` entry point.
+
+fn foo() -> i32 { 0 }
+

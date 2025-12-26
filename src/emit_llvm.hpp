@@ -18,7 +18,7 @@ struct EmitLlvmOptions {
     std::optional<std::filesystem::path> out_bc{};
     std::optional<std::filesystem::path> out_obj{};
     std::optional<std::filesystem::path> out_exe{};
-    bool emit_main_wrapper = true;
+    bool emit_main_wrapper = false;
 };
 
 bool emit_llvm(Session& session, const ResolvedCrate& crate,

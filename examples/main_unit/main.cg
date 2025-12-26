@@ -1,0 +1,6 @@
+// Demonstrates executable entry point: `fn main() -> ()`.
+
+fn main() -> () {
+    // Returning `()` is allowed; the C ABI wrapper returns 0.
+}
+

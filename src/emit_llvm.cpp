@@ -322,6 +322,7 @@ class LlvmBackend {
         build_function_bodies();
         if (opts.emit_main_wrapper) emit_main_shim();
 
+        if (session_.has_errors()) return false;
         if (!verify_module()) return false;
 
         if (!write_outputs(opts)) return false;
@@ -2632,23 +2633,102 @@ class LlvmBackend {
     void emit_main_shim() {
         const Module& root = crate_.modules[crate_.root];
         auto it = root.values.find("main");
-        if (it == root.values.end() || !it->second ||
-            it->second->kind != AstNodeKind::ItemFn)
+        if (it == root.values.end() || !it->second) {
+            error(Span{},
+                  "missing entry point `main` (see `spec/layout_abi.md`)");
             return;
-        auto* main_fn = static_cast<const ItemFn*>(it->second);
-        for (const Attr* a : main_fn->attrs) {
-            if (!a || !a->name) continue;
-            if (path_is_ident(a->name, "extern") ||
-                path_is_ident(a->name, "export"))
-                return;
+        }
+        if (it->second->kind != AstNodeKind::ItemFn) {
+            error(it->second->span,
+                  "`main` must be a function (see `spec/layout_abi.md`)");
+            return;
         }
 
+        auto* main_fn = static_cast<const ItemFn*>(it->second);
         auto sig_it = checked_.fn_info.find(main_fn);
-        if (sig_it == checked_.fn_info.end()) return;
-        const FnInfo& sig = sig_it->second;
-        if (!checked_.types.equal(sig.ret, checked_.types.int_(IntKind::I32)) ||
-            !sig.params.empty())
+        if (sig_it == checked_.fn_info.end()) {
+            error(main_fn->span,
+                  "internal error: missing signature for `main`");
             return;
+        }
+        const FnInfo& sig = sig_it->second;
+
+        bool is_extern = false;
+        bool is_export = false;
+        for (const Attr* a : main_fn->attrs) {
+            if (!a || !a->name) continue;
+            if (path_is_ident(a->name, "extern")) is_extern = true;
+            if (path_is_ident(a->name, "export")) is_export = true;
+        }
+
+        if (is_extern) {
+            error(main_fn->span,
+                  "executable entry point `main` must not be `extern(C)`");
+            return;
+        }
+
+        TypeId i32 = checked_.types.int_(IntKind::I32);
+        TypeId u8 = checked_.types.int_(IntKind::U8);
+        TypeId argv_ty =
+            checked_.types.ptr(Mutability::Const,
+                               checked_.types.ptr(Mutability::Const, u8));
+
+        auto has_c_main_sig = [&]() -> bool {
+            return sig.params.size() == 2 &&
+                   checked_.types.equal(sig.params[0], i32) &&
+                   checked_.types.equal(sig.params[1], argv_ty) &&
+                   checked_.types.equal(sig.ret, i32);
+        };
+
+        // 1) Prefer an explicit C ABI entry point:
+        //    `fn[export(C)] main(argc: i32, argv: const* const* u8) -> i32 { ... }`
+        if (is_export) {
+            if (!has_c_main_sig()) {
+                error(main_fn->span,
+                      "`fn[export(C)] main` must have signature "
+                      "`fn[export(C)] main(argc: i32, argv: const* const* u8) "
+                      "-> i32`");
+                return;
+            }
+
+            if (locator_.symbol_for(main_fn) != "main") {
+                error(main_fn->span,
+                      "`fn[export(C)] main` must have symbol name `main` "
+                      "(remove `export_name(...)` or set it to `\"main\"`)");
+                return;
+            }
+            return;
+        }
+
+        // 2) Otherwise, look for a Cog ABI main and synthesize a C ABI shim.
+        // Supported Cog ABI mains (v0.1):
+        //   a) `fn main() -> ()`
+        //   b) `fn main() -> i32`
+        //   c) `fn main(i32, const* const* u8) -> ()`
+        //   d) `fn main(i32, const* const* u8) -> i32`
+        const bool has_0_params = sig.params.empty();
+        const bool has_2_params =
+            sig.params.size() == 2 && checked_.types.equal(sig.params[0], i32) &&
+            checked_.types.equal(sig.params[1], argv_ty);
+        if (!has_0_params && !has_2_params) {
+            error(main_fn->span,
+                  "invalid `main` signature (see `spec/layout_abi.md`)");
+            return;
+        }
+
+        const bool ret_unit = checked_.types.equal(sig.ret, checked_.types.unit());
+        const bool ret_i32 = checked_.types.equal(sig.ret, i32);
+        if (!ret_unit && !ret_i32) {
+            error(main_fn->span,
+                  "invalid `main` return type (expected `()` or `i32`)");
+            return;
+        }
+
+        if (module_->getFunction("main")) {
+            error(main_fn->span,
+                  "multiple definitions of the executable entry point `main`");
+            return;
+        }
 
         llvm::FunctionType* wrapper_ty = llvm::FunctionType::get(
             llvm::Type::getInt32Ty(ctx_),
@@ -2667,9 +2747,20 @@ class LlvmBackend {
                 llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx_), 1));
             return;
         }
+
+        std::vector<llvm::Value*> args{};
+        if (has_2_params) {
+            args.push_back(wrapper->getArg(0));  // argc
+            args.push_back(wrapper->getArg(1));  // argv
+        }
+
         llvm::CallInst* call =
-            b.CreateCall(callee->getFunctionType(), callee, {});
-        b.CreateRet(call);
+            b.CreateCall(callee->getFunctionType(), callee, args);
+        if (ret_i32) {
+            b.CreateRet(call);
+        } else {
+            b.CreateRet(llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx_), 0));
+        }
     }
 
     bool verify_module() {

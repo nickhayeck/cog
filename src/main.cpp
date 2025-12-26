@@ -118,6 +118,7 @@ int main(int argc, char** argv) {
             opts.out_obj = std::filesystem::path(std::string(*emit_obj));
         if (emit_exe)
             opts.out_exe = std::filesystem::path(std::string(*emit_exe));
+        opts.emit_main_wrapper = emit_exe.has_value();
         (void)cog::emit_llvm(session, crate, *checked, opts);
     }
 

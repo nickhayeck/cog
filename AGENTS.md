@@ -7,7 +7,7 @@ These are project-local instructions for working in this repo.
 - Prefer correctness and debuggability over cleverness.
 - Avoid “magic” build steps; everything should run via CMake.
 
-## Current compiler pipeline (v0.0.18)
+## Current compiler pipeline (v0.0.18-main)
 - `cogc <file.cg>` runs: parse → module loading + `use` resolution → type checking + local move checking → comptime const-eval (for `const`/`static` and array lengths).
 - Comptime extensions (v0.0.16–v0.0.17): comptime function calls (with limits), `comptime` parameters with residualization, and `builtin::type_info(type)`.
 - Core typing extensions (v0.0.18): `!`, match exhaustiveness, tuple structs + `.0/.1`, and function pointers.
@@ -16,6 +16,7 @@ These are project-local instructions for working in this repo.
   - `cogc --emit-bc <out.bc> <file.cg>` emits LLVM bitcode.
   - `cogc --emit-obj <out.o> <file.cg>` emits an object file.
   - `cogc --emit-exe <out> <file.cg>` emits an object file and links via system `clang`.
+    - When building executables, the compiler enforces/implements `main` entrypoint selection per `spec/layout_abi.md` (including a synthesized C ABI shim for Cog ABI `main`).
 - Debug aids:
   - `cogc --dump-tokens <file.cg>`
   - `cogc --dump-ast <file.cg>` (after successful checking)
