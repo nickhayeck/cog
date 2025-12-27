@@ -28,7 +28,7 @@ Allowed tags on `mod` items:
 
 - `test`
 
-`mod[test] name { ... }` marks a test-only module (see `spec/tests.md`).
+`mod[test] name { ... }` marks a test-only module (see `spec/future.md`).
 
 ### `fn` tags
 

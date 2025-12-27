@@ -44,7 +44,8 @@ tag_arg   := path | STRING
 ```
 
 Notes:
-- The allowed tag sets and their semantics are specified in `spec/layout_abi.md` and `spec/tests.md`.
+- The allowed tag sets and their semantics are specified in `spec/layout_abi.md`.
+- The reserved `mod[test]` syntax and intended test runner model is described in `spec/future.md`.
 - Unknown tags are errors.
 
 ## Items
@@ -127,7 +128,8 @@ type_path := path
 
 ```
 type :=
-    type_path
+    type_call
+  | type_path
   | "type"                 // the type-of-types (comptime-only)
   | "!"                    // never type
   | pointer_type
@@ -135,6 +137,10 @@ type :=
   | array_type
   | tuple_type
   | fn_type
+
+// Type-level call (type functions).
+// This is how v0.1 expresses “generics without generics syntax”.
+type_call := type_path "(" type_list? ")"
 
 pointer_type := ("const" | "mut") "*" type
 slice_type   := "[" type "]"             // unsized slice

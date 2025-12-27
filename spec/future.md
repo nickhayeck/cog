@@ -170,7 +170,9 @@ A module tagged `test` is a test-only module:
 ```cog
 mod[test] tests {
     fn add_works() -> () {
-        if add(1, 2) != 3 { builtin::compile_error("add failed") };
+        if add(1, 2) != 3 {
+            // TBD: a standard runtime assertion / test-failure mechanism.
+        }
     }
 }
 ```

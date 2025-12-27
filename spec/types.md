@@ -58,12 +58,35 @@ Float NaN semantics are target/IEEE-754-like; exact NaN payload behavior is not 
 
 - `type` is the type of **type values**.
 - Values of type `type` exist only at compile time.
+- A type value represents a runtime type (sized or unsized).
 
 Example:
 
 ```cog
 fn Option(comptime T: type) -> type { ... }
 ```
+
+#### Type values in expressions
+
+In contexts where a value of type `type` is required (e.g. calls to `builtin::size_of`,
+`builtin::type_info`, or `builtin::cast`), a type name path denotes the corresponding type
+value:
+
+```cog
+let n: usize = builtin::size_of(i32);
+let t: type = builtin::type_ptr_const(builtin::type_slice(u8));
+let ti: TypeInfo = builtin::type_info(t);
+let x: i32 = builtin::cast(1, i32);
+```
+
+#### Type-level calls in type positions
+
+In a type position, `Name(T0, T1, ...)` is a **type-level call** (see `spec/syntax.md`).
+
+Semantics (v0.1):
+- The callee `Name` must resolve to a function that returns `type`.
+- All parameters of the callee must be `comptime` parameters of type `type` (v0.1 restriction).
+- The call is evaluated at compile time, and the returned type value is used as the type.
 
 ### `comptime_int` and `comptime_float`
 
@@ -182,17 +205,18 @@ Type aliases do not create new nominal types and do not affect layout.
 
 ## Casts (`as`) and conversion rules
 
-`x as T` is sugar for an intrinsic cast operation. Conceptually:
+`x as T` is sugar for a cast intrinsic. In v0.1, it is defined as:
 
 ```cog
-// not literal syntax; explanatory only
 builtin::cast(x, T)
 ```
+
+See `spec/builtins.md` for how intrinsics and builtins are specified in v0.1.
 
 For v0.1, the following casts are required:
 
 - Integer ↔ integer (with range checks as described in `spec/build_modes.md` when narrowing).
-- Integer ↔ pointer (implementation-defined; permitted for low-level code; may be restricted in `ReleaseSafe`).
+- Integer ↔ pointer (permitted for low-level code; implementation-defined mapping; allowed in all build modes).
 - `mut* T` → `const* T` (also exists as an implicit coercion).
 - Enum[tag(T)] ↔ `T` for fieldless enums (subject to validity checks).
 

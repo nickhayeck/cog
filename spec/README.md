@@ -35,6 +35,7 @@ The reference compiler in this repo may accept additional syntax (or be missing 
 
 - `spec/lexical.md`: tokens, keywords, literals, comments, and whitespace.
 - `spec/syntax.md`: grammar for the core language.
+- `spec/builtins.md`: compiler-provided builtins and intrinsics.
 - `spec/build_modes.md`: UB model, traps, and runtime checks.
 - `spec/modules.md`: crates, modules, `use`, and visibility.
 - `spec/types.md`: types (including `type`, `comptime_int`, pointers, slices, enums/structs, `!`).
@@ -45,7 +46,6 @@ The reference compiler in this repo may accept additional syntax (or be missing 
 - `spec/moves.md`: moves, `Copy` types, and match move behavior.
 - `spec/comptime.md`: comptime contexts, interpreter semantics, determinism, heap + serialization, reflection, and type construction.
 - `spec/stdlib.md`: required core surface (`core::Option`, `core::Result`, `?`, and required runtime symbols).
-- `spec/tests.md`: `mod[test]` and the test runner contract (planned).
 - `spec/future.md`: explicitly planned extensions and open questions.
 
 ## Notation and normative language

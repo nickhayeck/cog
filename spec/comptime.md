@@ -131,7 +131,10 @@ fn Option(comptime T: type) -> type {
 }
 ```
 
-The exact builtin surface for type construction is unstable in v0.1. A v0.1 implementation may provide a minimal subset and expand it over time.
+The type-construction builtin surface is specified in `spec/builtins.md`.
+
+It is considered unstable across pre-1.0 releases (it may evolve), but v0.1 compilers
+aiming for conformance should implement the set described there.
 
 ## Reflection
 
@@ -141,14 +144,25 @@ Cog provides reflection via:
 builtin::type_info(T: type) -> TypeInfo
 ```
 
-`TypeInfo` is a struct type provided by the compiler. Its exact layout is **unstable** in v0.1, but it should include enough information to:
-- distinguish kinds (int/float/pointer/array/struct/enum/function)
-- query size/alignment
-- enumerate fields/variants for structs/enums
+See `spec/builtins.md` for the builtin definition and v0.1 restrictions.
+
+In v0.1, `builtin::type_info` is defined for all runtime types, including unsized types
+like `[T]` and `fn(...) -> R`.
+
+`TypeInfo` is a struct type provided by the compiler. Its v0.1 definition is specified in
+`spec/builtins.md` and includes at least:
+- a kind discriminator
+- size/alignment (with `0`/`0` used for unsized types)
+
+Future versions may extend `TypeInfo` with richer reflection data.
 
 ## Compile-time errors
 
-`builtin::compile_error(msg)` reports a compile-time error if executed during comptime evaluation.
+`builtin::compile_error(msg)` is a comptime-only builtin that aborts compilation with an
+error message.
 
-- `msg` is a string (either `const* [u8]` or `const* u8`; implementations may accept both).
+- It may only appear in comptime contexts.
+- `msg` has type `const* [u8]`.
 - The expression has type `!`.
+
+See `spec/builtins.md` for the canonical builtin definition.
