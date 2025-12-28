@@ -6,6 +6,7 @@
 #include <llvm/IR/DerivedTypes.h>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/Instructions.h>
+#include <llvm/IR/Intrinsics.h>
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/LegacyPassManager.h>
 #include <llvm/IR/Module.h>
@@ -36,7 +37,11 @@
 
 #include "ast.hpp"
 #include "comptime.hpp"
+#include "hir.hpp"
 #include "layout.hpp"
+#include "lower_mir.hpp"
+#include "mir.hpp"
+#include "mir_interp.hpp"
 #include "target.hpp"
 
 namespace cog {
@@ -319,6 +324,7 @@ class LlvmBackend {
 
         build_nominal_types();
         build_function_decls();
+        if (!build_hir_and_mir()) return false;
         build_function_bodies();
         if (opts.emit_main_wrapper) emit_main_shim();
 
@@ -338,6 +344,9 @@ class LlvmBackend {
 
     LayoutEngine layout_;
     ComptimeEvaluator eval_;
+    std::optional<HirCrate> hir_{};
+    std::optional<MirProgram> mir_{};
+    std::unique_ptr<MirInterpreter> mir_eval_{};
 
     llvm::LLVMContext ctx_{};
     std::unique_ptr<llvm::Module> module_{};
@@ -614,13 +623,32 @@ class LlvmBackend {
         }
     }
 
+    bool build_hir_and_mir() {
+        if (hir_ && mir_ && mir_eval_) return true;
+        hir_ = build_hir(crate_, checked_);
+        auto program = lower_mir(session_, *hir_);
+        if (!program) return false;
+        mir_ = std::move(*program);
+        mir_eval_ = std::make_unique<MirInterpreter>(session_, *mir_);
+        return !session_.has_errors();
+    }
+
     void declare_function(const ItemFn* fn) {
         if (!fn || !fn->decl || !fn->decl->sig) return;
         if (fn_decls_.contains(fn)) return;
 
         auto sig_it = checked_.fn_info.find(fn);
         if (sig_it == checked_.fn_info.end()) return;
-        llvm::FunctionType* fty = llvm_fn_type(sig_it->second);
+        const FnInfo& sig = sig_it->second;
+        if (!sig.comptime_params.empty() &&
+            std::any_of(sig.comptime_params.begin(), sig.comptime_params.end(),
+                        [](bool b) { return b; })) {
+            // Functions with comptime parameters are not first-class values yet
+            // (and therefore do not have a stable runtime symbol). They are
+            // emitted on demand as residualized `$ct...` variants.
+            return;
+        }
+        llvm::FunctionType* fty = llvm_fn_type(sig);
 
         const std::string symbol = locator_.symbol_for(fn);
         llvm::Function* f = llvm::Function::Create(
@@ -705,26 +733,1309 @@ class LlvmBackend {
         comptime_specializations_.insert({name, specialized});
 
         // Emit the residualized body immediately.
-        if (fn->body) {
-            llvm::IRBuilder<>::InsertPointGuard guard(builder_);
-            emit_comptime_specialization(fn, specialized, sig, comptime_args,
-                                         use_site);
+        if (fn->body && hir_ && mir_) {
+            auto dit = hir_->def_ids.find(static_cast<const Item*>(fn));
+            if (dit != hir_->def_ids.end()) {
+                if (const MirBody* body = mir_->body_for_fn(dit->second)) {
+                    llvm::IRBuilder<>::InsertPointGuard guard(builder_);
+                    mir_emit_body(specialized, *body, sig, &comptime_args,
+                                  use_site);
+                }
+            }
         }
         return specialized;
     }
 
     void build_function_bodies() {
+        // v0.0.20: runtime codegen is driven by MIR, not the AST.
+        if (!hir_ || !mir_) return;
         for (ModuleId mid = 0; mid < crate_.modules.size(); mid++) {
             for (const Item* item : crate_.modules[mid].items) {
                 if (!item) continue;
                 if (item->kind == AstNodeKind::ItemFn)
-                    emit_function(static_cast<const ItemFn*>(item), mid);
+                    mir_emit_function(static_cast<const ItemFn*>(item));
                 if (item->kind == AstNodeKind::ItemImplInherent) {
                     auto* impl = static_cast<const ItemImplInherent*>(item);
-                    for (const ItemFn* m : impl->methods) emit_function(m, mid);
+                    for (const ItemFn* m : impl->methods) mir_emit_function(m);
                 }
             }
         }
+    }
+
+    // ---- MIR → LLVM lowering (v0.0.20) ----
+
+    struct MirFnCtx {
+        llvm::Function* fn = nullptr;
+        const MirBody* body = nullptr;
+        std::vector<llvm::AllocaInst*> locals{};
+        std::vector<llvm::BasicBlock*> blocks{};
+    };
+
+    struct MirPlaceAddr {
+        llvm::Value* ptr = nullptr;  // pointer to current place
+        TypeId ty = 0;
+
+        struct EnumPayload {
+            TypeId enum_ty = 0;
+            std::uint32_t variant_index = 0;
+        };
+        std::optional<EnumPayload> enum_payload{};
+    };
+
+    const ItemFn* fn_def(DefId def) const {
+        if (!hir_) return nullptr;
+        const HirDef* hd = hir_->def(def);
+        if (!hd || hd->kind != HirDefKind::Fn || !hd->ast) return nullptr;
+        if (hd->ast->kind != AstNodeKind::ItemFn) return nullptr;
+        return static_cast<const ItemFn*>(hd->ast);
+    }
+
+    const ItemStatic* static_def(DefId def) const {
+        if (!hir_) return nullptr;
+        const HirDef* hd = hir_->def(def);
+        if (!hd || hd->kind != HirDefKind::Static || !hd->ast) return nullptr;
+        if (hd->ast->kind != AstNodeKind::ItemStatic) return nullptr;
+        return static_cast<const ItemStatic*>(hd->ast);
+    }
+
+    TypeId type_of_static(const ItemStatic* st) const {
+        if (!st) return checked_.types.error();
+        auto it = checked_.static_types.find(st);
+        return it == checked_.static_types.end() ? checked_.types.error()
+                                                 : it->second;
+    }
+
+    TypeId type_of_const(const ItemConst* c) const {
+        if (!c) return checked_.types.error();
+        auto it = checked_.const_types.find(c);
+        return it == checked_.const_types.end() ? checked_.types.error()
+                                                : it->second;
+    }
+
+    TypeId type_of_fn_value(const ItemFn* fn) const {
+        if (!fn) return checked_.types.error();
+        auto it = checked_.fn_info.find(fn);
+        if (it == checked_.fn_info.end()) return checked_.types.error();
+        const FnInfo& sig = it->second;
+        TypeId fn_ty = checked_.types.fn(
+            std::vector<TypeId>(sig.params.begin(), sig.params.end()), sig.ret);
+        return checked_.types.ptr(Mutability::Const, fn_ty);
+    }
+
+    bool has_comptime_params(const FnInfo& sig) const {
+        return !sig.comptime_params.empty() &&
+               std::any_of(sig.comptime_params.begin(),
+                           sig.comptime_params.end(), [](bool b) { return b; });
+    }
+
+    TypeId mir_place_type(const MirFnCtx& f, const MirPlace& place) const {
+        if (!f.body) return checked_.types.error();
+        TypeId ty = checked_.types.error();
+        if (std::holds_alternative<MirPlace::Local>(place.base)) {
+            MirLocalId id = std::get<MirPlace::Local>(place.base).local;
+            if (id < f.body->locals.size())
+                ty = f.body->locals[static_cast<size_t>(id)].ty;
+        } else if (std::holds_alternative<MirPlace::Static>(place.base)) {
+            const ItemStatic* st =
+                static_def(std::get<MirPlace::Static>(place.base).def);
+            ty = type_of_static(st);
+        }
+
+        std::optional<std::pair<TypeId, std::uint32_t>> enum_payload{};
+        for (const MirProjection& p : place.projection) {
+            if (std::holds_alternative<MirProjection::Downcast>(p.data)) {
+                const TypeData& td = checked_.types.get(ty);
+                if (td.kind != TypeKind::Enum || !td.enum_def) break;
+                enum_payload = {
+                    ty,
+                    std::get<MirProjection::Downcast>(p.data).variant_index};
+                continue;
+            }
+            if (std::holds_alternative<MirProjection::Deref>(p.data)) {
+                const TypeData& td = checked_.types.get(ty);
+                if (td.kind != TypeKind::Ptr) break;
+                ty = td.pointee;
+                enum_payload.reset();
+                continue;
+            }
+            if (std::holds_alternative<MirProjection::Index>(p.data)) {
+                const TypeData& td = checked_.types.get(ty);
+                if (td.kind == TypeKind::Array) {
+                    ty = td.elem;
+                    enum_payload.reset();
+                    continue;
+                }
+                if (td.kind == TypeKind::Ptr) {
+                    const TypeData& pd = checked_.types.get(td.pointee);
+                    if (pd.kind == TypeKind::Slice) {
+                        ty = pd.elem;
+                        enum_payload.reset();
+                        continue;
+                    }
+                    ty = td.pointee;
+                    enum_payload.reset();
+                    continue;
+                }
+                break;
+            }
+            if (std::holds_alternative<MirProjection::Field>(p.data)) {
+                const std::uint32_t index =
+                    std::get<MirProjection::Field>(p.data).index;
+
+                if (enum_payload) {
+                    const TypeData& td =
+                        checked_.types.get(enum_payload->first);
+                    if (td.kind != TypeKind::Enum || !td.enum_def) break;
+                    auto ei_it = checked_.enum_info.find(td.enum_def);
+                    if (ei_it == checked_.enum_info.end()) break;
+                    const EnumInfo& ei = ei_it->second;
+                    if (enum_payload->second >= ei.variants_in_order.size())
+                        break;
+                    const std::string& vname =
+                        ei.variants_in_order[enum_payload->second];
+                    auto vit = ei.variants.find(vname);
+                    if (vit == ei.variants.end()) break;
+                    const VariantInfo& vi = vit->second;
+                    if (index >= vi.payload.size()) break;
+                    ty = vi.payload[index];
+                    enum_payload.reset();
+                    continue;
+                }
+
+                const TypeData& td = checked_.types.get(ty);
+                if (td.kind == TypeKind::Struct && td.struct_def) {
+                    auto si_it = checked_.struct_info.find(td.struct_def);
+                    if (si_it == checked_.struct_info.end()) break;
+                    if (index >= si_it->second.fields_in_order.size()) break;
+                    ty = si_it->second.fields_in_order[index].type;
+                    continue;
+                }
+                if (td.kind == TypeKind::Tuple) {
+                    if (index >= td.tuple_elems.size()) break;
+                    ty = td.tuple_elems[index];
+                    continue;
+                }
+                break;
+            }
+        }
+        return ty;
+    }
+
+    TypeId mir_operand_type(const MirFnCtx& f, const MirOperand& op) const {
+        if (std::holds_alternative<MirOperand::Const>(op.data))
+            return std::get<MirOperand::Const>(op.data).ty;
+        if (std::holds_alternative<MirOperand::Copy>(op.data))
+            return mir_place_type(f, std::get<MirOperand::Copy>(op.data).place);
+        if (std::holds_alternative<MirOperand::Move>(op.data))
+            return mir_place_type(f, std::get<MirOperand::Move>(op.data).place);
+        if (std::holds_alternative<MirOperand::Fn>(op.data)) {
+            const ItemFn* fn = fn_def(std::get<MirOperand::Fn>(op.data).def);
+            return type_of_fn_value(fn);
+        }
+        if (std::holds_alternative<MirOperand::ConstItem>(op.data)) {
+            DefId def = std::get<MirOperand::ConstItem>(op.data).def;
+            if (mir_) {
+                if (const MirBody* b = mir_->body_for_const(def))
+                    return b->ret_ty;
+            }
+            const HirDef* hd = hir_ ? hir_->def(def) : nullptr;
+            if (hd && hd->ast && hd->ast->kind == AstNodeKind::ItemConst)
+                return type_of_const(static_cast<const ItemConst*>(hd->ast));
+            return checked_.types.error();
+        }
+        return checked_.types.error();
+    }
+
+    CgValue mir_cast_value(const CgValue& from, TypeId to_ty) {
+        TypeId from_ty = from.type;
+        const TypeData& from_d = checked_.types.get(from_ty);
+        const TypeData& to_d = checked_.types.get(to_ty);
+
+        auto is_slice_ptr = [&](const TypeData& d) -> bool {
+            if (d.kind != TypeKind::Ptr) return false;
+            return checked_.types.get(d.pointee).kind == TypeKind::Slice;
+        };
+        const bool from_is_slice_ptr = is_slice_ptr(from_d);
+        const bool to_is_slice_ptr = is_slice_ptr(to_d);
+
+        llvm::Type* dst_ll_ty = llvm_type(to_ty);
+        if (!from.value) return CgValue{.type = to_ty, .value = nullptr};
+
+        if (from_d.kind == TypeKind::Float && to_d.kind == TypeKind::Float) {
+            if (from_d.float_kind == to_d.float_kind)
+                return CgValue{.type = to_ty, .value = from.value};
+            if (from_d.float_kind == FloatKind::F32 &&
+                to_d.float_kind == FloatKind::F64) {
+                return CgValue{
+                    .type = to_ty,
+                    .value = builder_.CreateFPExt(from.value, dst_ll_ty)};
+            }
+            if (from_d.float_kind == FloatKind::F64 &&
+                to_d.float_kind == FloatKind::F32) {
+                return CgValue{
+                    .type = to_ty,
+                    .value = builder_.CreateFPTrunc(from.value, dst_ll_ty)};
+            }
+            return CgValue{.type = to_ty, .value = from.value};
+        }
+        if (from_d.kind == TypeKind::Int && to_d.kind == TypeKind::Float) {
+            bool signed_from = is_signed_int(from_d.int_kind);
+            llvm::Value* out =
+                signed_from ? builder_.CreateSIToFP(from.value, dst_ll_ty)
+                            : builder_.CreateUIToFP(from.value, dst_ll_ty);
+            return CgValue{.type = to_ty, .value = out};
+        }
+        if (from_d.kind == TypeKind::Float && to_d.kind == TypeKind::Int) {
+            bool signed_to = is_signed_int(to_d.int_kind);
+            llvm::Value* out =
+                signed_to ? builder_.CreateFPToSI(from.value, dst_ll_ty)
+                          : builder_.CreateFPToUI(from.value, dst_ll_ty);
+            return CgValue{.type = to_ty, .value = out};
+        }
+        if (from_d.kind == TypeKind::Int && to_d.kind == TypeKind::Int) {
+            std::uint32_t from_bits = int_bits(from_d.int_kind, ptr_bits());
+            std::uint32_t to_bits = int_bits(to_d.int_kind, ptr_bits());
+            if (from_bits == to_bits)
+                return CgValue{.type = to_ty, .value = from.value};
+            bool signed_from = is_signed_int(from_d.int_kind);
+            if (from_bits < to_bits) {
+                llvm::Value* out =
+                    signed_from ? builder_.CreateSExt(from.value, dst_ll_ty)
+                                : builder_.CreateZExt(from.value, dst_ll_ty);
+                return CgValue{.type = to_ty, .value = out};
+            }
+            return CgValue{
+                .type = to_ty,
+                .value = builder_.CreateTrunc(from.value, dst_ll_ty)};
+        }
+
+        if (from_d.kind == TypeKind::Int && to_d.kind == TypeKind::Ptr) {
+            if (to_is_slice_ptr) {
+                llvm::Value* p = builder_.CreateIntToPtr(from.value, ptr_ty());
+                llvm::Value* len =
+                    llvm::ConstantInt::get(llvm_int_ty(IntKind::Usize), 0);
+                llvm::Value* agg = llvm::UndefValue::get(llvm_type(to_ty));
+                agg = builder_.CreateInsertValue(agg, p, {0});
+                agg = builder_.CreateInsertValue(agg, len, {1});
+                return CgValue{.type = to_ty, .value = agg};
+            }
+            return CgValue{
+                .type = to_ty,
+                .value = builder_.CreateIntToPtr(from.value, ptr_ty())};
+        }
+
+        if (from_d.kind == TypeKind::Ptr && to_d.kind == TypeKind::Int) {
+            if (from_is_slice_ptr) {
+                llvm::Value* p = builder_.CreateExtractValue(from.value, {0});
+                return CgValue{.type = to_ty,
+                               .value = builder_.CreatePtrToInt(p, dst_ll_ty)};
+            }
+            return CgValue{
+                .type = to_ty,
+                .value = builder_.CreatePtrToInt(from.value, dst_ll_ty)};
+        }
+
+        if (from_d.kind == TypeKind::Ptr && to_d.kind == TypeKind::Ptr) {
+            if (from_is_slice_ptr && to_is_slice_ptr) {
+                return CgValue{.type = to_ty, .value = from.value};
+            }
+            if (from_is_slice_ptr && !to_is_slice_ptr) {
+                llvm::Value* p = builder_.CreateExtractValue(from.value, {0});
+                return CgValue{.type = to_ty,
+                               .value = builder_.CreateBitCast(p, ptr_ty())};
+            }
+            if (!from_is_slice_ptr && to_is_slice_ptr) {
+                std::uint64_t len_value = 0;
+                const TypeData& fp = checked_.types.get(from_d.pointee);
+                if (fp.kind == TypeKind::Array) {
+                    if (fp.array_len_value) {
+                        len_value = *fp.array_len_value;
+                    } else if (fp.array_len_expr) {
+                        auto it = checked_.array_lens.find(fp.array_len_expr);
+                        if (it != checked_.array_lens.end()) {
+                            len_value = it->second;
+                        } else {
+                            error(Span{},
+                                  "array length is not a known comptime "
+                                  "constant during array-to-slice coercion");
+                        }
+                    }
+                }
+                llvm::Value* len = llvm::ConstantInt::get(
+                    llvm_int_ty(IntKind::Usize), len_value);
+                llvm::Value* agg = llvm::UndefValue::get(llvm_type(to_ty));
+                agg = builder_.CreateInsertValue(agg, from.value, {0});
+                agg = builder_.CreateInsertValue(agg, len, {1});
+                return CgValue{.type = to_ty, .value = agg};
+            }
+
+            return CgValue{
+                .type = to_ty,
+                .value = builder_.CreateBitCast(from.value, ptr_ty())};
+        }
+
+        return CgValue{.type = to_ty, .value = from.value};
+    }
+
+    CgValue mir_coerce_value(CgValue v, TypeId to_ty, Span use_site) {
+        if (checked_.types.equal(v.type, to_ty)) return v;
+        if (!checked_.types.can_coerce(v.type, to_ty)) {
+            error(use_site, "type mismatch: expected `" +
+                                checked_.types.to_string(to_ty) + "`, got `" +
+                                checked_.types.to_string(v.type) + "`");
+            return CgValue{.type = to_ty, .value = zero_init(llvm_type(to_ty))};
+        }
+        return mir_cast_value(v, to_ty);
+    }
+
+    std::optional<ComptimeValue> mir_eval_comptime_operand(const MirFnCtx& f,
+                                                           const MirOperand& op,
+                                                           TypeId expected_ty,
+                                                           Span use_site) {
+        (void)expected_ty;
+        if (!mir_eval_) return std::nullopt;
+        if (std::holds_alternative<MirOperand::Const>(op.data)) {
+            const auto& c = std::get<MirOperand::Const>(op.data);
+            return std::visit(
+                [&](const auto& v) -> std::optional<ComptimeValue> {
+                    using T = std::decay_t<decltype(v)>;
+                    if constexpr (std::is_same_v<T, MirConst::Unit>) {
+                        return ComptimeValue::unit();
+                    } else if constexpr (std::is_same_v<T, MirConst::Bool>) {
+                        return ComptimeValue::bool_(v.v);
+                    } else if constexpr (std::is_same_v<T, MirConst::Int>) {
+                        return ComptimeValue::int_(v.v);
+                    } else if constexpr (std::is_same_v<T, MirConst::Float>) {
+                        return ComptimeValue::float_(v.v);
+                    } else if constexpr (std::is_same_v<T, MirConst::String>) {
+                        return ComptimeValue::string(v.bytes);
+                    }
+                    return std::nullopt;
+                },
+                c.value.data);
+        }
+        if (std::holds_alternative<MirOperand::ConstItem>(op.data)) {
+            DefId def = std::get<MirOperand::ConstItem>(op.data).def;
+            return mir_eval_->eval_const(def);
+        }
+
+        // v0.0.20 MVP: support only literal/const-item comptime args at codegen
+        // time. More general MIR residualization happens in later milestones.
+        error(use_site,
+              "unsupported comptime argument form in MIR codegen "
+              "(expected a literal or `const` item)");
+        return std::nullopt;
+    }
+
+    MirPlaceAddr mir_place_addr(MirFnCtx& f, const MirPlace& place) {
+        MirPlaceAddr out{};
+        out.ty = checked_.types.error();
+
+        if (std::holds_alternative<MirPlace::Local>(place.base)) {
+            MirLocalId id = std::get<MirPlace::Local>(place.base).local;
+            if (id < f.locals.size() && f.body && id < f.body->locals.size()) {
+                out.ptr = f.locals[static_cast<size_t>(id)];
+                out.ty = f.body->locals[static_cast<size_t>(id)].ty;
+            }
+        } else if (std::holds_alternative<MirPlace::Static>(place.base)) {
+            DefId def = std::get<MirPlace::Static>(place.base).def;
+            const ItemStatic* st = static_def(def);
+            llvm::GlobalVariable* g =
+                st ? get_or_create_static_global(st) : nullptr;
+            out.ptr = g;
+            out.ty = type_of_static(st);
+        }
+
+        for (const MirProjection& proj : place.projection) {
+            if (!out.ptr) break;
+
+            if (std::holds_alternative<MirProjection::Downcast>(proj.data)) {
+                const std::uint32_t variant_index =
+                    std::get<MirProjection::Downcast>(proj.data).variant_index;
+                const TypeData& td = checked_.types.get(out.ty);
+                if (td.kind != TypeKind::Enum || !td.enum_def) {
+                    error(Span{}, "invalid enum downcast in MIR place");
+                    break;
+                }
+                out.enum_payload = MirPlaceAddr::EnumPayload{
+                    .enum_ty = out.ty, .variant_index = variant_index};
+
+                auto el = layout_.enum_layout(td.enum_def, Span{});
+                if (!el) break;
+                llvm::StructType* ll_enum =
+                    llvm::cast<llvm::StructType>(llvm_type(out.ty));
+                out.ptr = builder_.CreateStructGEP(ll_enum, out.ptr, 1);
+                continue;
+            }
+
+            if (std::holds_alternative<MirProjection::Deref>(proj.data)) {
+                const TypeData& td = checked_.types.get(out.ty);
+                if (td.kind != TypeKind::Ptr) {
+                    error(Span{}, "invalid deref projection in MIR place");
+                    break;
+                }
+                llvm::Value* p = emit_load(out.ty, out.ptr);
+                out.ptr = p;
+                out.ty = td.pointee;
+                out.enum_payload.reset();
+                continue;
+            }
+
+            if (std::holds_alternative<MirProjection::Index>(proj.data)) {
+                MirLocalId idx_local =
+                    std::get<MirProjection::Index>(proj.data).index_local;
+                if (!f.body || idx_local >= f.locals.size() ||
+                    idx_local >= f.body->locals.size()) {
+                    error(Span{}, "invalid MIR index local");
+                    break;
+                }
+                TypeId idx_ty =
+                    f.body->locals[static_cast<size_t>(idx_local)].ty;
+                llvm::Value* idx_val =
+                    emit_load(idx_ty, f.locals[static_cast<size_t>(idx_local)]);
+
+                const TypeData& td = checked_.types.get(out.ty);
+                if (td.kind == TypeKind::Array) {
+                    llvm::Value* zero =
+                        llvm::ConstantInt::get(llvm_int_ty(IntKind::Usize), 0);
+                    out.ptr = builder_.CreateInBoundsGEP(
+                        llvm_type(out.ty), out.ptr, {zero, idx_val});
+                    out.ty = td.elem;
+                    out.enum_payload.reset();
+                    continue;
+                }
+                if (td.kind == TypeKind::Ptr) {
+                    const TypeData& pd = checked_.types.get(td.pointee);
+                    if (pd.kind == TypeKind::Slice) {
+                        llvm::Value* slice_val = emit_load(out.ty, out.ptr);
+                        llvm::Value* data_ptr =
+                            builder_.CreateExtractValue(slice_val, {0});
+                        out.ptr = builder_.CreateInBoundsGEP(
+                            llvm_type(pd.elem), data_ptr, {idx_val});
+                        out.ty = pd.elem;
+                        out.enum_payload.reset();
+                        continue;
+                    }
+                    llvm::Value* base_ptr_val = emit_load(out.ty, out.ptr);
+                    out.ptr = builder_.CreateInBoundsGEP(
+                        llvm_type(td.pointee), base_ptr_val, {idx_val});
+                    out.ty = td.pointee;
+                    out.enum_payload.reset();
+                    continue;
+                }
+                error(Span{}, "invalid index projection in MIR place");
+                break;
+            }
+
+            if (std::holds_alternative<MirProjection::Field>(proj.data)) {
+                const std::uint32_t index =
+                    std::get<MirProjection::Field>(proj.data).index;
+
+                if (out.enum_payload) {
+                    const TypeData& td =
+                        checked_.types.get(out.enum_payload->enum_ty);
+                    if (td.kind != TypeKind::Enum || !td.enum_def) break;
+                    auto ei_it = checked_.enum_info.find(td.enum_def);
+                    if (ei_it == checked_.enum_info.end()) break;
+                    const EnumInfo& ei = ei_it->second;
+                    if (out.enum_payload->variant_index >=
+                        ei.variants_in_order.size())
+                        break;
+                    const std::string& vname =
+                        ei.variants_in_order[out.enum_payload->variant_index];
+                    auto vit = ei.variants.find(vname);
+                    if (vit == ei.variants.end()) break;
+                    const VariantInfo& vi = vit->second;
+                    if (index >= vi.payload.size()) break;
+                    TypeId field_ty = vi.payload[index];
+
+                    std::uint64_t off = 0;
+                    for (size_t i = 0; i < index; i++) {
+                        TypeId pt = vi.payload[i];
+                        auto al = layout_.align_of(pt, Span{});
+                        auto sz = layout_.size_of(pt, Span{});
+                        if (!al || !sz) break;
+                        off = align_up(off, *al);
+                        off += *sz;
+                    }
+                    auto al = layout_.align_of(field_ty, Span{});
+                    if (al) off = align_up(off, *al);
+
+                    out.ptr = builder_.CreateInBoundsGEP(
+                        llvm::Type::getInt8Ty(ctx_), out.ptr,
+                        builder_.getInt64(static_cast<std::uint64_t>(off)));
+                    out.ty = field_ty;
+                    out.enum_payload.reset();
+                    continue;
+                }
+
+                const TypeData& td = checked_.types.get(out.ty);
+                if (td.kind == TypeKind::Struct && td.struct_def) {
+                    auto si_it = checked_.struct_info.find(td.struct_def);
+                    if (si_it == checked_.struct_info.end()) break;
+                    if (index >= si_it->second.fields_in_order.size()) break;
+                    llvm::StructType* ll_struct =
+                        llvm::cast<llvm::StructType>(llvm_type(out.ty));
+                    out.ptr = builder_.CreateStructGEP(
+                        ll_struct, out.ptr, static_cast<unsigned>(index));
+                    out.ty = si_it->second.fields_in_order[index].type;
+                    continue;
+                }
+                if (td.kind == TypeKind::Tuple) {
+                    if (index >= td.tuple_elems.size()) break;
+                    llvm::StructType* ll_tuple =
+                        llvm::cast<llvm::StructType>(llvm_type(out.ty));
+                    out.ptr = builder_.CreateStructGEP(
+                        ll_tuple, out.ptr, static_cast<unsigned>(index));
+                    out.ty = td.tuple_elems[index];
+                    continue;
+                }
+                error(Span{}, "invalid field projection in MIR place");
+                break;
+            }
+        }
+
+        return out;
+    }
+
+    CgValue mir_emit_operand(MirFnCtx& f, const MirOperand& op) {
+        if (std::holds_alternative<MirOperand::Const>(op.data)) {
+            const auto& c = std::get<MirOperand::Const>(op.data);
+            llvm::Constant* ll = zero_init(llvm_type(c.ty));
+            std::visit(
+                [&](const auto& v) {
+                    using T = std::decay_t<decltype(v)>;
+                    if constexpr (std::is_same_v<T, MirConst::Unit>) {
+                        ll = zero_init(llvm_type(c.ty));
+                    } else if constexpr (std::is_same_v<T, MirConst::Bool>) {
+                        ll = llvm::ConstantInt::get(llvm_type(c.ty),
+                                                    v.v ? 1 : 0);
+                    } else if constexpr (std::is_same_v<T, MirConst::Int>) {
+                        ll = llvm::ConstantInt::get(
+                            llvm_type(c.ty), static_cast<std::uint64_t>(v.v),
+                            /*isSigned=*/true);
+                    } else if constexpr (std::is_same_v<T, MirConst::Float>) {
+                        ll = llvm::ConstantFP::get(llvm_type(c.ty), v.v);
+                    } else if constexpr (std::is_same_v<T, MirConst::String>) {
+                        (void)v.is_c_string;
+                        ll = llvm_const_value(
+                            c.ty, ComptimeValue::string(v.bytes), Span{});
+                    }
+                },
+                c.value.data);
+            return CgValue{.type = c.ty, .value = ll};
+        }
+        if (std::holds_alternative<MirOperand::Copy>(op.data)) {
+            const auto& c = std::get<MirOperand::Copy>(op.data);
+            TypeId ty = mir_place_type(f, c.place);
+            MirPlaceAddr addr = mir_place_addr(f, c.place);
+            return CgValue{.type = ty, .value = emit_load(ty, addr.ptr)};
+        }
+        if (std::holds_alternative<MirOperand::Move>(op.data)) {
+            const auto& c = std::get<MirOperand::Move>(op.data);
+            TypeId ty = mir_place_type(f, c.place);
+            MirPlaceAddr addr = mir_place_addr(f, c.place);
+            return CgValue{.type = ty, .value = emit_load(ty, addr.ptr)};
+        }
+        if (std::holds_alternative<MirOperand::Fn>(op.data)) {
+            DefId def = std::get<MirOperand::Fn>(op.data).def;
+            const ItemFn* fn = fn_def(def);
+            llvm::Function* callee = fn ? llvm_fn(fn) : nullptr;
+            if (!callee)
+                return CgValue{.type = checked_.types.error(),
+                               .value = nullptr};
+            return CgValue{.type = type_of_fn_value(fn),
+                           .value = builder_.CreateBitCast(callee, ptr_ty())};
+        }
+        if (std::holds_alternative<MirOperand::ConstItem>(op.data)) {
+            DefId def = std::get<MirOperand::ConstItem>(op.data).def;
+            const MirBody* b = mir_ ? mir_->body_for_const(def) : nullptr;
+            TypeId ty = b ? b->ret_ty : checked_.types.error();
+            if (!mir_eval_)
+                return CgValue{.type = ty, .value = zero_init(llvm_type(ty))};
+            auto v = mir_eval_->eval_const(def);
+            if (!v) {
+                return CgValue{.type = ty, .value = zero_init(llvm_type(ty))};
+            }
+            llvm::Constant* c = llvm_const_value(ty, *v, Span{});
+            return CgValue{.type = ty, .value = c};
+        }
+        error(Span{}, "unsupported MIR operand in LLVM lowering");
+        return CgValue{.type = checked_.types.error(), .value = nullptr};
+    }
+
+    CgValue mir_emit_rvalue(MirFnCtx& f, const MirRvalue& rv, TypeId expected,
+                            Span use_site) {
+        if (std::holds_alternative<MirRvalue::Use>(rv.data)) {
+            CgValue v =
+                mir_emit_operand(f, std::get<MirRvalue::Use>(rv.data).op);
+            return mir_coerce_value(v, expected, use_site);
+        }
+        if (std::holds_alternative<MirRvalue::Unary>(rv.data)) {
+            const auto& u = std::get<MirRvalue::Unary>(rv.data);
+            CgValue ov = mir_emit_operand(f, u.operand);
+            TypeId op_ty = ov.type;
+            const TypeData& td = checked_.types.get(op_ty);
+            switch (u.op) {
+                case UnaryOp::Neg:
+                    if (td.kind == TypeKind::Int)
+                        return CgValue{.type = op_ty,
+                                       .value = builder_.CreateNeg(ov.value)};
+                    if (td.kind == TypeKind::Float)
+                        return CgValue{.type = op_ty,
+                                       .value = builder_.CreateFNeg(ov.value)};
+                    break;
+                case UnaryOp::Not:
+                    return CgValue{.type = checked_.types.bool_(),
+                                   .value = builder_.CreateNot(ov.value)};
+                case UnaryOp::BitNot:
+                    return CgValue{.type = op_ty,
+                                   .value = builder_.CreateNot(ov.value)};
+                case UnaryOp::Deref: {
+                    if (td.kind != TypeKind::Ptr) break;
+                    TypeId pointee = td.pointee;
+                    llvm::Value* v =
+                        builder_.CreateLoad(llvm_type(pointee), ov.value);
+                    return CgValue{.type = pointee, .value = v};
+                }
+                case UnaryOp::AddrOf:
+                case UnaryOp::AddrOfMut:
+                    break;
+            }
+            error(use_site, "unsupported unary op in MIR codegen");
+            return CgValue{.type = expected,
+                           .value = zero_init(llvm_type(expected))};
+        }
+        if (std::holds_alternative<MirRvalue::Binary>(rv.data)) {
+            const auto& b = std::get<MirRvalue::Binary>(rv.data);
+            CgValue lv = mir_emit_operand(f, b.lhs);
+            CgValue rvv = mir_emit_operand(f, b.rhs);
+            if (!checked_.types.equal(lv.type, rvv.type) &&
+                checked_.types.can_coerce(rvv.type, lv.type)) {
+                rvv = mir_cast_value(rvv, lv.type);
+            }
+            TypeId op_ty = lv.type;
+            const TypeData& td = checked_.types.get(op_ty);
+            llvm::Value* out = nullptr;
+
+            auto shift_kind = [&]() -> bool {
+                return b.op == BinaryOp::Shl || b.op == BinaryOp::Shr;
+            };
+
+            if (td.kind == TypeKind::Int || td.kind == TypeKind::Bool ||
+                shift_kind()) {
+                switch (b.op) {
+                    case BinaryOp::Add:
+                        out = builder_.CreateAdd(lv.value, rvv.value);
+                        break;
+                    case BinaryOp::Sub:
+                        out = builder_.CreateSub(lv.value, rvv.value);
+                        break;
+                    case BinaryOp::Mul:
+                        out = builder_.CreateMul(lv.value, rvv.value);
+                        break;
+                    case BinaryOp::Div: {
+                        bool signed_int = td.kind == TypeKind::Int &&
+                                          is_signed_int(td.int_kind);
+                        out = signed_int
+                                  ? builder_.CreateSDiv(lv.value, rvv.value)
+                                  : builder_.CreateUDiv(lv.value, rvv.value);
+                        break;
+                    }
+                    case BinaryOp::Mod: {
+                        bool signed_int = td.kind == TypeKind::Int &&
+                                          is_signed_int(td.int_kind);
+                        out = signed_int
+                                  ? builder_.CreateSRem(lv.value, rvv.value)
+                                  : builder_.CreateURem(lv.value, rvv.value);
+                        break;
+                    }
+                    case BinaryOp::BitAnd:
+                        out = builder_.CreateAnd(lv.value, rvv.value);
+                        break;
+                    case BinaryOp::BitOr:
+                        out = builder_.CreateOr(lv.value, rvv.value);
+                        break;
+                    case BinaryOp::BitXor:
+                        out = builder_.CreateXor(lv.value, rvv.value);
+                        break;
+                    case BinaryOp::Shl:
+                        out = builder_.CreateShl(lv.value, rvv.value);
+                        break;
+                    case BinaryOp::Shr: {
+                        bool signed_int = td.kind == TypeKind::Int &&
+                                          is_signed_int(td.int_kind);
+                        out = signed_int
+                                  ? builder_.CreateAShr(lv.value, rvv.value)
+                                  : builder_.CreateLShr(lv.value, rvv.value);
+                        break;
+                    }
+                    case BinaryOp::Eq:
+                        out = builder_.CreateICmpEQ(lv.value, rvv.value);
+                        return CgValue{.type = checked_.types.bool_(),
+                                       .value = out};
+                    case BinaryOp::Ne:
+                        out = builder_.CreateICmpNE(lv.value, rvv.value);
+                        return CgValue{.type = checked_.types.bool_(),
+                                       .value = out};
+                    case BinaryOp::Lt:
+                        out = (td.kind == TypeKind::Int &&
+                               !is_signed_int(td.int_kind))
+                                  ? builder_.CreateICmpULT(lv.value, rvv.value)
+                                  : builder_.CreateICmpSLT(lv.value, rvv.value);
+                        return CgValue{.type = checked_.types.bool_(),
+                                       .value = out};
+                    case BinaryOp::Le:
+                        out = (td.kind == TypeKind::Int &&
+                               !is_signed_int(td.int_kind))
+                                  ? builder_.CreateICmpULE(lv.value, rvv.value)
+                                  : builder_.CreateICmpSLE(lv.value, rvv.value);
+                        return CgValue{.type = checked_.types.bool_(),
+                                       .value = out};
+                    case BinaryOp::Gt:
+                        out = (td.kind == TypeKind::Int &&
+                               !is_signed_int(td.int_kind))
+                                  ? builder_.CreateICmpUGT(lv.value, rvv.value)
+                                  : builder_.CreateICmpSGT(lv.value, rvv.value);
+                        return CgValue{.type = checked_.types.bool_(),
+                                       .value = out};
+                    case BinaryOp::Ge:
+                        out = (td.kind == TypeKind::Int &&
+                               !is_signed_int(td.int_kind))
+                                  ? builder_.CreateICmpUGE(lv.value, rvv.value)
+                                  : builder_.CreateICmpSGE(lv.value, rvv.value);
+                        return CgValue{.type = checked_.types.bool_(),
+                                       .value = out};
+                    case BinaryOp::And:
+                    case BinaryOp::Or:
+                        break;
+                }
+                return CgValue{.type = op_ty, .value = out};
+            }
+
+            if (td.kind == TypeKind::Float) {
+                switch (b.op) {
+                    case BinaryOp::Add:
+                        out = builder_.CreateFAdd(lv.value, rvv.value);
+                        break;
+                    case BinaryOp::Sub:
+                        out = builder_.CreateFSub(lv.value, rvv.value);
+                        break;
+                    case BinaryOp::Mul:
+                        out = builder_.CreateFMul(lv.value, rvv.value);
+                        break;
+                    case BinaryOp::Div:
+                        out = builder_.CreateFDiv(lv.value, rvv.value);
+                        break;
+                    case BinaryOp::Eq:
+                        out = builder_.CreateFCmpOEQ(lv.value, rvv.value);
+                        return CgValue{.type = checked_.types.bool_(),
+                                       .value = out};
+                    case BinaryOp::Ne:
+                        out = builder_.CreateFCmpONE(lv.value, rvv.value);
+                        return CgValue{.type = checked_.types.bool_(),
+                                       .value = out};
+                    case BinaryOp::Lt:
+                        out = builder_.CreateFCmpOLT(lv.value, rvv.value);
+                        return CgValue{.type = checked_.types.bool_(),
+                                       .value = out};
+                    case BinaryOp::Le:
+                        out = builder_.CreateFCmpOLE(lv.value, rvv.value);
+                        return CgValue{.type = checked_.types.bool_(),
+                                       .value = out};
+                    case BinaryOp::Gt:
+                        out = builder_.CreateFCmpOGT(lv.value, rvv.value);
+                        return CgValue{.type = checked_.types.bool_(),
+                                       .value = out};
+                    case BinaryOp::Ge:
+                        out = builder_.CreateFCmpOGE(lv.value, rvv.value);
+                        return CgValue{.type = checked_.types.bool_(),
+                                       .value = out};
+                    default:
+                        break;
+                }
+                return CgValue{.type = op_ty, .value = out};
+            }
+
+            if (td.kind == TypeKind::Ptr &&
+                (b.op == BinaryOp::Eq || b.op == BinaryOp::Ne)) {
+                out = (b.op == BinaryOp::Eq)
+                          ? builder_.CreateICmpEQ(lv.value, rvv.value)
+                          : builder_.CreateICmpNE(lv.value, rvv.value);
+                return CgValue{.type = checked_.types.bool_(), .value = out};
+            }
+
+            error(use_site, "unsupported binary op in MIR codegen");
+            return CgValue{.type = expected,
+                           .value = zero_init(llvm_type(expected))};
+        }
+        if (std::holds_alternative<MirRvalue::Cast>(rv.data)) {
+            const auto& c = std::get<MirRvalue::Cast>(rv.data);
+            CgValue v = mir_emit_operand(f, c.operand);
+            return mir_cast_value(v, c.to);
+        }
+        if (std::holds_alternative<MirRvalue::AddrOf>(rv.data)) {
+            const auto& a = std::get<MirRvalue::AddrOf>(rv.data);
+            MirPlaceAddr addr = mir_place_addr(f, a.place);
+            return CgValue{.type = expected,
+                           .value = builder_.CreateBitCast(addr.ptr, ptr_ty())};
+        }
+        if (std::holds_alternative<MirRvalue::EnumTag>(rv.data)) {
+            const auto& t = std::get<MirRvalue::EnumTag>(rv.data);
+            CgValue v = mir_emit_operand(f, t.operand);
+            llvm::Value* tag = builder_.CreateExtractValue(v.value, {0});
+            llvm::Value* out =
+                builder_.CreateZExtOrTrunc(tag, llvm_int_ty(IntKind::Usize));
+            return CgValue{.type = checked_.types.int_(IntKind::Usize),
+                           .value = out};
+        }
+        if (std::holds_alternative<MirRvalue::Aggregate>(rv.data)) {
+            const auto& a = std::get<MirRvalue::Aggregate>(rv.data);
+            llvm::Value* agg = llvm::UndefValue::get(llvm_type(a.ty));
+
+            if (a.kind == MirRvalue::AggregateKind::Tuple) {
+                const TypeData& td = checked_.types.get(a.ty);
+                for (size_t i = 0; i < a.elems.size(); i++) {
+                    TypeId elem_ty = i < td.tuple_elems.size()
+                                         ? td.tuple_elems[i]
+                                         : checked_.types.error();
+                    CgValue ev = mir_emit_operand(f, a.elems[i]);
+                    ev = mir_coerce_value(ev, elem_ty, use_site);
+                    agg = builder_.CreateInsertValue(
+                        agg, ev.value, {static_cast<unsigned>(i)});
+                }
+                return CgValue{.type = a.ty, .value = agg};
+            }
+
+            if (a.kind == MirRvalue::AggregateKind::Array) {
+                const TypeData& td = checked_.types.get(a.ty);
+                for (size_t i = 0; i < a.elems.size(); i++) {
+                    CgValue ev = mir_emit_operand(f, a.elems[i]);
+                    ev = mir_coerce_value(ev, td.elem, use_site);
+                    agg = builder_.CreateInsertValue(
+                        agg, ev.value, {static_cast<unsigned>(i)});
+                }
+                return CgValue{.type = a.ty, .value = agg};
+            }
+
+            if (a.kind == MirRvalue::AggregateKind::Struct) {
+                const TypeData& td = checked_.types.get(a.ty);
+                if (td.kind != TypeKind::Struct || !td.struct_def) {
+                    error(use_site, "struct aggregate has non-struct type");
+                    return CgValue{.type = a.ty, .value = agg};
+                }
+                auto si_it = checked_.struct_info.find(td.struct_def);
+                if (si_it == checked_.struct_info.end()) {
+                    error(use_site, "missing struct info during MIR lowering");
+                    return CgValue{.type = a.ty, .value = agg};
+                }
+                for (size_t i = 0; i < a.elems.size() &&
+                                   i < si_it->second.fields_in_order.size();
+                     i++) {
+                    TypeId field_ty = si_it->second.fields_in_order[i].type;
+                    CgValue ev = mir_emit_operand(f, a.elems[i]);
+                    ev = mir_coerce_value(ev, field_ty, use_site);
+                    agg = builder_.CreateInsertValue(
+                        agg, ev.value, {static_cast<unsigned>(i)});
+                }
+                return CgValue{.type = a.ty, .value = agg};
+            }
+
+            if (a.kind == MirRvalue::AggregateKind::EnumVariant) {
+                const TypeData& td = checked_.types.get(a.ty);
+                if (td.kind != TypeKind::Enum || !td.enum_def) {
+                    error(use_site, "enum aggregate has non-enum type");
+                    return CgValue{.type = a.ty, .value = agg};
+                }
+                auto el = layout_.enum_layout(td.enum_def, use_site);
+                if (!el) return CgValue{.type = a.ty, .value = agg};
+
+                auto ei_it = checked_.enum_info.find(td.enum_def);
+                if (ei_it == checked_.enum_info.end())
+                    return CgValue{.type = a.ty, .value = agg};
+                const EnumInfo& ei = ei_it->second;
+                if (a.variant_index >= ei.variants_in_order.size())
+                    return CgValue{.type = a.ty, .value = agg};
+                const std::string& vname =
+                    ei.variants_in_order[a.variant_index];
+                auto vit = ei.variants.find(vname);
+                if (vit == ei.variants.end())
+                    return CgValue{.type = a.ty, .value = agg};
+                const VariantInfo& vi = vit->second;
+
+                std::int64_t disc_value =
+                    static_cast<std::int64_t>(a.variant_index);
+                if (auto di = ei.discriminants.find(vname);
+                    di != ei.discriminants.end())
+                    disc_value = di->second;
+
+                llvm::StructType* ll_enum =
+                    llvm::cast<llvm::StructType>(llvm_type(a.ty));
+                llvm::AllocaInst* slot =
+                    create_entry_alloca(f.fn, ll_enum, "enum.tmp");
+                llvm::Value* tag_ptr =
+                    builder_.CreateStructGEP(ll_enum, slot, 0);
+                llvm::Type* tag_ty = llvm_tag_int_bytes(el->tag_size);
+                llvm::Value* tag_value = llvm::ConstantInt::get(
+                    tag_ty, static_cast<std::uint64_t>(disc_value),
+                    /*isSigned=*/true);
+                builder_.CreateStore(tag_value, tag_ptr);
+
+                if (!vi.payload.empty() && el->payload_size != 0) {
+                    llvm::Value* payload_base =
+                        builder_.CreateStructGEP(ll_enum, slot, 1);
+                    std::uint64_t off = 0;
+                    for (size_t i = 0;
+                         i < a.elems.size() && i < vi.payload.size(); i++) {
+                        TypeId payload_ty = vi.payload[i];
+                        auto al = layout_.align_of(payload_ty, use_site);
+                        auto sz = layout_.size_of(payload_ty, use_site);
+                        if (!al || !sz) break;
+                        off = align_up(off, *al);
+                        CgValue ev = mir_emit_operand(f, a.elems[i]);
+                        ev = mir_coerce_value(ev, payload_ty, use_site);
+                        llvm::Value* gep = builder_.CreateInBoundsGEP(
+                            llvm::Type::getInt8Ty(ctx_), payload_base,
+                            builder_.getInt64(off));
+                        llvm::StoreInst* store =
+                            builder_.CreateStore(ev.value, gep);
+                        store->setAlignment(llvm::Align(*al));
+                        off += *sz;
+                    }
+                }
+
+                llvm::Value* out = builder_.CreateLoad(ll_enum, slot);
+                return CgValue{.type = a.ty, .value = out};
+            }
+        }
+
+        error(use_site, "unsupported MIR rvalue in LLVM lowering");
+        return CgValue{.type = expected,
+                       .value = zero_init(llvm_type(expected))};
+    }
+
+    void mir_emit_stmt(MirFnCtx& f, const MirStatement& st) {
+        if (std::holds_alternative<MirStatement::Assign>(st.data)) {
+            const auto& a = std::get<MirStatement::Assign>(st.data);
+            TypeId dst_ty = mir_place_type(f, a.dst);
+            MirPlaceAddr dst_addr = mir_place_addr(f, a.dst);
+            CgValue v = mir_emit_rvalue(
+                f, a.src, dst_ty, a.dst.projection.empty() ? Span{} : Span{});
+            v = mir_coerce_value(v, dst_ty, Span{});
+            emit_store(dst_ty, dst_addr.ptr, v.value);
+            return;
+        }
+        if (std::holds_alternative<MirStatement::Assert>(st.data)) {
+            const auto& a = std::get<MirStatement::Assert>(st.data);
+            CgValue cond = mir_emit_operand(f, a.cond);
+            cond = mir_coerce_value(cond, checked_.types.bool_(), a.span);
+            llvm::Function* fn = f.fn;
+            llvm::BasicBlock* ok_bb =
+                llvm::BasicBlock::Create(ctx_, "assert.ok", fn);
+            llvm::BasicBlock* fail_bb =
+                llvm::BasicBlock::Create(ctx_, "assert.fail", fn);
+            builder_.CreateCondBr(cond.value, ok_bb, fail_bb);
+
+            builder_.SetInsertPoint(fail_bb);
+            auto trap = llvm::Intrinsic::getOrInsertDeclaration(
+                module_.get(), llvm::Intrinsic::trap);
+            builder_.CreateCall(trap);
+            builder_.CreateUnreachable();
+
+            builder_.SetInsertPoint(ok_bb);
+            return;
+        }
+        error(Span{}, "unsupported MIR statement in LLVM lowering");
+    }
+
+    void mir_emit_terminator(MirFnCtx& f, MirBlockId bb,
+                             const MirTerminator& term) {
+        if (std::holds_alternative<MirTerminator::Return>(term.data)) {
+            if (!f.body) {
+                builder_.CreateRetVoid();
+                return;
+            }
+            if (f.body->ret_ty == checked_.types.unit() ||
+                f.body->ret_ty == checked_.types.never()) {
+                builder_.CreateRetVoid();
+                return;
+            }
+            llvm::Value* rv = emit_load(f.body->ret_ty, f.locals[0]);
+            builder_.CreateRet(rv);
+            return;
+        }
+        if (std::holds_alternative<MirTerminator::Goto>(term.data)) {
+            builder_.CreateBr(
+                f.blocks[std::get<MirTerminator::Goto>(term.data).target]);
+            return;
+        }
+        if (std::holds_alternative<MirTerminator::SwitchInt>(term.data)) {
+            const auto& sw = std::get<MirTerminator::SwitchInt>(term.data);
+            TypeId scrut_ty = mir_operand_type(f, sw.scrut);
+            CgValue scrut = mir_emit_operand(f, sw.scrut);
+            llvm::BasicBlock* otherwise_bb = f.blocks[sw.otherwise];
+            llvm::SwitchInst* si =
+                builder_.CreateSwitch(scrut.value, otherwise_bb,
+                                      static_cast<unsigned>(sw.cases.size()));
+            llvm::Type* ll_scrut_ty = llvm_type(scrut_ty);
+            if (!ll_scrut_ty->isIntegerTy()) {
+                error(Span{},
+                      "internal error: MIR switch scrutinee is not an integer");
+                return;
+            }
+            for (const auto& [v, target] : sw.cases) {
+                llvm::ConstantInt* cv = llvm::ConstantInt::get(
+                    llvm::cast<llvm::IntegerType>(ll_scrut_ty),
+                    static_cast<std::uint64_t>(v));
+                si->addCase(cv, f.blocks[target]);
+            }
+            return;
+        }
+        if (std::holds_alternative<MirTerminator::Call>(term.data)) {
+            const auto& c = std::get<MirTerminator::Call>(term.data);
+
+            // Direct calls (`Fn(def#)`) vs indirect calls (`fp(...)`).
+            if (std::holds_alternative<MirOperand::Fn>(c.callee.data)) {
+                DefId callee_def = std::get<MirOperand::Fn>(c.callee.data).def;
+                const ItemFn* callee_ast = fn_def(callee_def);
+                if (!callee_ast) {
+                    error(Span{},
+                          "missing function def during MIR call lowering");
+                    builder_.CreateBr(f.blocks[c.next]);
+                    return;
+                }
+                auto sig_it = checked_.fn_info.find(callee_ast);
+                if (sig_it == checked_.fn_info.end()) {
+                    builder_.CreateBr(f.blocks[c.next]);
+                    return;
+                }
+                const FnInfo& sig = sig_it->second;
+
+                bool is_extern_c = false;
+                for (const Attr* a : callee_ast->attrs) {
+                    if (a && a->name && path_is_ident(a->name, "extern"))
+                        is_extern_c = true;
+                }
+
+                if (has_comptime_params(sig) && sig.is_variadic) {
+                    error(Span{},
+                          "functions with comptime parameters cannot be "
+                          "variadic (internal limitation)");
+                    builder_.CreateBr(f.blocks[c.next]);
+                    return;
+                }
+
+                std::vector<llvm::Value*> args{};
+                std::vector<ComptimeValue> ct_args{};
+                args.reserve(c.args.size());
+
+                const Span use_site = f.body ? f.body->span : Span{};
+                const size_t fixed = sig.params.size();
+                for (size_t i = 0; i < c.args.size(); i++) {
+                    const bool is_ct = i < sig.comptime_params.size() &&
+                                       sig.comptime_params[i];
+                    if (is_ct) {
+                        auto v = mir_eval_comptime_operand(
+                            f, c.args[i], sig.params[i], use_site);
+                        if (v) ct_args.push_back(*v);
+                        continue;
+                    }
+
+                    CgValue av = mir_emit_operand(f, c.args[i]);
+                    if (!sig.is_variadic) {
+                        if (i < fixed) {
+                            av = mir_coerce_value(av, sig.params[i], use_site);
+                        }
+                        args.push_back(av.value);
+                        continue;
+                    }
+
+                    if (i < fixed) {
+                        av = mir_coerce_value(av, sig.params[i], use_site);
+                        args.push_back(av.value);
+                        continue;
+                    }
+
+                    // Variadic args.
+                    args.push_back(is_extern_c
+                                       ? promote_c_vararg(av.type, av.value)
+                                       : av.value);
+                }
+
+                llvm::Function* callee_ll = nullptr;
+                if (has_comptime_params(sig)) {
+                    callee_ll = get_or_create_comptime_specialization(
+                        callee_ast, sig, ct_args, use_site);
+                } else {
+                    callee_ll = llvm_fn(callee_ast);
+                }
+
+                if (!callee_ll) {
+                    builder_.CreateBr(f.blocks[c.next]);
+                    return;
+                }
+
+                llvm::CallInst* call = builder_.CreateCall(
+                    callee_ll->getFunctionType(), callee_ll, args);
+                if (c.ret) {
+                    TypeId ret_ty = mir_place_type(f, *c.ret);
+                    if (llvm_type(ret_ty)->isVoidTy()) {
+                        builder_.CreateBr(f.blocks[c.next]);
+                        return;
+                    }
+                    MirPlaceAddr ret_addr = mir_place_addr(f, *c.ret);
+                    emit_store(ret_ty, ret_addr.ptr, call);
+                }
+                builder_.CreateBr(f.blocks[c.next]);
+                return;
+            }
+
+            // Indirect call through a function pointer.
+            CgValue callee_val = mir_emit_operand(f, c.callee);
+            TypeId callee_ty = callee_val.type;
+            const TypeData& cd = checked_.types.get(callee_ty);
+            if (cd.kind != TypeKind::Ptr) {
+                error(Span{}, "indirect call on non-pointer type");
+                builder_.CreateBr(f.blocks[c.next]);
+                return;
+            }
+            llvm::FunctionType* fty = llvm_fn_type(cd.pointee);
+            if (!fty) {
+                error(Span{}, "indirect call has non-function pointee type");
+                builder_.CreateBr(f.blocks[c.next]);
+                return;
+            }
+
+            std::vector<llvm::Value*> args{};
+            args.reserve(c.args.size());
+            for (const MirOperand& a : c.args) {
+                CgValue av = mir_emit_operand(f, a);
+                args.push_back(av.value);
+            }
+
+            llvm::CallInst* call =
+                builder_.CreateCall(fty, callee_val.value, args);
+            if (c.ret) {
+                TypeId ret_ty = mir_place_type(f, *c.ret);
+                if (!llvm_type(ret_ty)->isVoidTy()) {
+                    MirPlaceAddr ret_addr = mir_place_addr(f, *c.ret);
+                    emit_store(ret_ty, ret_addr.ptr, call);
+                }
+            }
+            builder_.CreateBr(f.blocks[c.next]);
+            return;
+        }
+        if (std::holds_alternative<MirTerminator::Unreachable>(term.data)) {
+            builder_.CreateUnreachable();
+            return;
+        }
+
+        error(Span{}, "unsupported MIR terminator in LLVM lowering");
+        builder_.CreateUnreachable();
+    }
+
+    void mir_emit_body(llvm::Function* ll_fn, const MirBody& body,
+                       const FnInfo& sig,
+                       const std::vector<ComptimeValue>* comptime_args,
+                       Span use_site) {
+        if (!ll_fn) return;
+
+        // Construct blocks.
+        llvm::BasicBlock* entry =
+            llvm::BasicBlock::Create(ctx_, "entry", ll_fn);
+        MirFnCtx f{};
+        f.fn = ll_fn;
+        f.body = &body;
+        f.blocks.resize(body.blocks.size(), nullptr);
+        for (size_t i = 0; i < body.blocks.size(); i++) {
+            f.blocks[i] =
+                llvm::BasicBlock::Create(ctx_, "bb" + std::to_string(i), ll_fn);
+        }
+
+        // Allocate locals.
+        builder_.SetInsertPoint(entry);
+        f.locals.resize(body.locals.size(), nullptr);
+        for (size_t i = 0; i < body.locals.size(); i++) {
+            TypeId ty = body.locals[i].ty;
+            llvm::Type* ll_ty = llvm_type(ty);
+            if (ll_ty->isVoidTy()) continue;
+            f.locals[i] =
+                create_entry_alloca(ll_fn, ll_ty, body.locals[i].name);
+        }
+
+        // Store params.
+        size_t ct_index = 0;
+        size_t runtime_index = 0;
+        for (size_t i = 0; i < sig.params.size(); i++) {
+            const bool is_ct =
+                i < sig.comptime_params.size() && sig.comptime_params[i];
+            const MirLocalId local_id = static_cast<MirLocalId>(1 + i);
+            if (local_id >= body.locals.size()) break;
+
+            TypeId param_ty = sig.params[i];
+            if (is_ct) {
+                if (!comptime_args || ct_index >= comptime_args->size()) {
+                    error(use_site, "internal error: missing comptime arg");
+                    ct_index++;
+                    continue;
+                }
+                if (f.locals[local_id]) {
+                    llvm::Constant* c = llvm_const_value(
+                        param_ty, (*comptime_args)[ct_index], use_site);
+                    emit_store(param_ty, f.locals[local_id], c);
+                }
+                ct_index++;
+                continue;
+            }
+
+            if (runtime_index >= ll_fn->arg_size()) {
+                error(use_site, "internal error: missing runtime argument");
+                runtime_index++;
+                continue;
+            }
+            if (f.locals[local_id]) {
+                llvm::Argument* arg =
+                    ll_fn->getArg(static_cast<unsigned>(runtime_index));
+                emit_store(param_ty, f.locals[local_id], arg);
+            }
+            runtime_index++;
+        }
+
+        builder_.CreateBr(f.blocks[body.start]);
+
+        // Emit each block.
+        for (size_t i = 0; i < body.blocks.size(); i++) {
+            builder_.SetInsertPoint(f.blocks[i]);
+            const MirBlock& b = body.blocks[i];
+            for (const MirStatement& st : b.stmts) mir_emit_stmt(f, st);
+            if (!builder_.GetInsertBlock()->getTerminator())
+                mir_emit_terminator(f, static_cast<MirBlockId>(i), b.term);
+        }
+    }
+
+    void mir_emit_function(const ItemFn* fn) {
+        if (!fn || !fn->decl || !fn->decl->sig || !fn->body) return;
+        if (emitted_fns_.contains(fn)) return;
+
+        auto sig_it = checked_.fn_info.find(fn);
+        if (sig_it == checked_.fn_info.end()) return;
+        const FnInfo& sig = sig_it->second;
+        if (has_comptime_params(sig)) {
+            // Emitted on demand as `$ct...` variants.
+            return;
+        }
+
+        llvm::Function* ll_fn = llvm_fn(fn);
+        if (!ll_fn) return;
+
+        auto dit = hir_->def_ids.find(static_cast<const Item*>(fn));
+        if (dit == hir_->def_ids.end()) return;
+        const MirBody* body = mir_->body_for_fn(dit->second);
+        if (!body) return;
+
+        emitted_fns_.insert(fn);
+        llvm::IRBuilder<>::InsertPointGuard guard(builder_);
+        mir_emit_body(ll_fn, *body, sig, /*comptime_args=*/nullptr, fn->span);
     }
 
     struct FnCtx {
@@ -881,9 +2192,14 @@ class LlvmBackend {
         }
 
         llvm::Constant* init = zero_init(ll_ty);
-        if (auto v = eval_.eval_static(st)) {
-            if (llvm::Constant* c = llvm_const_value(ty, *v, st->span))
-                init = c;
+        if (mir_eval_ && hir_) {
+            auto dit = hir_->def_ids.find(static_cast<const Item*>(st));
+            if (dit != hir_->def_ids.end()) {
+                if (auto v = mir_eval_->eval_static(dit->second)) {
+                    if (llvm::Constant* c = llvm_const_value(ty, *v, st->span))
+                        init = c;
+                }
+            }
         }
 
         std::string name = locator_.symbol_for_static(st);
@@ -938,8 +2254,8 @@ class LlvmBackend {
                 elems.reserve(static_cast<size_t>(n));
                 for (std::uint64_t i = 0; i < n; i++) {
                     if (i < v.array_elems.size()) {
-                        elems.push_back(
-                            llvm_const_value(td.elem, v.array_elems[i], use_site));
+                        elems.push_back(llvm_const_value(
+                            td.elem, v.array_elems[i], use_site));
                     } else {
                         elems.push_back(zero_init(llvm_type(td.elem)));
                     }
@@ -1483,8 +2799,7 @@ class LlvmBackend {
 
                 // Locals (single segment).
                 if (p->path->segments.size() == 1) {
-                    auto local =
-                        lookup_local(f, p->path->segments[0]->text);
+                    auto local = lookup_local(f, p->path->segments[0]->text);
                     if (local && local->alloca)
                         return std::pair<TypeId, llvm::Value*>{local->type,
                                                                local->alloca};
@@ -1500,7 +2815,8 @@ class LlvmBackend {
                         llvm::GlobalVariable* g =
                             get_or_create_static_global(st);
                         if (!g) return std::nullopt;
-                        return std::pair<TypeId, llvm::Value*>{ty_it->second, g};
+                        return std::pair<TypeId, llvm::Value*>{ty_it->second,
+                                                               g};
                     }
                 }
 
@@ -1592,15 +2908,14 @@ class LlvmBackend {
                         base_ptr = base_place->second;
                     } else {
                         CgValue base_val = emit_expr(f, ix->base);
-                        llvm::AllocaInst* tmp =
-                            create_entry_alloca(f.llvm_fn, llvm_type(base_ty),
-                                                "arr.tmp");
+                        llvm::AllocaInst* tmp = create_entry_alloca(
+                            f.llvm_fn, llvm_type(base_ty), "arr.tmp");
                         emit_store(base_ty, tmp, base_val.value);
                         base_ptr = tmp;
                     }
 
-                    llvm::Value* zero = llvm::ConstantInt::get(
-                        llvm_int_ty(IntKind::Usize), 0);
+                    llvm::Value* zero =
+                        llvm::ConstantInt::get(llvm_int_ty(IntKind::Usize), 0);
                     llvm::Value* gep = builder_.CreateInBoundsGEP(
                         llvm_type(base_ty), base_ptr, {zero, idx});
                     return std::pair<TypeId, llvm::Value*>{bd.elem, gep};
@@ -1650,15 +2965,15 @@ class LlvmBackend {
                 return CgValue{.type = to_ty, .value = from.value};
             if (from_d.float_kind == FloatKind::F32 &&
                 to_d.float_kind == FloatKind::F64) {
-                return CgValue{.type = to_ty,
-                               .value = builder_.CreateFPExt(from.value,
-                                                            dst_ll_ty)};
+                return CgValue{
+                    .type = to_ty,
+                    .value = builder_.CreateFPExt(from.value, dst_ll_ty)};
             }
             if (from_d.float_kind == FloatKind::F64 &&
                 to_d.float_kind == FloatKind::F32) {
-                return CgValue{.type = to_ty,
-                               .value = builder_.CreateFPTrunc(from.value,
-                                                              dst_ll_ty)};
+                return CgValue{
+                    .type = to_ty,
+                    .value = builder_.CreateFPTrunc(from.value, dst_ll_ty)};
             }
             return CgValue{.type = to_ty, .value = from.value};
         }
@@ -1796,8 +3111,9 @@ class LlvmBackend {
             case AstNodeKind::ExprFloat: {
                 auto* fl = static_cast<const ExprFloat*>(e);
                 llvm::Type* ll_ty = llvm_type(ty);
-                return CgValue{.type = ty,
-                               .value = llvm::ConstantFP::get(ll_ty, fl->value)};
+                return CgValue{
+                    .type = ty,
+                    .value = llvm::ConstantFP::get(ll_ty, fl->value)};
             }
             case AstNodeKind::ExprString: {
                 auto* s = static_cast<const ExprString*>(e);
@@ -1884,7 +3200,8 @@ class LlvmBackend {
                                            fld.name + "` in codegen");
                         continue;
                     }
-                    CgValue fv = emit_expr_coerced(f, init_it->second, fld.type);
+                    CgValue fv =
+                        emit_expr_coerced(f, init_it->second, fld.type);
                     agg = builder_.CreateInsertValue(
                         agg, fv.value, {static_cast<unsigned>(field_index)});
                 }
@@ -1911,8 +3228,9 @@ class LlvmBackend {
                 auto* a = static_cast<const ExprArrayLit*>(e);
                 if (td.kind != TypeKind::Array) {
                     error(e->span, "array literal has non-array type");
-                    return CgValue{.type = ty,
-                                   .value = llvm::UndefValue::get(llvm_type(ty))};
+                    return CgValue{
+                        .type = ty,
+                        .value = llvm::UndefValue::get(llvm_type(ty))};
                 }
                 llvm::Type* agg_ty = llvm_type(ty);
                 llvm::Value* agg = llvm::UndefValue::get(agg_ty);
@@ -1927,8 +3245,9 @@ class LlvmBackend {
                 auto* a = static_cast<const ExprArrayRepeat*>(e);
                 if (td.kind != TypeKind::Array) {
                     error(e->span, "array repeat has non-array type");
-                    return CgValue{.type = ty,
-                                   .value = llvm::UndefValue::get(llvm_type(ty))};
+                    return CgValue{
+                        .type = ty,
+                        .value = llvm::UndefValue::get(llvm_type(ty))};
                 }
 
                 // `[x; N]` evaluates `x` once, then repeats the value.
@@ -2297,10 +3616,10 @@ class LlvmBackend {
                         return CgValue{.type = ty,
                                        .value = builder_.CreateFNeg(v.value)};
                     }
-                    return CgValue{.type = ty,
-                                   .value = builder_.CreateSub(
-                                       llvm::ConstantInt::get(llvm_type(ty), 0),
-                                       v.value)};
+                    return CgValue{
+                        .type = ty,
+                        .value = builder_.CreateSub(
+                            llvm::ConstantInt::get(llvm_type(ty), 0), v.value)};
                 }
                 if (u->op == UnaryOp::Not) {
                     return CgValue{
@@ -2365,12 +3684,13 @@ class LlvmBackend {
 
                     builder_.SetInsertPoint(end_bb);
                     llvm::PHINode* phi = builder_.CreatePHI(
-                        llvm::Type::getInt1Ty(ctx_),
-                        rhs_reaches_end ? 2u : 1u, is_and ? "and" : "or");
-                    phi->addIncoming(is_and ? builder_.getFalse()
-                                            : builder_.getTrue(),
-                                     lhs_bb);
-                    if (rhs_reaches_end) phi->addIncoming(rhs.value, rhs_end_bb);
+                        llvm::Type::getInt1Ty(ctx_), rhs_reaches_end ? 2u : 1u,
+                        is_and ? "and" : "or");
+                    phi->addIncoming(
+                        is_and ? builder_.getFalse() : builder_.getTrue(),
+                        lhs_bb);
+                    if (rhs_reaches_end)
+                        phi->addIncoming(rhs.value, rhs_end_bb);
                     return CgValue{.type = ty, .value = phi};
                 }
 
@@ -2385,75 +3705,75 @@ class LlvmBackend {
                             return CgValue{.type = ty,
                                            .value = builder_.CreateFAdd(
                                                lhs.value, rhs.value)};
-                        return CgValue{.type = ty,
-                                       .value = builder_.CreateAdd(lhs.value,
-                                                                  rhs.value)};
+                        return CgValue{
+                            .type = ty,
+                            .value = builder_.CreateAdd(lhs.value, rhs.value)};
                     case BinaryOp::Sub:
                         if (lhs_td.kind == TypeKind::Float)
                             return CgValue{.type = ty,
                                            .value = builder_.CreateFSub(
                                                lhs.value, rhs.value)};
-                        return CgValue{.type = ty,
-                                       .value = builder_.CreateSub(lhs.value,
-                                                                  rhs.value)};
+                        return CgValue{
+                            .type = ty,
+                            .value = builder_.CreateSub(lhs.value, rhs.value)};
                     case BinaryOp::Mul:
                         if (lhs_td.kind == TypeKind::Float)
                             return CgValue{.type = ty,
                                            .value = builder_.CreateFMul(
                                                lhs.value, rhs.value)};
-                        return CgValue{.type = ty,
-                                       .value = builder_.CreateMul(lhs.value,
-                                                                  rhs.value)};
+                        return CgValue{
+                            .type = ty,
+                            .value = builder_.CreateMul(lhs.value, rhs.value)};
                     case BinaryOp::Div:
                         if (lhs_td.kind == TypeKind::Float)
                             return CgValue{.type = ty,
                                            .value = builder_.CreateFDiv(
                                                lhs.value, rhs.value)};
                         if (lhs_td.kind != TypeKind::Int) break;
-                        return CgValue{.type = ty,
-                                       .value = is_signed_int(lhs_td.int_kind)
-                                                    ? builder_.CreateSDiv(
-                                                          lhs.value, rhs.value)
-                                                    : builder_.CreateUDiv(
-                                                          lhs.value,
+                        return CgValue{
+                            .type = ty,
+                            .value =
+                                is_signed_int(lhs_td.int_kind)
+                                    ? builder_.CreateSDiv(lhs.value, rhs.value)
+                                    : builder_.CreateUDiv(lhs.value,
                                                           rhs.value)};
                     case BinaryOp::Mod:
                         if (lhs_td.kind != TypeKind::Int) break;
-                        return CgValue{.type = ty,
-                                       .value = is_signed_int(lhs_td.int_kind)
-                                                    ? builder_.CreateSRem(
-                                                          lhs.value, rhs.value)
-                                                    : builder_.CreateURem(
-                                                          lhs.value,
+                        return CgValue{
+                            .type = ty,
+                            .value =
+                                is_signed_int(lhs_td.int_kind)
+                                    ? builder_.CreateSRem(lhs.value, rhs.value)
+                                    : builder_.CreateURem(lhs.value,
                                                           rhs.value)};
                     case BinaryOp::BitAnd:
                         if (lhs_td.kind != TypeKind::Int) break;
-                        return CgValue{.type = ty,
-                                       .value = builder_.CreateAnd(lhs.value,
-                                                                  rhs.value)};
+                        return CgValue{
+                            .type = ty,
+                            .value = builder_.CreateAnd(lhs.value, rhs.value)};
                     case BinaryOp::BitOr:
                         if (lhs_td.kind != TypeKind::Int) break;
-                        return CgValue{.type = ty,
-                                       .value = builder_.CreateOr(lhs.value,
-                                                                 rhs.value)};
+                        return CgValue{
+                            .type = ty,
+                            .value = builder_.CreateOr(lhs.value, rhs.value)};
                     case BinaryOp::BitXor:
                         if (lhs_td.kind != TypeKind::Int) break;
-                        return CgValue{.type = ty,
-                                       .value = builder_.CreateXor(lhs.value,
-                                                                  rhs.value)};
+                        return CgValue{
+                            .type = ty,
+                            .value = builder_.CreateXor(lhs.value, rhs.value)};
                     case BinaryOp::Shl:
                         if (lhs_td.kind != TypeKind::Int) break;
-                        return CgValue{.type = ty,
-                                       .value = builder_.CreateShl(lhs.value,
-                                                                  rhs.value)};
+                        return CgValue{
+                            .type = ty,
+                            .value = builder_.CreateShl(lhs.value, rhs.value)};
                     case BinaryOp::Shr:
                         if (lhs_td.kind != TypeKind::Int) break;
-                        return CgValue{.type = ty,
-                                       .value = is_signed_int(lhs_td.int_kind)
-                                                    ? builder_.CreateAShr(
-                                                          lhs.value, rhs.value)
-                                                    : builder_.CreateLShr(
-                                                          lhs.value,
+                        return CgValue{
+                            .type = ty,
+                            .value =
+                                is_signed_int(lhs_td.int_kind)
+                                    ? builder_.CreateAShr(lhs.value, rhs.value)
+                                    : builder_.CreateLShr(lhs.value,
                                                           rhs.value)};
                     case BinaryOp::Eq:
                         if (lhs_td.kind == TypeKind::Float)
@@ -2611,7 +3931,8 @@ class LlvmBackend {
                     if (!local || !local->alloca)
                         return CgValue{.type = ty,
                                        .value = zero_init(llvm_type(ty))};
-                    recv_arg = CgValue{.type = self_param, .value = local->alloca};
+                    recv_arg =
+                        CgValue{.type = self_param, .value = local->alloca};
                 } else {
                     recv_arg = emit_expr(f, mc->receiver);
                     if (!checked_.types.equal(recv_arg.type, self_param))
@@ -2626,7 +3947,8 @@ class LlvmBackend {
                 } else {
                     for (size_t i = 0; i < mc->args.size(); i++) {
                         TypeId expected_ty = sig.params[i + 1];
-                        CgValue av = emit_expr_coerced(f, mc->args[i], expected_ty);
+                        CgValue av =
+                            emit_expr_coerced(f, mc->args[i], expected_ty);
                         args.push_back(av.value);
                     }
                 }
@@ -2839,8 +4161,8 @@ class LlvmBackend {
                                   "codegen");
                         } else {
                             for (size_t i = 0; i < call->args.size(); i++) {
-                                CgValue av = emit_expr_coerced(
-                                    f, call->args[i], pd.fn_params[i]);
+                                CgValue av = emit_expr_coerced(f, call->args[i],
+                                                               pd.fn_params[i]);
                                 args.push_back(av.value);
                             }
                         }
@@ -3045,9 +4367,8 @@ class LlvmBackend {
 
         TypeId i32 = checked_.types.int_(IntKind::I32);
         TypeId u8 = checked_.types.int_(IntKind::U8);
-        TypeId argv_ty =
-            checked_.types.ptr(Mutability::Const,
-                               checked_.types.ptr(Mutability::Const, u8));
+        TypeId argv_ty = checked_.types.ptr(
+            Mutability::Const, checked_.types.ptr(Mutability::Const, u8));
 
         auto has_c_main_sig = [&]() -> bool {
             return sig.params.size() == 2 &&
@@ -3057,7 +4378,8 @@ class LlvmBackend {
         };
 
         // 1) Prefer an explicit C ABI entry point:
-        //    `fn[export(C)] main(argc: i32, argv: const* const* u8) -> i32 { ... }`
+        //    `fn[export(C)] main(argc: i32, argv: const* const* u8) -> i32 {
+        //    ... }`
         if (is_export) {
             if (!has_c_main_sig()) {
                 error(main_fn->span,
@@ -3088,11 +4410,10 @@ class LlvmBackend {
             if (sig.params.size() == 2 &&
                 checked_.types.equal(sig.params[0], i32) &&
                 checked_.types.equal(sig.params[1], argv_ty)) {
-                error(
-                    main_fn->span,
-                    "`argc`/`argv` are only available via an explicit C ABI "
-                    "entry point; write `fn[export(C)] main(argc: i32, argv: "
-                    "const* const* u8) -> i32 { ... }`");
+                error(main_fn->span,
+                      "`argc`/`argv` are only available via an explicit C ABI "
+                      "entry point; write `fn[export(C)] main(argc: i32, argv: "
+                      "const* const* u8) -> i32 { ... }`");
                 return;
             }
             error(main_fn->span,
@@ -3100,7 +4421,8 @@ class LlvmBackend {
             return;
         }
 
-        const bool ret_unit = checked_.types.equal(sig.ret, checked_.types.unit());
+        const bool ret_unit =
+            checked_.types.equal(sig.ret, checked_.types.unit());
         const bool ret_i32 = checked_.types.equal(sig.ret, i32);
         if (!ret_unit && !ret_i32) {
             error(main_fn->span,
@@ -3139,7 +4461,8 @@ class LlvmBackend {
         if (ret_i32) {
             b.CreateRet(call);
         } else {
-            b.CreateRet(llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx_), 0));
+            b.CreateRet(
+                llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx_), 0));
         }
     }
 

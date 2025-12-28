@@ -1,6 +1,6 @@
 ---
 title: Compiler MIR Design (Non-normative)
-version: 0.0.19-main (design draft)
+version: 0.0.20 (design draft)
 status: non-normative
 ---
 

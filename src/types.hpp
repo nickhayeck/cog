@@ -87,22 +87,22 @@ class TypeStore {
    public:
     TypeStore() = default;
 
-    TypeId error();
-    TypeId unit();
-    TypeId bool_();
-    TypeId never();
-    TypeId type_type();
-    TypeId self();
+    TypeId error() const;
+    TypeId unit() const;
+    TypeId bool_() const;
+    TypeId never() const;
+    TypeId type_type() const;
+    TypeId self() const;
 
-    TypeId int_(IntKind k);
-    TypeId float_(FloatKind k);
-    TypeId ptr(Mutability mut, TypeId pointee);
-    TypeId slice(TypeId elem);
-    TypeId array(TypeId elem, const Expr* len_expr);
-    TypeId tuple(std::vector<TypeId> elems);
-    TypeId fn(std::vector<TypeId> params, TypeId ret);
-    TypeId struct_(const ItemStruct* def);
-    TypeId enum_(const ItemEnum* def);
+    TypeId int_(IntKind k) const;
+    TypeId float_(FloatKind k) const;
+    TypeId ptr(Mutability mut, TypeId pointee) const;
+    TypeId slice(TypeId elem) const;
+    TypeId array(TypeId elem, const Expr* len_expr) const;
+    TypeId tuple(std::vector<TypeId> elems) const;
+    TypeId fn(std::vector<TypeId> params, TypeId ret) const;
+    TypeId struct_(const ItemStruct* def) const;
+    TypeId enum_(const ItemEnum* def) const;
 
     const TypeData& get(TypeId id) const {
         return types_.at(static_cast<size_t>(id));
@@ -120,21 +120,21 @@ class TypeStore {
     void set_array_len_value(const Expr* expr, std::uint64_t len);
 
    private:
-    std::vector<TypeData> types_{};
+    mutable std::vector<TypeData> types_{};
 
-    std::optional<TypeId> cached_error_{};
-    std::optional<TypeId> cached_unit_{};
-    std::optional<TypeId> cached_bool_{};
-    std::optional<TypeId> cached_never_{};
-    std::optional<TypeId> cached_type_type_{};
-    std::optional<TypeId> cached_self_{};
+    mutable std::optional<TypeId> cached_error_{};
+    mutable std::optional<TypeId> cached_unit_{};
+    mutable std::optional<TypeId> cached_bool_{};
+    mutable std::optional<TypeId> cached_never_{};
+    mutable std::optional<TypeId> cached_type_type_{};
+    mutable std::optional<TypeId> cached_self_{};
 
-    std::unordered_map<IntKind, TypeId> cached_ints_{};
-    std::unordered_map<FloatKind, TypeId> cached_floats_{};
-    std::unordered_map<const ItemStruct*, TypeId> cached_structs_{};
-    std::unordered_map<const ItemEnum*, TypeId> cached_enums_{};
+    mutable std::unordered_map<IntKind, TypeId> cached_ints_{};
+    mutable std::unordered_map<FloatKind, TypeId> cached_floats_{};
+    mutable std::unordered_map<const ItemStruct*, TypeId> cached_structs_{};
+    mutable std::unordered_map<const ItemEnum*, TypeId> cached_enums_{};
 
-    TypeId make(TypeData d);
+    TypeId make(TypeData d) const;
 };
 
 }  // namespace cog

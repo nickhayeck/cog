@@ -10,12 +10,13 @@ This repo contains an early C++ prototype compiler (`cogc`).
 - Comptime design notes: `comptime_design.md`
 - Examples: `examples/`
 
-## Status (v0.0.19-main)
-- Front-end: parse → modules/`use` → type check + local move check → comptime const-eval for `const`/`static` and array lengths.
+## Status (v0.0.20)
+- Front-end: parse → modules/`use` → type check + local move check → HIR → MIR.
 - Comptime: function calls (with resource limits), `comptime` parameters with residualization, and `builtin::type_info(type)`.
 - Core typing: `!` (never) type + match exhaustiveness (bool/enums; `_` required for int matches), tuple structs + `.0/.1`, and function pointers (`const* fn(...) -> R`).
 - Core surface: array literals (`[e0, e1, ...]` and `[x; N]`), float literals/types (`f32`/`f64`), bitwise ops/shifts, and indexing (`a[i]`, including raw pointer indexing).
-- LLVM backend (early): adds tuple expressions/indexing, indirect calls through function pointers, and array/slice indexing + array→slice pointer coercions.
+- MIR interpreter: const/static initialization + comptime blocks/paths are evaluated on MIR, and the result is embedded as runtime constants.
+- LLVM backend: MIR → LLVM lowering (alloca-based locals; rely on LLVM `mem2reg` as the initial strategy).
 - Executables: implements `main` entrypoint selection per `spec/layout_abi.md`.
 - C interop surface (early): keyword tags on items, `fn[extern(C)]` declarations, `fn[export(C)]` definitions, `extern_name(...)`/`export_name(...)`, and extern-only `...` varargs.
 - String literals:
@@ -42,6 +43,9 @@ Other emits:
 - `./build/cogc --emit-llvm build/out.ll examples/ffi_tags_strings/main.cg`
 - `./build/cogc --emit-bc build/out.bc examples/ffi_tags_strings/main.cg`
 - `./build/cogc --emit-obj build/out.o examples/ffi_tags_strings/main.cg`
+- `./build/cogc --emit-hir build/out.hir examples/basic_codegen/main.cg`
+- `./build/cogc --emit-mir build/out.mir examples/basic_codegen/main.cg`
+- `./build/cogc --emit-mir-after lower build/out.mir examples/basic_codegen/main.cg`
 
 Format:
 - `find . -name "*.cpp" -o -name "*.hpp" | xargs -I {} /opt/homebrew/opt/llvm/bin/clang-format -i {}`

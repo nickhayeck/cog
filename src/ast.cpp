@@ -160,6 +160,66 @@ static void dump_text(std::ostream& os, std::string_view text) {
     os << " \"" << text << '"';
 }
 
+std::string ast_unary_op_str(UnaryOp op) {
+    switch (op) {
+        case UnaryOp::Neg:
+            return "-";
+        case UnaryOp::Not:
+            return "!";
+        case UnaryOp::BitNot:
+            return "~";
+        case UnaryOp::Deref:
+            return "*";
+        case UnaryOp::AddrOf:
+            return "&";
+        case UnaryOp::AddrOfMut:
+            return "&mut";
+    }
+}
+
+std::string ast_binary_op_str(BinaryOp op) {
+    switch (op) {
+        case BinaryOp::Add:
+            return "+";
+        case BinaryOp::Sub:
+            return "-";
+        case BinaryOp::Mul:
+            return "*";
+        case BinaryOp::Div:
+            return "/";
+        case BinaryOp::Mod:
+            return "%";
+        case BinaryOp::Eq:
+            return "==";
+        case BinaryOp::Ne:
+            return "!=";
+        case BinaryOp::Lt:
+            return "<";
+        case BinaryOp::Le:
+            return "<=";
+        case BinaryOp::Gt:
+            return ">";
+        case BinaryOp::Ge:
+            return ">=";
+        case BinaryOp::And:
+            return "&&";
+        case BinaryOp::Or:
+            return "||";
+        case BinaryOp::BitAnd:
+            return "&";
+        case BinaryOp::BitOr:
+            return "|";
+        case BinaryOp::BitXor:
+            return "^";
+        case BinaryOp::Shl:
+            return "<<";
+        case BinaryOp::Shr:
+            return ">>";
+        break;
+    }
+}
+
+
 void dump_ast(std::ostream& os, const AstNode* node, int indent) {
     if (!node) {
         indent_to(os, indent);

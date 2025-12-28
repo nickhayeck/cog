@@ -130,7 +130,8 @@ TypeId ComptimeEvaluator::lower_type_path(ModuleId mid, const Path* path,
         std::string_view name = path->segments[0]->text;
         if (name == "bool") return types_->bool_();
         if (auto ik = types_->parse_int_kind(name)) return types_->int_(*ik);
-        if (auto fk = types_->parse_float_kind(name)) return types_->float_(*fk);
+        if (auto fk = types_->parse_float_kind(name))
+            return types_->float_(*fk);
     }
     const Item* item = resolve_type_item(mid, path);
     if (!item) {
@@ -503,20 +504,24 @@ std::optional<ComptimeEvaluator::Flow> ComptimeEvaluator::eval_expr_inner(
         case AstNodeKind::ExprArrayRepeat: {
             auto* a = static_cast<const ExprArrayRepeat*>(expr);
             auto count_v = eval_expr_inner(mid, a->count, env, loop_depth);
-            if (!count_v || count_v->control != Control::None) return std::nullopt;
+            if (!count_v || count_v->control != Control::None)
+                return std::nullopt;
             if (count_v->value.kind != ComptimeValue::Kind::Int) {
-                error(expr->span, "array repeat count must be an integer at comptime");
+                error(expr->span,
+                      "array repeat count must be an integer at comptime");
                 return std::nullopt;
             }
             if (count_v->value.int_value < 0) {
-                error(expr->span, "array repeat count must be non-negative at comptime");
+                error(expr->span,
+                      "array repeat count must be non-negative at comptime");
                 return std::nullopt;
             }
             std::uint64_t n =
                 static_cast<std::uint64_t>(count_v->value.int_value);
 
             auto elem_v = eval_expr_inner(mid, a->elem, env, loop_depth);
-            if (!elem_v || elem_v->control != Control::None) return std::nullopt;
+            if (!elem_v || elem_v->control != Control::None)
+                return std::nullopt;
 
             if (!consume_heap(expr->span, /*units=*/8 + n)) return std::nullopt;
             std::vector<ComptimeValue> elems{};
@@ -715,9 +720,9 @@ std::optional<ComptimeEvaluator::Flow> ComptimeEvaluator::eval_expr_inner(
                             .value = ComptimeValue::int_(-v->value.int_value)};
                     }
                     if (v->value.kind == ComptimeValue::Kind::Float) {
-                        return Flow{
-                            .control = Control::None,
-                            .value = ComptimeValue::float_(-v->value.float_value)};
+                        return Flow{.control = Control::None,
+                                    .value = ComptimeValue::float_(
+                                        -v->value.float_value)};
                     }
                     error(expr->span,
                           "unary `-` requires integer or float at comptime");
@@ -827,24 +832,22 @@ std::optional<ComptimeEvaluator::Flow> ComptimeEvaluator::eval_expr_inner(
                         return Flow{.control = Control::None,
                                     .value = ComptimeValue::int_(a % c)};
                     case BinaryOp::BitAnd:
-                        return Flow{
-                            .control = Control::None,
-                            .value = ComptimeValue::int_(
-                                static_cast<std::int64_t>(au & cu))};
+                        return Flow{.control = Control::None,
+                                    .value = ComptimeValue::int_(
+                                        static_cast<std::int64_t>(au & cu))};
                     case BinaryOp::BitOr:
-                        return Flow{
-                            .control = Control::None,
-                            .value = ComptimeValue::int_(
-                                static_cast<std::int64_t>(au | cu))};
+                        return Flow{.control = Control::None,
+                                    .value = ComptimeValue::int_(
+                                        static_cast<std::int64_t>(au | cu))};
                     case BinaryOp::BitXor:
-                        return Flow{
-                            .control = Control::None,
-                            .value = ComptimeValue::int_(
-                                static_cast<std::int64_t>(au ^ cu))};
+                        return Flow{.control = Control::None,
+                                    .value = ComptimeValue::int_(
+                                        static_cast<std::int64_t>(au ^ cu))};
                     case BinaryOp::Shl: {
                         auto sh = shift_amount();
                         if (!sh) {
-                            error(expr->span, "invalid shift amount at comptime");
+                            error(expr->span,
+                                  "invalid shift amount at comptime");
                             return std::nullopt;
                         }
                         return Flow{.control = Control::None,
@@ -854,7 +857,8 @@ std::optional<ComptimeEvaluator::Flow> ComptimeEvaluator::eval_expr_inner(
                     case BinaryOp::Shr: {
                         auto sh = shift_amount();
                         if (!sh) {
-                            error(expr->span, "invalid shift amount at comptime");
+                            error(expr->span,
+                                  "invalid shift amount at comptime");
                             return std::nullopt;
                         }
                         return Flow{.control = Control::None,
@@ -1014,7 +1018,8 @@ std::optional<ComptimeEvaluator::Flow> ComptimeEvaluator::eval_expr_inner(
                 }
                 Binding* b = env.lookup(p->segments[0]->text);
                 if (!b) {
-                    error(expr->span, "assignment to unknown local at comptime");
+                    error(expr->span,
+                          "assignment to unknown local at comptime");
                     return std::nullopt;
                 }
                 if (!b->is_mut) {
@@ -1047,7 +1052,8 @@ std::optional<ComptimeEvaluator::Flow> ComptimeEvaluator::eval_expr_inner(
                 }
                 Binding* b = env.lookup(p->segments[0]->text);
                 if (!b) {
-                    error(expr->span, "assignment to unknown local at comptime");
+                    error(expr->span,
+                          "assignment to unknown local at comptime");
                     return std::nullopt;
                 }
                 if (!b->is_mut) {
@@ -1056,8 +1062,9 @@ std::optional<ComptimeEvaluator::Flow> ComptimeEvaluator::eval_expr_inner(
                     return std::nullopt;
                 }
                 if (b->value.kind != ComptimeValue::Kind::Array) {
-                    error(expr->span,
-                          "indexed comptime assignment requires an array value");
+                    error(
+                        expr->span,
+                        "indexed comptime assignment requires an array value");
                     return std::nullopt;
                 }
                 auto idx_v = eval_expr_inner(mid, ix->index, env, loop_depth);

@@ -1,4 +1,5 @@
 #include <cstdlib>
+#include <fstream>
 #include <iostream>
 #include <optional>
 #include <string>
@@ -8,6 +9,9 @@
 #include "check.hpp"
 #include "diag.hpp"
 #include "emit_llvm.hpp"
+#include "hir.hpp"
+#include "lower_mir.hpp"
+#include "mir.hpp"
 #include "parse.hpp"
 #include "resolve.hpp"
 #include "session.hpp"
@@ -17,6 +21,8 @@ static void usage(const char* argv0) {
     std::cerr << "usage: " << argv0
               << " [--dump-ast] [--dump-tokens] [--emit-llvm <out.ll>] "
                  "[--emit-bc <out.bc>] [--emit-obj <out.o>] [--emit-exe <out>] "
+                 "[--emit-hir <out.hir>] [--emit-mir <out.mir>] "
+                 "[--emit-mir-after <pass> <out.mir>] "
                  "[--target <triple>] <file.cg>\n";
 }
 
@@ -27,6 +33,10 @@ int main(int argc, char** argv) {
     std::optional<std::string_view> emit_bc{};
     std::optional<std::string_view> emit_obj{};
     std::optional<std::string_view> emit_exe{};
+    std::optional<std::string_view> emit_hir{};
+    std::optional<std::string_view> emit_mir{};
+    std::optional<std::string_view> emit_mir_after_pass{};
+    std::optional<std::string_view> emit_mir_after_out{};
     std::optional<std::string_view> target_triple{};
     const char* input_path = nullptr;
 
@@ -72,6 +82,31 @@ int main(int argc, char** argv) {
             emit_exe = std::string_view(argv[++i]);
             continue;
         }
+        if (arg == "--emit-hir") {
+            if (i + 1 >= argc) {
+                usage(argv[0]);
+                return 2;
+            }
+            emit_hir = std::string_view(argv[++i]);
+            continue;
+        }
+        if (arg == "--emit-mir") {
+            if (i + 1 >= argc) {
+                usage(argv[0]);
+                return 2;
+            }
+            emit_mir = std::string_view(argv[++i]);
+            continue;
+        }
+        if (arg == "--emit-mir-after") {
+            if (i + 2 >= argc) {
+                usage(argv[0]);
+                return 2;
+            }
+            emit_mir_after_pass = std::string_view(argv[++i]);
+            emit_mir_after_out = std::string_view(argv[++i]);
+            continue;
+        }
         if (arg == "--target") {
             if (i + 1 >= argc) {
                 usage(argv[0]);
@@ -106,6 +141,68 @@ int main(int argc, char** argv) {
     std::optional<cog::CheckedCrate> checked{};
     if (!session.has_errors() && target)
         checked = cog::check_crate(session, crate, target->layout);
+
+    std::optional<cog::HirCrate> hir{};
+    if (!session.has_errors() && checked &&
+        (emit_hir || emit_mir || emit_mir_after_pass)) {
+        hir = cog::build_hir(crate, *checked);
+    }
+
+    if (!session.has_errors() && hir && emit_hir) {
+        std::ofstream os{std::string(*emit_hir)};
+        if (!os) {
+            session.diags.push_back(cog::Diagnostic{
+                .severity = cog::Severity::Error,
+                .span = cog::Span{},
+                .message = "failed to open output file for --emit-hir",
+            });
+        } else {
+            cog::dump_hir(os, *hir);
+        }
+    }
+
+    std::optional<cog::MirProgram> mir{};
+    if (!session.has_errors() && hir && (emit_mir || emit_mir_after_pass)) {
+        mir = cog::lower_mir(session, *hir);
+    }
+
+    if (!session.has_errors() && mir && emit_mir) {
+        std::ofstream os{std::string(*emit_mir)};
+        if (!os) {
+            session.diags.push_back(cog::Diagnostic{
+                .severity = cog::Severity::Error,
+                .span = cog::Span{},
+                .message = "failed to open output file for --emit-mir",
+            });
+        } else {
+            cog::dump_mir(os, *mir);
+        }
+    }
+
+    if (!session.has_errors() && mir && emit_mir_after_pass &&
+        emit_mir_after_out) {
+        if (*emit_mir_after_pass != "lower") {
+            session.diags.push_back(cog::Diagnostic{
+                .severity = cog::Severity::Error,
+                .span = cog::Span{},
+                .message = "unsupported --emit-mir-after pass `" +
+                           std::string(*emit_mir_after_pass) +
+                           "` (supported: lower)",
+            });
+        } else {
+            std::ofstream os{std::string(*emit_mir_after_out)};
+            if (!os) {
+                session.diags.push_back(cog::Diagnostic{
+                    .severity = cog::Severity::Error,
+                    .span = cog::Span{},
+                    .message =
+                        "failed to open output file for --emit-mir-after",
+                });
+            } else {
+                cog::dump_mir(os, *mir);
+            }
+        }
+    }
 
     if (!session.has_errors() && checked && target &&
         (emit_llvm || emit_bc || emit_obj || emit_exe)) {

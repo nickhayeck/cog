@@ -6,10 +6,9 @@ This document is written as a **spec-driven** path to **v0.1.0 conformance**. Ea
 - examples that exercise the feature(s),
 - and at least one targeted compile test (positive or negative).
 
-Status: **v0.0.19-main is implemented** (everyday literals/operators + indexing + float/bitwise surface + LLVM backend + basic comptime). The v0.1 core language spec lives in `spec/README.md`.
+Status: **v0.0.20 is implemented** (AST→HIR→MIR→LLVM pipeline + MIR interpreter for const/comptime embedding). The v0.1 core language spec lives in `spec/README.md`.
 
-Key spec gaps as of v0.0.19-main (blocking v0.1.0):
-- IR pipeline refactor: AST → HIR → MIR → LLVM (`spec/hir.md`, `spec/mir.md`)
+Key spec gaps as of v0.0.20 (blocking v0.1.0):
 - Builtins: implement `spec/builtins.md` (notably `builtin::cast` and type construction)
 - `type` as a first-class comptime value + type-level calls in type positions (`spec/comptime.md`, `spec/types.md`, `spec/syntax.md`)
 - `auto` type placeholder (`spec/auto.md`)
@@ -181,9 +180,7 @@ Goal: cover “everyday” expression surface required for v0.1 examples.
 - Examples:
   - add `examples/numerics_arrays_floats/` and `examples/crc32_tool/`
 
-## Next milestones
-
-### v0.0.20 — IR pipeline: AST → HIR → MIR → LLVM
+### v0.0.20 — IR pipeline: AST → HIR → MIR → LLVM (done)
 Goal: get an end-to-end HIR/MIR pipeline working so comptime interpretation and codegen share one semantics engine (`spec/hir.md`, `spec/mir.md`).
 
 - HIR:
@@ -204,6 +201,8 @@ Goal: get an end-to-end HIR/MIR pipeline working so comptime interpretation and 
 - Tests/examples:
   - Keep the existing compile suite green.
   - Add at least one test that exercises `--emit-hir` and `--emit-mir`.
+
+## Next milestones
 
 ### v0.0.21 — Builtins inventory + `type` values + type-level calls (foundation)
 Goal: make `type`-producing comptime functions possible and clarify the builtin surface (`spec/comptime.md`, `spec/types.md`, `spec/syntax.md`).

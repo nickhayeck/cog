@@ -241,7 +241,8 @@ class Checker {
     void init_comptime_support() {
         if (layout_engine_ && comptime_eval_) return;
         layout_engine_ = std::make_unique<LayoutEngine>(
-            session_, types_, struct_info_, enum_info_, array_lens_, target_layout_);
+            session_, types_, struct_info_, enum_info_, array_lens_,
+            target_layout_);
         comptime_eval_ = std::make_unique<ComptimeEvaluator>(
             session_, crate_, &types_, layout_engine_.get());
     }
@@ -1650,7 +1651,8 @@ class Checker {
         if (d.kind != TypeKind::Array) return std::nullopt;
         if (d.array_len_value) return d.array_len_value;
         if (!d.array_len_expr) return std::nullopt;
-        if (auto it = array_lens_.find(d.array_len_expr); it != array_lens_.end())
+        if (auto it = array_lens_.find(d.array_len_expr);
+            it != array_lens_.end())
             return it->second;
         if (!comptime_eval_) return std::nullopt;
         if (auto v = comptime_eval_->eval_usize(mid, d.array_len_expr)) {
@@ -1981,7 +1983,8 @@ class Checker {
             if (pd.kind == TypeKind::Slice) return {.type = pd.elem};
             if (types_.is_sized(bd.pointee)) return {.type = bd.pointee};
         }
-        error(ix->span, "indexing requires an array, slice pointer, or pointer");
+        error(ix->span,
+              "indexing requires an array, slice pointer, or pointer");
         return {.type = types_.error()};
     }
 
@@ -2121,7 +2124,8 @@ class Checker {
                               ld.kind == TypeKind::Bool);
                     }
                     if (!ok)
-                        error(b->span, "unsupported operand type in comparison");
+                        error(b->span,
+                              "unsupported operand type in comparison");
                 }
                 return {.type = types_.bool_()};
             }

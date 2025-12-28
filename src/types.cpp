@@ -4,49 +4,49 @@
 
 namespace cog {
 
-TypeId TypeStore::make(TypeData d) {
+TypeId TypeStore::make(TypeData d) const {
     TypeId id = static_cast<TypeId>(types_.size());
     types_.push_back(std::move(d));
     return id;
 }
 
-TypeId TypeStore::error() {
+TypeId TypeStore::error() const {
     if (cached_error_) return *cached_error_;
     cached_error_ = make(TypeData{.kind = TypeKind::Error});
     return *cached_error_;
 }
 
-TypeId TypeStore::unit() {
+TypeId TypeStore::unit() const {
     if (cached_unit_) return *cached_unit_;
     cached_unit_ = make(TypeData{.kind = TypeKind::Unit});
     return *cached_unit_;
 }
 
-TypeId TypeStore::bool_() {
+TypeId TypeStore::bool_() const {
     if (cached_bool_) return *cached_bool_;
     cached_bool_ = make(TypeData{.kind = TypeKind::Bool});
     return *cached_bool_;
 }
 
-TypeId TypeStore::never() {
+TypeId TypeStore::never() const {
     if (cached_never_) return *cached_never_;
     cached_never_ = make(TypeData{.kind = TypeKind::Never});
     return *cached_never_;
 }
 
-TypeId TypeStore::type_type() {
+TypeId TypeStore::type_type() const {
     if (cached_type_type_) return *cached_type_type_;
     cached_type_type_ = make(TypeData{.kind = TypeKind::TypeType});
     return *cached_type_type_;
 }
 
-TypeId TypeStore::self() {
+TypeId TypeStore::self() const {
     if (cached_self_) return *cached_self_;
     cached_self_ = make(TypeData{.kind = TypeKind::Self});
     return *cached_self_;
 }
 
-TypeId TypeStore::int_(IntKind k) {
+TypeId TypeStore::int_(IntKind k) const {
     if (auto it = cached_ints_.find(k); it != cached_ints_.end())
         return it->second;
     TypeId id = make(TypeData{.kind = TypeKind::Int, .int_kind = k});
@@ -54,7 +54,7 @@ TypeId TypeStore::int_(IntKind k) {
     return id;
 }
 
-TypeId TypeStore::float_(FloatKind k) {
+TypeId TypeStore::float_(FloatKind k) const {
     if (auto it = cached_floats_.find(k); it != cached_floats_.end())
         return it->second;
     TypeId id = make(TypeData{.kind = TypeKind::Float, .float_kind = k});
@@ -62,37 +62,36 @@ TypeId TypeStore::float_(FloatKind k) {
     return id;
 }
 
-TypeId TypeStore::ptr(Mutability mut, TypeId pointee) {
+TypeId TypeStore::ptr(Mutability mut, TypeId pointee) const {
     return make(
         TypeData{.kind = TypeKind::Ptr, .mutability = mut, .pointee = pointee});
 }
 
-TypeId TypeStore::slice(TypeId elem) {
+TypeId TypeStore::slice(TypeId elem) const {
     return make(TypeData{.kind = TypeKind::Slice, .elem = elem});
 }
 
-TypeId TypeStore::array(TypeId elem, const Expr* len_expr) {
-    return make(TypeData{
-        .kind = TypeKind::Array,
-        .elem = elem,
-        .array_len_expr = len_expr,
-        .array_len_value = std::nullopt});
+TypeId TypeStore::array(TypeId elem, const Expr* len_expr) const {
+    return make(TypeData{.kind = TypeKind::Array,
+                         .elem = elem,
+                         .array_len_expr = len_expr,
+                         .array_len_value = std::nullopt});
 }
 
-TypeId TypeStore::tuple(std::vector<TypeId> elems) {
+TypeId TypeStore::tuple(std::vector<TypeId> elems) const {
     TypeData d{.kind = TypeKind::Tuple};
     d.tuple_elems = std::move(elems);
     return make(std::move(d));
 }
 
-TypeId TypeStore::fn(std::vector<TypeId> params, TypeId ret) {
+TypeId TypeStore::fn(std::vector<TypeId> params, TypeId ret) const {
     TypeData d{.kind = TypeKind::Fn};
     d.fn_params = std::move(params);
     d.fn_ret = ret;
     return make(std::move(d));
 }
 
-TypeId TypeStore::struct_(const ItemStruct* def) {
+TypeId TypeStore::struct_(const ItemStruct* def) const {
     if (auto it = cached_structs_.find(def); it != cached_structs_.end())
         return it->second;
     TypeId id = make(TypeData{.kind = TypeKind::Struct, .struct_def = def});
@@ -100,7 +99,7 @@ TypeId TypeStore::struct_(const ItemStruct* def) {
     return id;
 }
 
-TypeId TypeStore::enum_(const ItemEnum* def) {
+TypeId TypeStore::enum_(const ItemEnum* def) const {
     if (auto it = cached_enums_.find(def); it != cached_enums_.end())
         return it->second;
     TypeId id = make(TypeData{.kind = TypeKind::Enum, .enum_def = def});

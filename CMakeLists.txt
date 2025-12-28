@@ -44,8 +44,12 @@ add_executable(
   src/comptime.cpp
   src/diag.cpp
   src/emit_llvm.cpp
+  src/hir.cpp
   src/layout.cpp
+  src/lower_mir.cpp
   src/main.cpp
+  src/mir.cpp
+  src/mir_interp.cpp
   src/parse.cpp
   src/parse_state.cpp
   src/resolve.cpp
@@ -93,6 +97,11 @@ add_test(NAME compile_main_unit              COMMAND cogc --emit-exe test_18.bin
 add_test(NAME compile_main_export_c          COMMAND cogc --emit-exe test_21.bin ${CMAKE_CURRENT_SOURCE_DIR}/examples/main_export_c/main.cg)
 add_test(NAME compile_numerics_arrays_floats COMMAND cogc --emit-exe test_22.bin ${CMAKE_CURRENT_SOURCE_DIR}/examples/numerics_arrays_floats/main.cg)
 add_test(NAME compile_crc32_tool             COMMAND cogc --emit-exe test_23.bin ${CMAKE_CURRENT_SOURCE_DIR}/examples/crc32_tool/main.cg)
+
+# v0.0.20: IR dumps (smoke)
+add_test(NAME emit_hir_smoke  COMMAND cogc --emit-hir test_emit_00.hir ${CMAKE_CURRENT_SOURCE_DIR}/examples/comptime_parameters/main.cg)
+add_test(NAME emit_mir_smoke  COMMAND cogc --emit-mir test_emit_01.mir ${CMAKE_CURRENT_SOURCE_DIR}/examples/comptime_parameters/main.cg)
+add_test(NAME emit_mirl_smoke COMMAND cogc --emit-mir-after lower test_emit_02.mir ${CMAKE_CURRENT_SOURCE_DIR}/examples/comptime_parameters/main.cg)
 
 add_test(NAME fail_non_exhaustive_match   COMMAND cogc --emit-exe test_neg_00.bin ${CMAKE_CURRENT_SOURCE_DIR}/test/negative/non_exhaustive_match.cg)
 set_tests_properties(fail_non_exhaustive_match PROPERTIES WILL_FAIL TRUE)

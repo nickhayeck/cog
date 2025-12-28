@@ -761,6 +761,8 @@ struct FileAst final : AstNode {
 };
 
 std::string_view ast_kind_name(AstNodeKind kind);
+std::string ast_unary_op_str(UnaryOp op);
+std::string ast_binary_op_str(BinaryOp op);
 void dump_ast(std::ostream& os, const AstNode* node, int indent = 0);
 
 }  // namespace cog
