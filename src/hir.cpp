@@ -193,7 +193,7 @@ const HirBody* HirCrate::body(BodyId id) const {
     return &bodies[static_cast<size_t>(id)];
 }
 
-HirCrate build_hir(const ResolvedCrate& crate, const CheckedCrate& checked) {
+HirCrate build_hir(const ResolvedCrate& crate, CheckedCrate& checked) {
     HirCrate out{};
     out.crate = &crate;
     out.checked = &checked;

@@ -18,13 +18,11 @@ LayoutEngine::LayoutEngine(
     Session& session, TypeStore& types,
     const std::unordered_map<const ItemStruct*, StructInfo>& struct_info,
     const std::unordered_map<const ItemEnum*, EnumInfo>& enum_info,
-    const std::unordered_map<const Expr*, std::uint64_t>& array_lens,
     TargetLayout target)
     : session_(session),
       types_(types),
       struct_info_(struct_info),
       enum_info_(enum_info),
-      array_lens_(array_lens),
       target_(target) {}
 
 void LayoutEngine::error(Span span, std::string message) {
@@ -70,14 +68,6 @@ std::uint64_t LayoutEngine::int_align(IntKind k) const {
             return target_.pointer_align;
     }
     return 1;
-}
-
-std::optional<std::uint64_t> LayoutEngine::array_len_value(
-    const Expr* expr) const {
-    if (!expr) return std::nullopt;
-    if (auto it = array_lens_.find(expr); it != array_lens_.end())
-        return it->second;
-    return std::nullopt;
 }
 
 bool LayoutEngine::is_packed(const std::vector<Attr*>& attrs) {
@@ -241,14 +231,12 @@ std::optional<Layout> LayoutEngine::compute_layout(TypeId ty, Span use_site) {
                 error(use_site, "array element type must be sized");
                 return std::nullopt;
             }
-            std::optional<std::uint64_t> len = d.array_len_value;
-            if (!len) len = array_len_value(d.array_len_expr);
-            if (!len) {
+            if (!d.array_len_value) {
                 error(use_site,
                       "array length is not a known comptime constant");
                 return std::nullopt;
             }
-            std::uint64_t size = elem_l->size * (*len);
+            std::uint64_t size = elem_l->size * (*d.array_len_value);
             return Layout{.size = size, .align = elem_l->align, .sized = true};
         }
         case TypeKind::Tuple: {

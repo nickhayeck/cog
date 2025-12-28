@@ -11,6 +11,25 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # project
 project(cog_lang)
 
+# Avoid confusing linker warnings when linking against Homebrew LLVM on macOS by
+# defaulting the deployment target to the host OS version (callers can still
+# override by setting `CMAKE_OSX_DEPLOYMENT_TARGET`).
+if(APPLE)
+  execute_process(
+    COMMAND sw_vers -productVersion
+    OUTPUT_VARIABLE COG_MACOS_VERSION
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
+  )
+  if(COG_MACOS_VERSION)
+    if((NOT CMAKE_OSX_DEPLOYMENT_TARGET) OR
+       (CMAKE_OSX_DEPLOYMENT_TARGET STREQUAL "") OR
+       (CMAKE_OSX_DEPLOYMENT_TARGET STREQUAL CMAKE_HOST_SYSTEM_VERSION))
+      set(CMAKE_OSX_DEPLOYMENT_TARGET "${COG_MACOS_VERSION}" CACHE STRING "Minimum macOS version to target" FORCE)
+    endif()
+  endif()
+endif()
+
 find_package(BISON REQUIRED)
 find_package(FLEX REQUIRED)
 
@@ -43,7 +62,7 @@ add_executable(
   src/check.cpp
   src/comptime.cpp
   src/diag.cpp
-  src/emit_llvm.cpp
+  src/llvm_backend.cpp
   src/hir.cpp
   src/layout.cpp
   src/lower_mir.cpp
@@ -72,6 +91,12 @@ if(MSVC)
   target_compile_options(cogc PRIVATE /W4)
 else()
   target_compile_options(cogc PRIVATE -Wall -Wextra -Wpedantic)
+  # Flex-generated scanners are external code; keep warnings focused on our sources.
+  set_source_files_properties(
+    ${FLEX_CogLexer_OUTPUTS}
+    PROPERTIES
+      COMPILE_OPTIONS "-Wno-sign-compare"
+  )
 endif()
 
 enable_testing()

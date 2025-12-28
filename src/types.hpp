@@ -133,6 +133,7 @@ class TypeStore {
     mutable std::unordered_map<FloatKind, TypeId> cached_floats_{};
     mutable std::unordered_map<const ItemStruct*, TypeId> cached_structs_{};
     mutable std::unordered_map<const ItemEnum*, TypeId> cached_enums_{};
+    mutable std::unordered_map<const Expr*, std::uint64_t> array_len_cache_{};
 
     TypeId make(TypeData d) const;
 };

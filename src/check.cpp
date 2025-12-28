@@ -194,7 +194,6 @@ class Checker {
         out.fn_info = std::move(fn_info_);
         out.binding_types = std::move(binding_types_);
         out.expr_types = std::move(expr_types_);
-        out.array_lens = std::move(array_lens_);
         return out;
     }
 
@@ -211,7 +210,6 @@ class Checker {
     std::unordered_map<const ItemFn*, FnInfo> fn_info_{};
     std::unordered_map<const PatBinding*, TypeId> binding_types_{};
     std::unordered_map<const Expr*, TypeId> expr_types_{};
-    std::unordered_map<const Expr*, std::uint64_t> array_lens_{};
 
     const ItemStruct* typeinfo_struct_ = nullptr;
     std::unique_ptr<LayoutEngine> layout_engine_{};
@@ -241,8 +239,7 @@ class Checker {
     void init_comptime_support() {
         if (layout_engine_ && comptime_eval_) return;
         layout_engine_ = std::make_unique<LayoutEngine>(
-            session_, types_, struct_info_, enum_info_, array_lens_,
-            target_layout_);
+            session_, types_, struct_info_, enum_info_, target_layout_);
         comptime_eval_ = std::make_unique<ComptimeEvaluator>(
             session_, crate_, &types_, layout_engine_.get());
     }
@@ -1021,7 +1018,6 @@ class Checker {
                                     types_.to_string(expected) + "`, got `" +
                                     types_.to_string(got) + "`");
                         }
-                        if (!session_.has_errors()) (void)eval.eval_const(c);
                         break;
                     }
                     case AstNodeKind::ItemStatic: {
@@ -1039,7 +1035,6 @@ class Checker {
                                     types_.to_string(expected) + "`, got `" +
                                     types_.to_string(got) + "`");
                         }
-                        if (!session_.has_errors()) (void)eval.eval_static(s);
                         break;
                     }
                     default:
@@ -1061,7 +1056,6 @@ class Checker {
                                      types_.int_(IntKind::Usize));
                     if (!session_.has_errors()) {
                         if (auto v = eval.eval_usize(mid, a->len)) {
-                            array_lens_[a->len] = *v;
                             types_.set_array_len_value(a->len, *v);
                         }
                     }
@@ -1651,12 +1645,8 @@ class Checker {
         if (d.kind != TypeKind::Array) return std::nullopt;
         if (d.array_len_value) return d.array_len_value;
         if (!d.array_len_expr) return std::nullopt;
-        if (auto it = array_lens_.find(d.array_len_expr);
-            it != array_lens_.end())
-            return it->second;
         if (!comptime_eval_) return std::nullopt;
         if (auto v = comptime_eval_->eval_usize(mid, d.array_len_expr)) {
-            array_lens_[d.array_len_expr] = *v;
             types_.set_array_len_value(d.array_len_expr, *v);
             return *v;
         }
@@ -1716,7 +1706,6 @@ class Checker {
         }
 
         TypeId out = types_.array(elem_ty, a);
-        array_lens_[a] = n;
         types_.set_array_len_value(a, n);
         return {.type = out};
     }
@@ -1730,7 +1719,6 @@ class Checker {
         if (comptime_eval_ && !session_.has_errors()) {
             if (auto v = comptime_eval_->eval_usize(mid, a->count)) {
                 n = *v;
-                array_lens_[a->count] = *v;
                 types_.set_array_len_value(a->count, *v);
             }
         }
@@ -2426,7 +2414,7 @@ class Checker {
         std::optional<ComptimeEvaluator> eval{};
         if (has_comptime_params) {
             layout.emplace(session_, types_, struct_info_, enum_info_,
-                           array_lens_, target_layout_);
+                           target_layout_);
             eval.emplace(session_, crate_, &types_, &*layout);
         }
         if (!sig.is_variadic) {

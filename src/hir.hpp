@@ -49,7 +49,7 @@ struct HirBody {
 
 struct HirCrate {
     const ResolvedCrate* crate = nullptr;
-    const CheckedCrate* checked = nullptr;
+    CheckedCrate* checked = nullptr;
 
     std::vector<HirDef> defs{};
     std::vector<HirBody> bodies{};
@@ -67,7 +67,7 @@ struct HirCrate {
 // Builds a HIR view of the crate. This is a lightweight wrapper around the
 // existing resolved + checked AST, primarily to provide stable IDs and a clean
 // handoff point to MIR lowering.
-HirCrate build_hir(const ResolvedCrate& crate, const CheckedCrate& checked);
+HirCrate build_hir(const ResolvedCrate& crate, CheckedCrate& checked);
 
 // Debug output.
 void dump_hir(std::ostream& os, const HirCrate& hir);

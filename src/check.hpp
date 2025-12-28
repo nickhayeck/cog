@@ -25,7 +25,6 @@ struct CheckedCrate {
 
     std::unordered_map<const PatBinding*, TypeId> binding_types{};
     std::unordered_map<const Expr*, TypeId> expr_types{};
-    std::unordered_map<const Expr*, std::uint64_t> array_lens{};
 };
 
 std::optional<CheckedCrate> check_crate(Session& session,

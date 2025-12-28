@@ -1,4 +1,4 @@
-%option noyywrap nodefault yylineno
+%option noyywrap nodefault yylineno noinput nounput
 
 %{
 #include "parse_state.hpp"

@@ -34,7 +34,7 @@ class Lowerer {
           checked_(*hir.checked),
           types_(const_cast<TypeStore&>(checked_.types)),
           layout_(session, types_, checked_.struct_info, checked_.enum_info,
-                  checked_.array_lens, TargetLayout{}) {}
+                  TargetLayout{}) {}
 
     std::optional<MirProgram> run() {
         MirProgram program{};
@@ -1286,12 +1286,7 @@ class Lowerer {
     std::optional<std::uint64_t> array_len_value(TypeId array_ty) const {
         const TypeData& td = types_.get(array_ty);
         if (td.kind != TypeKind::Array) return std::nullopt;
-        if (td.array_len_value) return td.array_len_value;
-        if (td.array_len_expr) {
-            auto it = checked_.array_lens.find(td.array_len_expr);
-            if (it != checked_.array_lens.end()) return it->second;
-        }
-        return std::nullopt;
+        return td.array_len_value;
     }
 
     MirOperand lower_array_repeat(ModuleId mid, const ExprArrayRepeat* r) {

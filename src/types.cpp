@@ -72,10 +72,17 @@ TypeId TypeStore::slice(TypeId elem) const {
 }
 
 TypeId TypeStore::array(TypeId elem, const Expr* len_expr) const {
+    std::optional<std::uint64_t> len_value{};
+    if (len_expr) {
+        if (auto it = array_len_cache_.find(len_expr);
+            it != array_len_cache_.end()) {
+            len_value = it->second;
+        }
+    }
     return make(TypeData{.kind = TypeKind::Array,
                          .elem = elem,
                          .array_len_expr = len_expr,
-                         .array_len_value = std::nullopt});
+                         .array_len_value = len_value});
 }
 
 TypeId TypeStore::tuple(std::vector<TypeId> elems) const {
@@ -377,6 +384,8 @@ std::optional<FloatKind> TypeStore::parse_float_kind(
 }
 
 void TypeStore::set_array_len_value(const Expr* expr, std::uint64_t len) {
+    if (!expr) return;
+    array_len_cache_[expr] = len;
     for (TypeData& t : types_) {
         if (t.kind != TypeKind::Array) continue;
         if (t.array_len_expr != expr) continue;

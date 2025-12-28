@@ -8,10 +8,11 @@
 #include "ast.hpp"
 #include "check.hpp"
 #include "diag.hpp"
-#include "emit_llvm.hpp"
 #include "hir.hpp"
+#include "llvm_backend.hpp"
 #include "lower_mir.hpp"
 #include "mir.hpp"
+#include "mir_interp.hpp"
 #include "parse.hpp"
 #include "resolve.hpp"
 #include "session.hpp"
@@ -143,8 +144,7 @@ int main(int argc, char** argv) {
         checked = cog::check_crate(session, crate, target->layout);
 
     std::optional<cog::HirCrate> hir{};
-    if (!session.has_errors() && checked &&
-        (emit_hir || emit_mir || emit_mir_after_pass)) {
+    if (!session.has_errors() && checked) {
         hir = cog::build_hir(crate, *checked);
     }
 
@@ -162,7 +162,7 @@ int main(int argc, char** argv) {
     }
 
     std::optional<cog::MirProgram> mir{};
-    if (!session.has_errors() && hir && (emit_mir || emit_mir_after_pass)) {
+    if (!session.has_errors() && hir) {
         mir = cog::lower_mir(session, *hir);
     }
 
@@ -204,10 +204,20 @@ int main(int argc, char** argv) {
         }
     }
 
-    if (!session.has_errors() && checked && target &&
+    std::optional<cog::MirInterpreter> mir_eval{};
+    if (!session.has_errors() && hir && mir) {
+        mir_eval.emplace(session, *mir);
+        for (const cog::HirDef& d : hir->defs) {
+            if (d.kind == cog::HirDefKind::Const)
+                (void)mir_eval->eval_const(d.id);
+            else if (d.kind == cog::HirDefKind::Static)
+                (void)mir_eval->eval_static(d.id);
+        }
+    }
+
+    if (!session.has_errors() && hir && mir && target &&
         (emit_llvm || emit_bc || emit_obj || emit_exe)) {
-        cog::EmitLlvmOptions opts{};
-        opts.target = &*target;
+        cog::LlvmEmitOptions opts{};
         if (emit_llvm)
             opts.out_ll = std::filesystem::path(std::string(*emit_llvm));
         if (emit_bc) opts.out_bc = std::filesystem::path(std::string(*emit_bc));
@@ -216,7 +226,8 @@ int main(int argc, char** argv) {
         if (emit_exe)
             opts.out_exe = std::filesystem::path(std::string(*emit_exe));
         opts.emit_main_wrapper = emit_exe.has_value();
-        (void)cog::emit_llvm(session, crate, *checked, opts);
+        if (mir_eval) opts.mir_eval = &*mir_eval;
+        (void)cog::llvm_backend_emit(session, *hir, *mir, *target, opts);
     }
 
     if (session.has_errors()) {

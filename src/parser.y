@@ -46,6 +46,7 @@ static std::vector<T*> take_vec(std::vector<T*>* v) {
 
 %locations
 %error-verbose
+%expect 26
 
 %union {
   long long int_val;
