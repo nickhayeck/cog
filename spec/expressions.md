@@ -48,7 +48,7 @@ let z: [u8; 16] = [0; 16];
   - `N` is the number of elements written, and
   - `T` is determined by unifying the element types (or by an expected type).
 - Each element expression is evaluated and moved into the array.
-- The order of evaluation of element expressions is **unspecified**.
+- Element expressions are evaluated **left-to-right**.
 - `[]` (the empty array literal) is only permitted when the expected type is `[T; 0]` for some `T`.
 
 ### `[x; N]` (repeat)
@@ -95,6 +95,34 @@ Supported loops:
 
 `return` has type `!`.
 
+### `?` (try)
+
+`expr?` is a postfix operator that performs early return on `core::Option(T)` / `core::Result(T, E)` values (see `spec/stdlib.md`).
+
+Semantics (conceptual desugaring; pseudo-code):
+
+- For `core::Result(T, E)`:
+
+```cog
+match expr {
+    Ok(v) => v,
+    Err(e) => return Err(e),
+}
+```
+
+- For `core::Option(T)`:
+
+```cog
+match expr {
+    Some(v) => v,
+    None => return None,
+}
+```
+
+Typing constraints in v0.1:
+- `expr` must have type `core::Result(T, E)` or `core::Option(T)` for some `T`/`E`.
+- The surrounding function’s return type must be compatible (as specified in `spec/stdlib.md`).
+
 ## Match
 
 `match` selects an arm based on pattern matching:
@@ -120,48 +148,48 @@ Typing:
 Exhaustiveness:
 - Match must be exhaustive; `_` can be used as a catch-all (see `spec/moves.md` and planned exhaustiveness details).
 
-## Evaluation order (unspecified)
+## Evaluation order (left-to-right)
 
-Cog intentionally leaves evaluation order unspecified for most subexpressions.
+Cog guarantees **left-to-right evaluation order** for subexpressions.
 
-Examples where you must not rely on order:
+Examples:
 
 ```cog
-// The order of f() and g() is unspecified.
+// Guaranteed: f() is evaluated before g().
 let x = f() + g();
 
-// The order of argument evaluation is unspecified.
+// Guaranteed: arguments are evaluated left-to-right.
 foo(f(), g());
 ```
 
-The compiler may evaluate subexpressions in any order, including interleaving, as long as the behavior corresponds to some valid order consistent with control-flow constructs.
+The left-to-right order is defined syntactically by the surface syntax.
 
-More concretely:
-- For any expression with multiple subexpressions, the implementation may choose an evaluation order.
-- The observable behavior of the program must be consistent with evaluating subexpressions in *some* such order.
-- If different orders would produce different observable results, the result is **unspecified** (the compiler may pick any).
+More concretely, evaluation proceeds as follows (all left-to-right):
+- Unary operators: evaluate the operand, then apply the operator.
+- Binary operators (except `&&`/`||`): evaluate LHS, then RHS, then apply the operator.
+- `a && b`: evaluate `a`; if false, do not evaluate `b`.
+- `a || b`: evaluate `a`; if true, do not evaluate `b`.
+- Assignment `place = expr`: evaluate `place` (including its subexpressions), then evaluate `expr`, then perform the store.
+- Calls `callee(args...)`: evaluate `callee`, then evaluate arguments left-to-right, then perform the call.
+- Method calls `recv.m(args...)`: evaluate `recv`, then evaluate arguments left-to-right, then perform the call.
+- Field access `base.field`: evaluate `base`, then select the field.
+- Indexing `base[index]`: evaluate `base`, then evaluate `index`, then select the element.
+- Tuple/array/struct literals: evaluate elements/fields left-to-right.
+- Blocks: evaluate statements in source order; the trailing expression (if any) is evaluated last.
 
-### Guaranteed ordering (minimal set)
-
-The following ordering is guaranteed:
-
-- `a && b`: `a` is evaluated first; `b` is evaluated only if needed.
-- `a || b`: `a` is evaluated first; `b` is evaluated only if needed.
-- `if cond { ... } else { ... }`: `cond` is evaluated before either branch; only the selected branch is evaluated.
-- `while cond { body }`: each iteration evaluates `cond` before `body`.
-- `match scrutinee { ... }`: `scrutinee` is evaluated before trying arms; arms are tried in source order.
-
-All other ordering is unspecified.
+Control-flow constructs:
+- `if cond { ... } else { ... }`: evaluate `cond`; only the selected branch is evaluated.
+- `while cond { body }`: per iteration, evaluate `cond`; if true evaluate `body`.
+- `match scrutinee { ... }`: evaluate `scrutinee`; arms are tested in source order; only the selected arm body is evaluated.
 
 ### Side effects and “conflicting accesses”
 
-Cog does not attempt to define C-style “unsequenced” UB rules for expressions in v0.1.
+Because evaluation order is defined, side effects are sequenced in that left-to-right order.
 
-Instead:
-- If your program’s meaning depends on evaluation order, rewrite it using temporaries (`let`) to force an order.
-- If an expression performs multiple reads/writes to the same location and the outcome depends on order, the outcome is **unspecified** (it may vary across builds and compiler versions).
-
-An implementation may diagnose obvious cases of “conflicting accesses” (e.g. modifying the same local multiple times in one expression), but v0.1 does not require these diagnoses.
+This does **not** make unsafe memory accesses safe:
+- dereferencing dangling pointers is still UB,
+- in `ReleaseFast`, many failures are still UB (see `spec/build_modes.md`),
+- threading/data races remain out of scope for v0.1.
 
 ## Operators
 

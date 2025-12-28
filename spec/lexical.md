@@ -32,7 +32,7 @@ Identifiers are case-sensitive.
 
 The following tokens are reserved words and cannot be used as identifiers:
 
-`as break comptime const continue crate else enum false fn if impl let loop match mod mut pub return Self static struct true type use while`
+`as auto break comptime const continue crate else enum false fn if impl let loop match mod mut pub return Self static struct true type use while`
 
 Notes:
 - Tags like `repr`, `extern`, `export`, `inline`, `test` are **not** keywords; they are parsed as identifiers inside item tag lists.
@@ -49,6 +49,8 @@ Cog uses these punctuators/operators (non-exhaustive list):
 `+` `-` `*` `/` `%`
 
 `!` `&&` `||`
+
+`?` (try operator)
 
 `&` `^` `~` `<<` `>>`
 

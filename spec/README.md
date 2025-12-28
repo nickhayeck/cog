@@ -22,6 +22,9 @@ The reference compiler in this repo may accept additional syntax (or be missing 
   - explicit `comptime { ... }` blocks and `comptime` parameters
   - comptime is interpreted; compilation emits only **residual runtime operations**
   - no “template specialization” semantics as a language feature (memoization is an optimization only)
+- **`auto` type placeholder**:
+  - enables type inference and polymorphic functions without angle-bracket generics
+  - specified in `spec/auto.md`
 - **C interop** through **item tags** (no `extern fn` keyword forms):
   - `fn[extern(C)] ...;` for imported declarations
   - `fn[export(C)] ... { ... }` for exported definitions
@@ -39,14 +42,17 @@ The reference compiler in this repo may accept additional syntax (or be missing 
 - `spec/build_modes.md`: UB model, traps, and runtime checks.
 - `spec/modules.md`: crates, modules, `use`, and visibility.
 - `spec/types.md`: types (including `type`, `comptime_int`, pointers, slices, enums/structs, `!`).
+- `spec/auto.md`: the `auto` type placeholder (type inference + polymorphism).
 - `spec/layout_abi.md`: data layout (`repr(cog)`, `repr(C)`, `repr(packed)`), calling conventions, symbol naming, varargs.
 - `spec/items.md`: item semantics (`fn`, `impl`, `const`, `static`, `type`) and method calls.
-- `spec/expressions.md`: expression semantics (including unspecified evaluation order) and control flow.
+- `spec/expressions.md`: expression semantics (including left-to-right evaluation order) and control flow.
 - `spec/patterns.md`: pattern semantics and match exhaustiveness.
 - `spec/moves.md`: moves, `Copy` types, and match move behavior.
 - `spec/comptime.md`: comptime contexts, interpreter semantics, determinism, heap + serialization, reflection, and type construction.
 - `spec/stdlib.md`: required core surface (`core::Option`, `core::Result`, `?`, and required runtime symbols).
 - `spec/future.md`: explicitly planned extensions and open questions.
+- `spec/hir.md`: compiler HIR design notes (non-normative).
+- `spec/mir.md`: compiler MIR design notes (non-normative).
 
 ## Notation and normative language
 

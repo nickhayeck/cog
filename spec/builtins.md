@@ -130,11 +130,11 @@ Behavior:
 Signature (conceptual):
 
 ```cog
-builtin::cast(x: any, comptime T: type) -> T
+builtin::cast(x: auto, comptime T: type) -> T
 ```
 
 Notes:
-- `any` is not a real Cog type; it indicates the builtin is polymorphic and has special typing rules.
+- `auto` is the type placeholder (see `spec/auto.md`); it indicates the builtin is polymorphic in `x`.
 - `builtin::cast(x, T)` is exactly the operation performed by `x as T` (see below).
 - Cast validity rules are specified in `spec/types.md`.
 - If `builtin::cast` is used in a comptime context, it is evaluated during comptime execution.

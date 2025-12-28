@@ -21,7 +21,6 @@ and has type `char` (a Unicode scalar value).
 
 ## Additional literals
 
-- Char literals (and the `char` type) with full Unicode escape support.
 - Additional string literal forms:
   - byte/hex escapes (`\xNN`)
   - Unicode scalar escapes (`\u{...}`)
@@ -156,6 +155,19 @@ some maximum (likely `128`) for both computation and layout control.
 
 - Zig-style `build.cg` as the primary build description.
 - A `gear` tool that generates `build.cg` and provides a Cargo-like UX.
+
+## Stable HIR/MIR emission (planned)
+
+The reference compiler is expected to grow internal IR layers (HIR/MIR) and expose them for debugging:
+- `cogc --emit-hir <out.hir> <file.cg>`
+- `cogc --emit-mir <out.mir> <file.cg>`
+- `cogc --emit-mir-after <pass> <out.mir> <file.cg>`
+
+In early v0.x development these textual formats are **not** required to be stable.
+
+Before 1.0, the project should stabilize the text formats enough that:
+- we can write regression tests against IR output, and
+- IR diffs are meaningful during refactors.
 
 ## Tests-in-source (planned)
 

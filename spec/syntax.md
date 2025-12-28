@@ -54,20 +54,24 @@ Notes:
 item := vis? item_core
 
 item_core :=
-    "use" tags? use_tree ";"
+    "use" use_tree ";"
   | "mod" tags? IDENT "{" item* "}"
   | "mod" tags? IDENT ";"
   | "struct" tags? IDENT struct_body
   | "enum" tags? IDENT enum_body
-  | "impl" tags? type_path "{" impl_item* "}"
+  | "impl" type_path "{" impl_item* "}"
   | "fn" tags? IDENT "(" params? ")" ret? (block | ";")
-  | "const" tags? IDENT ":" type "=" expr ";"
-  | "static" tags? IDENT ":" type "=" expr ";"
-  | "type" tags? IDENT "=" type ";"
+  | "const" IDENT ":" type "=" expr ";"
+  | "static" IDENT ":" type "=" expr ";"
+  | "type" IDENT "=" type ";"
 
 impl_item := vis? "fn" tags? IDENT "(" params? ")" ret? block
 ret       := "->" type
 ```
+
+Notes:
+- `inline` tags may be used on `impl` methods.
+- `extern(C)` / `export(C)` tags are module-scope only (see `spec/layout_abi.md`).
 
 ### `use` trees
 
@@ -92,6 +96,7 @@ tuple_field  := vis? type
 
 Notes:
 - Tuple structs are part of the core language surface, but may be implemented after other struct features.
+- `auto` is not permitted in struct field types; see `spec/auto.md`.
 
 ### Enums
 
@@ -104,6 +109,7 @@ variant_discriminant := "=" expr
 
 Notes:
 - Fieldless enums are enums where every variant has no payload (no `(...)`).
+- `auto` is not permitted in enum payload types; see `spec/auto.md`.
 
 ### Parameters
 
@@ -130,6 +136,7 @@ type_path := path
 type :=
     type_call
   | type_path
+  | "auto"                 // type placeholder (see `spec/auto.md`)
   | "type"                 // the type-of-types (comptime-only)
   | "!"                    // never type
   | pointer_type
@@ -141,6 +148,9 @@ type :=
 // Type-level call (type functions).
 // This is how v0.1 expresses “generics without generics syntax”.
 type_call := type_path "(" type_list? ")"
+
+Notes:
+- `auto` must not appear as a type-call argument (see `spec/auto.md`).
 
 pointer_type := ("const" | "mut") "*" type
 slice_type   := "[" type "]"             // unsized slice
@@ -159,6 +169,7 @@ type_list := types
 
 Notes:
 - `fn(...) -> R` is a function type. In v0.1, function types may only appear behind pointers (`const* fn(...) -> R`).
+- Although `auto` is parsed in type positions, it is only permitted in specific contexts; see `spec/auto.md`.
 
 ## Blocks and statements
 
@@ -221,6 +232,7 @@ postfix_expr := primary_expr
              | postfix_expr "." IDENT                // field / tuple index
              | postfix_expr "." IDENT "(" args? ")"  // method call
              | postfix_expr "[" expr "]"             // index
+             | postfix_expr "?"                      // try (`spec/stdlib.md`)
 
 args := expr ("," expr)* ","?
 ```

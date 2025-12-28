@@ -32,12 +32,17 @@ Parameters are passed by value unless their type is a pointer.
 - are evaluated at compile time at each call site
 - do not exist at runtime (see `spec/comptime.md`)
 
+`auto`:
+- `auto` may appear in parameter types for type inference / polymorphism (see `spec/auto.md`).
+- `auto` must not be used in `fn[extern(C)]` / `fn[export(C)]` signatures.
+
 Varargs:
 - `...` is only permitted on `fn[extern(C)]` declarations (see `spec/layout_abi.md`).
 
 ### Return type
 
 - If `-> T` is omitted, the return type is `()`.
+- `-> auto` is permitted for inference; see `spec/auto.md`.
 - `return` exits a function early and has type `!` (see `spec/types.md`).
 
 ## Inherent impl blocks (`impl`)

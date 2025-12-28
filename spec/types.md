@@ -10,6 +10,12 @@ Cog has:
 - **Runtime value types**: types that exist at runtime (ints, pointers, structs, enums, etc.).
 - **Comptime-only types**: types whose values exist only during compilation and are erased (e.g. `type`, `comptime_int`, `comptime_float`).
 
+## `auto` (type placeholder)
+
+`auto` is a type placeholder used for type inference and compile-time polymorphism.
+
+See `spec/auto.md`.
+
 ## Primitive types
 
 ### Integers

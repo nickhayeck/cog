@@ -62,4 +62,4 @@ A binding pattern like `x` or `mut x` binds the matched value:
 
 A guard `if expr` is evaluated after the pattern matches. Any bindings from the pattern are in scope in the guard and the arm body.
 
-The evaluation order inside the guard expression is unspecified (see `spec/expressions.md`).
+The guard expression follows the normal left-to-right evaluation order (see `spec/expressions.md`).

@@ -81,12 +81,9 @@ Note: Cog does not and will not have a general “dangling pointer” check; der
 
 ## Evaluation order and side effects
 
-The **order of evaluation** of subexpressions is **unspecified** (see `spec/expressions.md`).
+Cog guarantees **left-to-right evaluation order** for subexpressions (see `spec/expressions.md`).
 
-Cog does not define a general “sequenced-before” relation like Rust. Instead:
-- If multiple evaluation orders are possible, the program may behave as if *any* one of them was chosen.
-- You must not rely on a particular order unless the spec explicitly guarantees one.
-- Differences due solely to evaluation order are **unspecified behavior**, not UB.
+Side effects are sequenced in that left-to-right order.
 
 ## Data races (threads)
 

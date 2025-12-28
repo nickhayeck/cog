@@ -89,7 +89,7 @@ Constraints:
 
 ### Tags on other items
 
-In v0.1, `use`, `const`, `static`, and `type` items do not accept tags. Supplying tags on these items is an error.
+In v0.1, `use`, `impl`, `const`, `static`, and `type` items do not accept tags. Supplying tags on these items is an error.
 
 ## `repr` and data layout
 
@@ -191,12 +191,21 @@ In v0.1:
 #### FFI-safe types for v0.1
 
 For v0.1, `extern(C)` / `export(C)` signatures are restricted to:
-- integers
-- floats
-- `bool`
-- raw pointers (`const* T`, `mut* T`)
+- parameter types:
+  - integers
+  - floats
+  - `bool`
+  - raw pointers (`const* T`, `mut* T`)
+- return types:
+  - any of the above, plus `()` (C `void`)
 
 Other types (structs, enums, slices, arrays, tuples, function pointers) are not FFI-safe in v0.1 and should be rejected at the C ABI boundary.
+
+#### `extern(C)` / `export(C)` are module-scope only
+
+In v0.1, `extern(C)` / `export(C)` tags are only permitted on module-scope `fn` items.
+
+They are not permitted on `impl` methods.
 
 #### Varargs (`...`)
 
