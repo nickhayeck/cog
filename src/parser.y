@@ -46,7 +46,7 @@ static std::vector<T*> take_vec(std::vector<T*>* v) {
 
 %locations
 %error-verbose
-%expect 26
+%expect 27
 
 %union {
   long long int_val;
@@ -105,7 +105,7 @@ static std::vector<T*> take_vec(std::vector<T*>* v) {
 %token KW_FN KW_STRUCT KW_ENUM KW_IMPL KW_TYPE KW_CONST KW_STATIC
 %token KW_MOD KW_USE KW_PUB KW_AS KW_LET KW_MUT KW_IF KW_ELSE KW_WHILE
 %token KW_LOOP KW_MATCH KW_RETURN KW_BREAK KW_CONTINUE KW_COMPTIME KW_SELF_TYPE KW_CRATE
-%token KW_TRUE KW_FALSE
+%token KW_TRUE KW_FALSE KW_AUTO
 
 %token TOK_COLONCOLON TOK_COLONCOLON_LBRACE TOK_ARROW TOK_FATARROW TOK_EQEQ TOK_NEQ TOK_LE TOK_GE TOK_ANDAND TOK_OROR TOK_SHL TOK_SHR TOK_ELLIPSIS
 
@@ -436,6 +436,8 @@ qpath_segments
 
 type
   : path { $$ = MK(cog::TypePath, @$, $1); }
+  | path '(' types_opt ')' { $$ = MK(cog::TypeCall, @$, $1, take_vec($3)); }
+  | KW_AUTO { $$ = MK(cog::TypeAuto, @$); }
   | KW_TYPE { $$ = MK(cog::TypeType, @$); }
   | '!' { $$ = MK(cog::TypeNever, @$); }
   | KW_FN '(' types_opt ')' ret_opt { $$ = MK(cog::TypeFn, @$, take_vec($3), $5); }

@@ -1,0 +1,9 @@
+// Type-level calls must return `type`.
+
+fn NotAType(comptime T: type) -> i32 { 0 }
+
+type Bad = NotAType(i32);
+
+fn takes_bad(_: Bad) -> () { () }
+
+fn main() -> i32 { 0 }

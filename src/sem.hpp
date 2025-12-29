@@ -42,6 +42,14 @@ struct FnInfo {
     std::vector<bool> comptime_params{};  // parallel to `params`
     TypeId ret = 0;
     bool is_variadic = false;
+
+    // v0.0.22: `auto` placeholder in signatures.
+    // If `has_auto` is true, the signature is not fully known until
+    // `auto_instantiated` becomes true.
+    bool has_auto = false;
+    bool auto_instantiated = true;
+    std::vector<bool> param_has_auto{};  // parallel to `params`
+    bool ret_has_auto = false;
 };
 
 }  // namespace cog

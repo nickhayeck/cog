@@ -1,0 +1,6 @@
+type Bad = auto;
+
+fn uses(_: Bad) -> () { () }
+
+fn main() -> i32 { 0 }
+

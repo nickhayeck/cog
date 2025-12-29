@@ -4,9 +4,11 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "ast.hpp"
+#include "sem.hpp"
 #include "resolve.hpp"
 #include "session.hpp"
 #include "types.hpp"
@@ -16,6 +18,20 @@ namespace cog {
 class LayoutEngine;
 class TypeStore;
 
+struct TypeConstructContext {
+    // Shared cache: key -> constructed type.
+    // The key is a compiler-internal, stable-within-compilation string derived
+    // from the full descriptor values.
+    std::unordered_map<std::string, TypeId>* cache = nullptr;
+
+    // Storage for synthetic nominal items (allocated into `ResolvedCrate::builtins_arena`).
+    AstArena* arena = nullptr;
+
+    // Side tables used by layout/codegen for nominal types.
+    std::unordered_map<const ItemStruct*, StructInfo>* struct_info = nullptr;
+    std::unordered_map<const ItemEnum*, EnumInfo>* enum_info = nullptr;
+};
+
 struct ComptimeValue {
     enum class Kind : std::uint8_t {
         Error,
@@ -23,7 +39,11 @@ struct ComptimeValue {
         Bool,
         Int,
         Float,
+        Type,
+        // Raw pointer value (e.g. from integer↔pointer casts).
         Ptr,
+        // Reference into the comptime heap (e.g. from `&place`).
+        Ref,
         Array,
         Tuple,
         Struct,
@@ -36,6 +56,7 @@ struct ComptimeValue {
     bool bool_value = false;
     std::int64_t int_value = 0;
     double float_value = 0.0;
+    TypeId type_value = 0;
     std::uint64_t ptr_value = 0;
 
     std::string string_value{};
@@ -66,8 +87,14 @@ struct ComptimeValue {
     static ComptimeValue float_(double f) {
         return ComptimeValue{.kind = Kind::Float, .float_value = f};
     }
+    static ComptimeValue type_(TypeId t) {
+        return ComptimeValue{.kind = Kind::Type, .type_value = t};
+    }
     static ComptimeValue ptr_(std::uint64_t p) {
         return ComptimeValue{.kind = Kind::Ptr, .ptr_value = p};
+    }
+    static ComptimeValue ref_(std::uint64_t p) {
+        return ComptimeValue{.kind = Kind::Ref, .ptr_value = p};
     }
     static ComptimeValue array(std::vector<ComptimeValue> elems) {
         ComptimeValue v{};
@@ -87,7 +114,8 @@ class ComptimeEvaluator {
    public:
     explicit ComptimeEvaluator(Session& session, const ResolvedCrate& crate,
                                TypeStore* types = nullptr,
-                               LayoutEngine* layout = nullptr);
+                               LayoutEngine* layout = nullptr,
+                               TypeConstructContext type_ctx = {});
 
     // Evaluate a const/static value. The defining module context is used for
     // name resolution.
@@ -100,12 +128,19 @@ class ComptimeEvaluator {
     // Convenience for array lengths.
     std::optional<std::uint64_t> eval_usize(ModuleId mid, const Expr* expr);
 
+    // Evaluate a function call at comptime with already-evaluated arguments.
+    std::optional<ComptimeValue> eval_fn(const ItemFn* fn,
+                                         std::vector<ComptimeValue> args,
+                                         Span use_site);
+
    private:
     Session& session_;
     const ResolvedCrate& crate_;
     TypeStore* types_ = nullptr;
     LayoutEngine* layout_ = nullptr;
+    TypeConstructContext type_ctx_{};
     const ItemStruct* typeinfo_struct_ = nullptr;
+    const ItemEnum* typekind_enum_ = nullptr;
 
     enum class CacheState : std::uint8_t { InProgress, Done };
 
@@ -130,6 +165,19 @@ class ComptimeEvaluator {
     bool consume_step(Span span);
     bool consume_heap(Span span, std::uint64_t units);
 
+    // ---- Comptime heap / refs ----
+    struct HeapObject {
+        ComptimeValue value{};
+    };
+    std::vector<HeapObject> heap_{};
+    std::optional<std::uint64_t> heap_alloc(Span span, ComptimeValue v);
+    const ComptimeValue* heap_deref(Span span, const ComptimeValue& ref);
+
+    // ---- Canonicalization helpers ----
+    std::string type_key(TypeId t);
+    std::string value_key(const ComptimeValue& v,
+                          std::unordered_set<std::uint64_t>& visiting);
+
     // ---- Name resolution helpers (const-eval only) ----
     const Item* resolve_type_item(ModuleId mid, const Path* path);
     const Item* resolve_value_item(ModuleId mid, const Path* path);
@@ -138,6 +186,7 @@ class ComptimeEvaluator {
     const ItemEnum* resolve_enum(ModuleId mid, const Path* path);
 
     const ItemStruct* find_struct_global(std::string_view name);
+    const ItemEnum* find_enum_in_builtin_module(std::string_view name);
 
     struct ResolvedVariant {
         const ItemEnum* def = nullptr;

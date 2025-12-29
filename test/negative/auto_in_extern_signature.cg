@@ -1,0 +1,4 @@
+fn[extern(C)] puts(s: const* auto) -> i32;
+
+fn main() -> i32 { 0 }
+

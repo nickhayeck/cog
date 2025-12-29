@@ -1,0 +1,6 @@
+struct Bad {
+    x: auto,
+}
+
+fn main() -> i32 { 0 }
+

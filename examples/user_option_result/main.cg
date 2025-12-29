@@ -1,0 +1,207 @@
+// v0.0.23: user-defined "generic" Option/Result types via comptime type
+// construction builtins.
+//
+// This file is intentionally comment-heavy: it’s an end-to-end demonstration of
+// Cog’s current “generic programming” story without angle-bracket generics.
+//
+// Key ideas shown here:
+//
+// 1) `type` is a comptime-only value kind.
+//    - A value of type `type` represents a Cog type (e.g. `i32`, `const* u8`,
+//      a struct type, an enum type, etc).
+//    - You can only meaningfully construct/use `type` values in comptime
+//      contexts (including inside functions that return `type` when called from
+//      a type position).
+//
+// 2) “Type-level calls” in type positions:
+//    - In a type position, `Option(i32)` is *not* a runtime call expression.
+//      It is syntax for “call the comptime function `Option` with the *type*
+//      argument `i32`”, and use the returned `type` as the type here.
+//
+// 3) Type construction builtins:
+//    - `builtin::type_enum(desc)` consumes a descriptor value and produces a
+//      new nominal enum type.
+//    - These builtins are comptime-only; they do not exist at runtime.
+//
+// 4) The confusing part: `[T]` / `[E]` in this file are *array value literals*.
+//    - `T` and `E` are comptime parameters of type `type`, so they are *values*.
+//    - `[T]` is an array literal with one element: the type value `T`.
+//      Its type is `[type; 1]`.
+//    - We pass `&[type; N]` to builtins that expect `const* [type]` (a slice
+//      pointer) using the array-to-slice-pointer coercion.
+//    - This array is not “the enum payload”; it is a *descriptor* saying
+//      “this variant’s payload types are (T)” or “(E)”.
+
+fn Option(comptime T: type) -> type {
+    // `none_payload` is the list of payload field types for the `None` variant.
+    //
+    // It is empty, so we must write an empty array value `[]`.
+    // In Cog, `[]` needs an expected type, so we annotate it as `[type; 0]`
+    // (array of 0 elements, each element would be a `type` value).
+    let none_payload: [type; 0] = [];
+
+    // `some_payload` is the list of payload field types for the `Some` variant.
+    //
+    // This is a single-element array literal containing the *type value* `T`.
+    // So the value has type `[type; 1]`.
+    let some_payload = [T];
+
+    // `variants` is an array of *descriptor structs* (`builtin::EnumVariant`).
+    // Each element describes one enum variant: its name, payload type list, and
+    // (optionally) an explicit discriminant for tagged/FFI enums.
+    let variants = [
+        builtin::EnumVariant{
+            name: "None",
+            payload: &none_payload,
+            discriminant: builtin::MaybeComptimeInt::None,
+        },
+        builtin::EnumVariant{
+            name: "Some",
+            payload: &some_payload,
+            discriminant: builtin::MaybeComptimeInt::None,
+        },
+    ];
+
+    // The enum “descriptor” consumed by `builtin::type_enum`.
+    //
+    // - `name` is currently used for debugging / pretty-printing.
+    //   (Type identity is not “the name”; constructed types are canonicalized
+    //   by the full descriptor values.)
+    // - `tag_type: None` means this is a normal payload enum with an
+    //   implementation-defined tag representation (repr(cog)).
+    //   If `tag_type` were `Some(i32)`, it would request a C-like tagged
+    //   fieldless enum representation, and would be rejected if any variant had
+    //   a payload.
+    let desc = builtin::EnumDesc{
+        name: "Option",
+        variants: &variants,
+        tag_type: builtin::MaybeType::None,
+    };
+
+    builtin::type_enum(desc)
+}
+
+fn Result(comptime T: type, comptime E: type) -> type {
+    // Same “payload type list” idea as `Option`, but this enum has two
+    // single-field variants.
+    let ok_payload = [T];
+    let err_payload = [E];
+
+    let variants = [
+        builtin::EnumVariant{
+            name: "Ok",
+            payload: &ok_payload,
+            discriminant: builtin::MaybeComptimeInt::None,
+        },
+        builtin::EnumVariant{
+            name: "Err",
+            payload: &err_payload,
+            discriminant: builtin::MaybeComptimeInt::None,
+        },
+    ];
+
+    let desc = builtin::EnumDesc{
+        name: "Result",
+        variants: &variants,
+        tag_type: builtin::MaybeType::None,
+    };
+
+    builtin::type_enum(desc)
+}
+
+
+// Calling a `fn ... -> type` in a *type position* constructs a concrete type.
+// These are type aliases to the constructed enum types.
+type OptI32 = Option(i32);
+type ResI32 = Result(i32, i32);
+type OptResI32 = Option(Result(i32, i32));
+
+// ---- Stress: type-level call caching with constructed type arguments ----
+//
+// This intentionally passes a *constructed nominal type* as a type-level call
+// argument.
+//
+// `Option(i32)` and `Option(u8)` both produce enum types named "Option", so any
+// cache key that uses only the *string name* of a type is incorrect (it can
+// confuse distinct types that happen to share a name).
+//
+// We define `Wrap(T)` and apply it to both `Option(i32)` and `Option(u8)`.
+// The resulting wrapper types must be distinct and type-check independently.
+
+type OptU8 = Option(u8);
+
+fn Wrap(comptime T: type) -> type {
+    let fields = [
+        builtin::StructField{
+            name: "value",
+            ty: T,
+            vis: builtin::Vis::Pub,
+        },
+    ];
+
+    let desc = builtin::StructDesc{
+        name: "Wrap",
+        repr: builtin::StructRepr::Cog,
+        fields: &fields,
+    };
+
+    builtin::type_struct(desc)
+}
+
+type WrapOptI32 = Wrap(Option(i32));
+type WrapOptU8 = Wrap(Option(u8));
+
+fn opt_to_i32(x: OptI32) -> i32 {
+    match x {
+        // A unit variant pattern (no payload).
+        OptI32::None => 0,
+        // A payload variant pattern. `v` is bound to the payload value.
+        OptI32::Some(v) => v,
+    }
+}
+
+fn res_to_i32(x: ResI32) -> i32 {
+    match x {
+        ResI32::Ok(v) => v,
+        ResI32::Err(e) => e,
+    }
+}
+
+fn nested_to_i32(x: OptResI32) -> i32 {
+    match x {
+        OptResI32::None => 0,
+        OptResI32::Some(r) => res_to_i32(r),
+    }
+}
+
+fn wrap_opt_i32_to_i32(x: WrapOptI32) -> i32 {
+    opt_to_i32(x.value)
+}
+
+fn wrap_opt_u8_to_i32(x: WrapOptU8) -> i32 {
+    match x.value {
+        OptU8::None => 0,
+        OptU8::Some(v) => v as i32,
+    }
+}
+
+fn main() -> i32 {
+    // Variant constructors use `Type::Variant(...)` syntax.
+    //
+    // Note: `OptI32` is a type alias, but method/variant lookup uses the
+    // underlying constructed enum type.
+    let a: OptI32 = OptI32::Some(10);
+    let b: OptI32 = OptI32::None;
+
+    let ok: ResI32 = ResI32::Ok(32);
+    let err: ResI32 = ResI32::Err(-1);
+
+    let nested_ok: OptResI32 = OptResI32::Some(ok);
+    let nested_err: OptResI32 = OptResI32::Some(err);
+    let nested_none: OptResI32 = OptResI32::None;
+
+    opt_to_i32(a) + opt_to_i32(b) + nested_to_i32(nested_ok) +
+        nested_to_i32(nested_err) + nested_to_i32(nested_none) +
+        wrap_opt_i32_to_i32(WrapOptI32{value: OptI32::Some(1)}) +
+        wrap_opt_u8_to_i32(WrapOptU8{value: OptU8::Some(2)})
+}

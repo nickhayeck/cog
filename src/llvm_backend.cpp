@@ -500,6 +500,8 @@ class LlvmBackend {
         }
         name += ".";
         name += sanitize(s ? s->name : "<struct>");
+        name += "$";
+        name += std::to_string(reinterpret_cast<std::uintptr_t>(s));
         return name;
     }
 
@@ -512,6 +514,8 @@ class LlvmBackend {
         }
         name += ".";
         name += sanitize(e ? e->name : "<enum>");
+        name += "$";
+        name += std::to_string(reinterpret_cast<std::uintptr_t>(e));
         return name;
     }
 
@@ -523,20 +527,43 @@ class LlvmBackend {
     }
 
     void build_nominal_types() {
-        for (ModuleId mid = 0; mid < crate_.modules.size(); mid++) {
-            for (const Item* item : crate_.modules[mid].items) {
-                if (!item) continue;
-                if (item->kind == AstNodeKind::ItemStruct) {
-                    auto* s = static_cast<const ItemStruct*>(item);
-                    struct_types_.insert(
-                        {s, llvm::StructType::create(
-                                ctx_, llvm_struct_type_name(s))});
-                } else if (item->kind == AstNodeKind::ItemEnum) {
-                    auto* e = static_cast<const ItemEnum*>(item);
-                    enum_types_.insert({e, llvm::StructType::create(
-                                               ctx_, llvm_enum_type_name(e))});
-                }
+        // v0.0.23: nominal types are driven by the checker side tables, not
+        // by module item iteration. This includes constructed types created by
+        // comptime type construction builtins.
+        std::optional<ModuleId> builtin_mid{};
+        if (crate_.root < crate_.modules.size()) {
+            if (auto it = crate_.modules[crate_.root].submodules.find("builtin");
+                it != crate_.modules[crate_.root].submodules.end())
+                builtin_mid = it->second;
+        }
+
+        auto is_builtin_item = [&](const Item* it) -> bool {
+            if (!builtin_mid) return false;
+            return locator_.module_of(it) == *builtin_mid;
+        };
+
+        for (const auto& [s, _] : checked_.struct_info) {
+            if (!s) continue;
+            if (is_builtin_item(static_cast<const Item*>(s))) {
+                // Builtin descriptor structs are comptime-only; they must not
+                // be codegenned.
+                continue;
             }
+            struct_types_.insert(
+                {s,
+                 llvm::StructType::create(ctx_, llvm_struct_type_name(s))});
+        }
+
+        for (const auto& [e, _] : checked_.enum_info) {
+            if (!e) continue;
+            if (is_builtin_item(static_cast<const Item*>(e)) &&
+                e->name != "TypeKind") {
+                // Builtin descriptor enums are comptime-only (except TypeKind,
+                // which backs TypeInfo).
+                continue;
+            }
+            enum_types_.insert(
+                {e, llvm::StructType::create(ctx_, llvm_enum_type_name(e))});
         }
 
         // Fill bodies (after predecl so pointer recursion can work).
@@ -610,6 +637,10 @@ class LlvmBackend {
         auto sig_it = checked_.fn_info.find(fn);
         if (sig_it == checked_.fn_info.end()) return;
         const FnInfo& sig = sig_it->second;
+        if (sig.has_auto && !sig.auto_instantiated) {
+            // v0.0.22 MVP: `auto` functions are instantiated on demand.
+            return;
+        }
         if (!sig.comptime_params.empty() &&
             std::any_of(sig.comptime_params.begin(), sig.comptime_params.end(),
                         [](bool b) { return b; })) {
@@ -2196,6 +2227,64 @@ class LlvmBackend {
                       "string comptime value requires `const* u8` or `const* "
                       "[u8]`");
                 return zero_init(ll_ty);
+            }
+            case ComptimeValue::Kind::Enum: {
+                if (td.kind != TypeKind::Enum || !td.enum_def) {
+                    error(use_site, "enum comptime value requires an enum type");
+                    return zero_init(ll_ty);
+                }
+                if (!v.enum_def || v.enum_def != td.enum_def) {
+                    error(use_site,
+                          "enum comptime value does not match expected enum "
+                          "type");
+                    return zero_init(ll_ty);
+                }
+                auto el = layout_.enum_layout(td.enum_def, use_site);
+                if (!el) return zero_init(ll_ty);
+                auto ei_it = checked_.enum_info.find(td.enum_def);
+                if (ei_it == checked_.enum_info.end()) {
+                    error(use_site,
+                          "internal error: missing enum info during constant "
+                          "lowering");
+                    return zero_init(ll_ty);
+                }
+                const EnumInfo& ei = ei_it->second;
+                std::optional<std::size_t> idx{};
+                for (std::size_t i = 0; i < ei.variants_in_order.size(); i++) {
+                    if (ei.variants_in_order[i] == v.enum_variant) {
+                        idx = i;
+                        break;
+                    }
+                }
+                if (!idx) {
+                    error(use_site,
+                          "unknown enum variant `" + v.enum_variant +
+                              "` in comptime value");
+                    return zero_init(ll_ty);
+                }
+                std::int64_t disc_value = static_cast<std::int64_t>(*idx);
+                if (auto di = ei.discriminants.find(v.enum_variant);
+                    di != ei.discriminants.end())
+                    disc_value = di->second;
+
+                llvm::Type* tag_ty = llvm_tag_int_bytes(el->tag_size);
+                llvm::Constant* tag = llvm::ConstantInt::get(
+                    tag_ty, static_cast<std::uint64_t>(disc_value),
+                    /*isSigned=*/true);
+
+                llvm::StructType* ll_enum =
+                    llvm::cast<llvm::StructType>(llvm_type(ty));
+                if (el->payload_size == 0 || ll_enum->getNumElements() == 1) {
+                    return llvm::ConstantStruct::get(ll_enum, {tag});
+                }
+                if (!v.enum_payload.empty()) {
+                    error(use_site,
+                          "payload enums are not supported in LLVM constant "
+                          "lowering yet");
+                }
+                llvm::Constant* payload =
+                    zero_init(ll_enum->getElementType(1));
+                return llvm::ConstantStruct::get(ll_enum, {tag, payload});
             }
             case ComptimeValue::Kind::Struct: {
                 if (td.kind != TypeKind::Struct || !td.struct_def) {

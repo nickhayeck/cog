@@ -1,0 +1,6 @@
+enum Bad {
+    Some(auto),
+}
+
+fn main() -> i32 { 0 }
+

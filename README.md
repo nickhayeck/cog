@@ -10,9 +10,13 @@ This repo contains an early C++ prototype compiler (`cogc`).
 - Comptime design notes: `comptime_design.md`
 - Examples: `examples/`
 
-## Status (v0.0.20)
+## Status (v0.0.23)
 - Front-end: parse → modules/`use` → type check + local move check → HIR → MIR.
 - Comptime: function calls (with resource limits), `comptime` parameters with residualization, and `builtin::type_info(type)`.
+- Type-level programming:
+  - `type` values + type-level calls in type positions (`PickWord(i32)`)
+  - comptime type construction builtins (`builtin::type_enum`, `builtin::type_struct`, etc)
+- `auto` type placeholder (MVP polymorphic functions, see `spec/auto.md`).
 - Core typing: `!` (never) type + match exhaustiveness (bool/enums; `_` required for int matches), tuple structs + `.0/.1`, and function pointers (`const* fn(...) -> R`).
 - Core surface: array literals (`[e0, e1, ...]` and `[x; N]`), float literals/types (`f32`/`f64`), bitwise ops/shifts, and indexing (`a[i]`, including raw pointer indexing).
 - MIR interpreter: const/static initialization + comptime blocks/paths are evaluated on MIR, and the result is embedded as runtime constants.

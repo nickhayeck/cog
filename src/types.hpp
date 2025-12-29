@@ -99,6 +99,7 @@ class TypeStore {
     TypeId ptr(Mutability mut, TypeId pointee) const;
     TypeId slice(TypeId elem) const;
     TypeId array(TypeId elem, const Expr* len_expr) const;
+    TypeId array_const(TypeId elem, std::uint64_t len) const;
     TypeId tuple(std::vector<TypeId> elems) const;
     TypeId fn(std::vector<TypeId> params, TypeId ret) const;
     TypeId struct_(const ItemStruct* def) const;

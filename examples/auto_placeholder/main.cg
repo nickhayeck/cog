@@ -1,0 +1,21 @@
+// v0.0.22: `auto` placeholder for inference and polymorphic functions.
+//
+// `auto` is *not* a concrete runtime type. It’s a placeholder meaning:
+// - “infer this type from context” (for locals/consts/statics), and
+// - “this function is polymorphic over the argument/return types” (in function
+//   signatures).
+//
+// In this v0.0.22 MVP, `auto` functions are instantiated per call site (the
+// compiler caches instantiations as an optimization).
+
+fn id(x: auto) -> auto { x }
+
+fn main() -> i32 {
+    // Local type annotation `: auto` means “infer from initializer”.
+    let x: auto = id(41 as i32);
+
+    // `auto` can appear nested inside other local type annotations.
+    // Here it means: infer `p` as `const* i32` from `&x`.
+    let p: const* auto = &x;
+    *p
+}

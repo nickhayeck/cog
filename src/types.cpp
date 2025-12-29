@@ -85,6 +85,13 @@ TypeId TypeStore::array(TypeId elem, const Expr* len_expr) const {
                          .array_len_value = len_value});
 }
 
+TypeId TypeStore::array_const(TypeId elem, std::uint64_t len) const {
+    return make(TypeData{.kind = TypeKind::Array,
+                         .elem = elem,
+                         .array_len_expr = nullptr,
+                         .array_len_value = len});
+}
+
 TypeId TypeStore::tuple(std::vector<TypeId> elems) const {
     TypeData d{.kind = TypeKind::Tuple};
     d.tuple_elems = std::move(elems);

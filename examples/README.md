@@ -13,6 +13,9 @@ These examples are intended to compile with the current prototype compiler.
 - `comptime_function_calls/`: comptime function calls + `builtin::type_info(type)`.
 - `comptime_parameters/`: `comptime` parameters + residualization.
 - `crc32_tool/`: a small “real program” using `printf` + comptime-generated data (CRC32 table).
+- `type_level_calls/`: `type` values + type-level calls in type positions.
+- `auto_placeholder/`: `auto` placeholder for inference + call-site polymorphism.
+- `user_option_result/`: user-defined `Option`/`Result` via comptime type construction (`builtin::type_enum`).
 - `match_or_patterns/`: `match` with `|` pattern alternatives and guards.
 - `match_exhaustiveness/`: `match` exhaustiveness (positive cases).
 - `never_type/`: `!` (never) type unification through control flow.

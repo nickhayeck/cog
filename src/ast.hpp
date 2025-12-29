@@ -54,6 +54,8 @@ enum class AstNodeKind : std::uint16_t {
 
     // Types
     TypePath,
+    TypeCall,
+    TypeAuto,
     TypePtr,
     TypeSlice,
     TypeArray,
@@ -191,6 +193,19 @@ struct TypePath final : Type {
     Path* path = nullptr;
     explicit TypePath(Span span, Path* path)
         : Type(AstNodeKind::TypePath, span), path(path) {}
+};
+
+struct TypeCall final : Type {
+    Path* callee = nullptr;
+    std::vector<Type*> args{};
+    explicit TypeCall(Span span, Path* callee, std::vector<Type*> args)
+        : Type(AstNodeKind::TypeCall, span),
+          callee(callee),
+          args(std::move(args)) {}
+};
+
+struct TypeAuto final : Type {
+    explicit TypeAuto(Span span) : Type(AstNodeKind::TypeAuto, span) {}
 };
 
 struct TypePtr final : Type {

@@ -6,6 +6,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -32,7 +33,15 @@ struct VarInfo {
 
 struct Env {
     std::vector<std::unordered_map<std::string, VarInfo>> scopes{};
+    bool in_function = false;
     std::optional<TypeId> fn_ret{};
+
+    bool infer_return = false;
+    struct ReturnCandidate {
+        Span span{};
+        TypeId type = 0;
+    };
+    std::vector<ReturnCandidate>* return_candidates = nullptr;
 
     Env() { scopes.emplace_back(); }
 
@@ -208,12 +217,34 @@ class Checker {
     std::unordered_map<const ItemConst*, TypeId> const_types_{};
     std::unordered_map<const ItemStatic*, TypeId> static_types_{};
     std::unordered_map<const ItemFn*, FnInfo> fn_info_{};
+    std::unordered_map<const ItemFn*, ModuleId> fn_modules_{};
     std::unordered_map<const PatBinding*, TypeId> binding_types_{};
     std::unordered_map<const Expr*, TypeId> expr_types_{};
+    std::unordered_set<const ItemFn*> bodies_checked_{};
+    std::unordered_set<const ItemFn*> auto_instantiating_{};
 
     const ItemStruct* typeinfo_struct_ = nullptr;
     std::unique_ptr<LayoutEngine> layout_engine_{};
     std::unique_ptr<ComptimeEvaluator> comptime_eval_{};
+
+    enum class TypeCallCacheState : std::uint8_t { InProgress, Done };
+    struct CachedTypeCall {
+        TypeCallCacheState state = TypeCallCacheState::InProgress;
+        TypeId result = 0;
+    };
+    std::unordered_map<std::string, CachedTypeCall> type_call_cache_{};
+    std::unordered_map<std::string, TypeId> type_construct_cache_{};
+    std::uint32_t comptime_depth_ = 0;
+
+    struct ScopedComptimeContext {
+        Checker& self;
+        explicit ScopedComptimeContext(Checker& self) : self(self) {
+            self.comptime_depth_++;
+        }
+        ~ScopedComptimeContext() { self.comptime_depth_--; }
+    };
+
+    bool in_comptime_context() const { return comptime_depth_ > 0; }
 
     void error(Span span, std::string message) {
         session_.diags.push_back(Diagnostic{.severity = Severity::Error,
@@ -231,17 +262,71 @@ class Checker {
         return nullptr;
     }
 
+    const ItemStruct* find_struct_in_builtin_module(std::string_view name) const {
+        if (crate_.root >= crate_.modules.size()) return nullptr;
+        auto it = crate_.modules[crate_.root].submodules.find("builtin");
+        if (it == crate_.modules[crate_.root].submodules.end()) return nullptr;
+        ModuleId bid = it->second;
+        if (bid >= crate_.modules.size()) return nullptr;
+        auto tit = crate_.modules[bid].types.find(std::string(name));
+        if (tit == crate_.modules[bid].types.end()) return nullptr;
+        if (!tit->second || tit->second->kind != AstNodeKind::ItemStruct)
+            return nullptr;
+        return static_cast<const ItemStruct*>(tit->second);
+    }
+
     TypeId typeinfo_type() {
         if (!typeinfo_struct_) return types_.error();
         return types_.struct_(typeinfo_struct_);
+    }
+
+    bool type_contains_auto(const Type* ty) const {
+        if (!ty) return false;
+        switch (ty->kind) {
+            case AstNodeKind::TypeAuto:
+                return true;
+            case AstNodeKind::TypePtr:
+                return type_contains_auto(static_cast<const TypePtr*>(ty)->pointee);
+            case AstNodeKind::TypeSlice:
+                return type_contains_auto(static_cast<const TypeSlice*>(ty)->elem);
+            case AstNodeKind::TypeArray: {
+                auto* a = static_cast<const TypeArray*>(ty);
+                return type_contains_auto(a->elem);
+            }
+            case AstNodeKind::TypeTuple: {
+                auto* t = static_cast<const TypeTuple*>(ty);
+                for (const Type* e : t->elems)
+                    if (type_contains_auto(e)) return true;
+                return false;
+            }
+            case AstNodeKind::TypeFn: {
+                auto* ft = static_cast<const TypeFn*>(ty);
+                for (const Type* p : ft->params)
+                    if (type_contains_auto(p)) return true;
+                return type_contains_auto(ft->ret);
+            }
+            case AstNodeKind::TypeCall: {
+                auto* c = static_cast<const TypeCall*>(ty);
+                for (const Type* a : c->args)
+                    if (type_contains_auto(a)) return true;
+                return false;
+            }
+            default:
+                return false;
+        }
     }
 
     void init_comptime_support() {
         if (layout_engine_ && comptime_eval_) return;
         layout_engine_ = std::make_unique<LayoutEngine>(
             session_, types_, struct_info_, enum_info_, target_layout_);
+        TypeConstructContext tc{};
+        tc.cache = &type_construct_cache_;
+        tc.arena = &crate_.builtins_arena;
+        tc.struct_info = &struct_info_;
+        tc.enum_info = &enum_info_;
         comptime_eval_ = std::make_unique<ComptimeEvaluator>(
-            session_, crate_, &types_, layout_engine_.get());
+            session_, crate_, &types_, layout_engine_.get(), tc);
     }
 
     static bool path_is_ident(const Path* p, std::string_view name) {
@@ -287,6 +372,21 @@ class Checker {
         const TagLookup exn = find_tag(fn->attrs, "extern_name");
         const TagLookup expn = find_tag(fn->attrs, "export_name");
         const TagLookup inl = find_tag(fn->attrs, "inline");
+
+        bool sig_has_auto = false;
+        for (const Param* p : fn->decl->sig->params) {
+            if (p && type_contains_auto(p->type)) {
+                sig_has_auto = true;
+                break;
+            }
+        }
+        if (!sig_has_auto && fn->decl->sig->ret)
+            sig_has_auto = type_contains_auto(fn->decl->sig->ret);
+        if (sig_has_auto && (ex.first || exp.first)) {
+            error(fn->span,
+                  "`auto` is not allowed in `extern(C)`/`export(C)` signatures "
+                  "in v0.0.x");
+        }
 
         if (ex.count > 1)
             error(ex.first ? ex.first->span : fn->span,
@@ -583,17 +683,25 @@ class Checker {
                 switch (item->kind) {
                     case AstNodeKind::ItemConst: {
                         auto* c = static_cast<const ItemConst*>(item);
-                        TypeId ty =
-                            lower_type(mid, c->type, /*allow_unsized=*/false,
-                                       std::nullopt, /*allow_self=*/false);
+                        const bool has_auto = type_contains_auto(c->type);
+                        TypeId ty = has_auto
+                                        ? types_.error()
+                                        : lower_type(mid, c->type,
+                                                     /*allow_unsized=*/false,
+                                                     std::nullopt,
+                                                     /*allow_self=*/false);
                         const_types_.insert({c, ty});
                         break;
                     }
                     case AstNodeKind::ItemStatic: {
                         auto* s = static_cast<const ItemStatic*>(item);
-                        TypeId ty =
-                            lower_type(mid, s->type, /*allow_unsized=*/false,
-                                       std::nullopt, /*allow_self=*/false);
+                        const bool has_auto = type_contains_auto(s->type);
+                        TypeId ty = has_auto
+                                        ? types_.error()
+                                        : lower_type(mid, s->type,
+                                                     /*allow_unsized=*/false,
+                                                     std::nullopt,
+                                                     /*allow_self=*/false);
                         static_types_.insert({s, ty});
                         break;
                     }
@@ -623,6 +731,7 @@ class Checker {
                         std::optional<TypeId> self_ty, bool allow_self) {
         if (!fn || !fn->decl || !fn->decl->sig) return;
         validate_fn_abi_tags(fn, self_ty);
+        fn_modules_.insert({fn, mid});
         fn_info_.insert(
             {fn, lower_fn_sig(mid, fn->decl->sig, self_ty, allow_self)});
     }
@@ -631,16 +740,222 @@ class Checker {
                         std::optional<TypeId> self_ty, bool allow_self) {
         FnInfo out{};
         out.is_variadic = sig->is_variadic;
-        out.ret = sig->ret ? lower_type(mid, sig->ret, /*allow_unsized=*/false,
-                                        self_ty, allow_self)
-                           : types_.unit();
+        out.ret_has_auto = sig->ret && type_contains_auto(sig->ret);
+        out.ret = out.ret_has_auto
+                      ? types_.error()
+                      : (sig->ret ? lower_type(mid, sig->ret,
+                                               /*allow_unsized=*/false, self_ty,
+                                               allow_self)
+                                  : types_.unit());
         for (const Param* p : sig->params) {
             if (!p) continue;
-            TypeId pt = lower_type(mid, p->type, /*allow_unsized=*/false,
-                                   self_ty, allow_self);
+            const bool has_auto = type_contains_auto(p->type);
+            out.param_has_auto.push_back(has_auto);
+            TypeId pt = has_auto ? types_.error()
+                                 : lower_type(mid, p->type,
+                                              /*allow_unsized=*/false, self_ty,
+                                              allow_self);
             out.params.push_back(pt);
             out.comptime_params.push_back(p->is_comptime);
         }
+        out.has_auto = out.ret_has_auto ||
+                       std::any_of(out.param_has_auto.begin(),
+                                   out.param_has_auto.end(),
+                                   [](bool b) { return b; });
+        out.auto_instantiated = !out.has_auto;
+        return out;
+    }
+
+    std::string type_call_cache_key(const ItemFn* fn,
+                                    const std::vector<TypeId>& args) const {
+        auto type_key = [&](TypeId t, auto&& self,
+                            std::unordered_set<TypeId>& visiting) -> std::string {
+            if (visiting.contains(t)) return "cycle@" + std::to_string(t);
+            visiting.insert(t);
+
+            const TypeData& d = types_.get(t);
+            switch (d.kind) {
+                case TypeKind::Error:
+                    visiting.erase(t);
+                    return "err";
+                case TypeKind::Unit:
+                case TypeKind::Bool:
+                case TypeKind::Int:
+                case TypeKind::Float:
+                case TypeKind::Never:
+                case TypeKind::TypeType:
+                case TypeKind::Self: {
+                    std::string s = types_.to_string(t);
+                    visiting.erase(t);
+                    return s;
+                }
+                case TypeKind::Ptr: {
+                    std::string s = (d.mutability == Mutability::Mut ? "mut*<"
+                                                                     : "const*<") +
+                                    self(d.pointee, self, visiting) + ">";
+                    visiting.erase(t);
+                    return s;
+                }
+                case TypeKind::Slice: {
+                    std::string s =
+                        "slice<" + self(d.elem, self, visiting) + ">";
+                    visiting.erase(t);
+                    return s;
+                }
+                case TypeKind::Array: {
+                    std::ostringstream out;
+                    out << "array<" << self(d.elem, self, visiting) << ">[";
+                    if (d.array_len_value) {
+                        out << *d.array_len_value;
+                    } else {
+                        out << "expr@"
+                            << reinterpret_cast<std::uintptr_t>(d.array_len_expr);
+                    }
+                    out << "]";
+                    visiting.erase(t);
+                    return out.str();
+                }
+                case TypeKind::Tuple: {
+                    std::ostringstream out;
+                    out << "tuple(";
+                    for (size_t i = 0; i < d.tuple_elems.size(); i++) {
+                        if (i) out << ",";
+                        out << self(d.tuple_elems[i], self, visiting);
+                    }
+                    out << ")";
+                    visiting.erase(t);
+                    return out.str();
+                }
+                case TypeKind::Fn: {
+                    std::ostringstream out;
+                    out << "fn(";
+                    for (size_t i = 0; i < d.fn_params.size(); i++) {
+                        if (i) out << ",";
+                        out << self(d.fn_params[i], self, visiting);
+                    }
+                    out << ")->" << self(d.fn_ret, self, visiting);
+                    visiting.erase(t);
+                    return out.str();
+                }
+                case TypeKind::Struct: {
+                    std::ostringstream out;
+                    out << "struct@"
+                        << reinterpret_cast<std::uintptr_t>(d.struct_def);
+                    visiting.erase(t);
+                    return out.str();
+                }
+                case TypeKind::Enum: {
+                    std::ostringstream out;
+                    out << "enum@" << reinterpret_cast<std::uintptr_t>(d.enum_def);
+                    visiting.erase(t);
+                    return out.str();
+                }
+            }
+
+            visiting.erase(t);
+            return "<type>";
+        };
+
+        std::string key{};
+        key.reserve(64);
+        key += "fn@";
+        key += std::to_string(reinterpret_cast<std::uintptr_t>(fn));
+        for (TypeId a : args) {
+            key += "|";
+            std::unordered_set<TypeId> visiting{};
+            key += type_key(a, type_key, visiting);
+        }
+        return key;
+    }
+
+    TypeId lower_type_call(ModuleId mid, const TypeCall* call,
+                           bool allow_unsized) {
+        if (!call || !call->callee) return types_.error();
+        init_comptime_support();
+        if (!comptime_eval_) return types_.error();
+
+        const ItemFn* fn = resolve_fn_path(mid, call->callee);
+        if (!fn || !fn->decl || !fn->decl->sig) {
+            error(call->span,
+                  "type-level call target must be a function returning `type`");
+            return types_.error();
+        }
+        auto sig_it = fn_info_.find(fn);
+        if (sig_it == fn_info_.end()) return types_.error();
+        const FnInfo& sig = sig_it->second;
+
+        if (!types_.equal(sig.ret, types_.type_type())) {
+            error(call->span,
+                  "type-level call target must return `type` (got `" +
+                      types_.to_string(sig.ret) + "`)");
+            return types_.error();
+        }
+
+        if (sig.params.size() != call->args.size()) {
+            error(call->span, "type-level call arity mismatch");
+            return types_.error();
+        }
+        for (size_t i = 0; i < sig.params.size(); i++) {
+            const bool is_ct =
+                i < sig.comptime_params.size() && sig.comptime_params[i];
+            if (!is_ct) {
+                error(call->span,
+                      "type-level call targets must take only `comptime` "
+                      "parameters in v0.1");
+                return types_.error();
+            }
+            if (!types_.equal(sig.params[i], types_.type_type())) {
+                error(call->span,
+                      "type-level call parameters must have type `type` in "
+                      "v0.1");
+                return types_.error();
+            }
+        }
+
+        std::vector<TypeId> arg_tys{};
+        arg_tys.reserve(call->args.size());
+        for (const Type* a : call->args) {
+            // Type-level call arguments are types; represent them as type
+            // values.
+            arg_tys.push_back(
+                lower_type(mid, a, /*allow_unsized=*/true, std::nullopt,
+                           /*allow_self=*/false));
+        }
+
+        const std::string key = type_call_cache_key(fn, arg_tys);
+        if (auto it = type_call_cache_.find(key); it != type_call_cache_.end()) {
+            if (it->second.state == TypeCallCacheState::InProgress) {
+                error(call->span, "cycle detected while evaluating type call");
+                return types_.error();
+            }
+            return it->second.result;
+        }
+
+        type_call_cache_.insert(
+            {key, CachedTypeCall{.state = TypeCallCacheState::InProgress}});
+
+        std::vector<ComptimeValue> ct_args{};
+        ct_args.reserve(arg_tys.size());
+        for (TypeId a : arg_tys) ct_args.push_back(ComptimeValue::type_(a));
+
+        std::optional<ComptimeValue> rv =
+            comptime_eval_->eval_fn(fn, std::move(ct_args), call->span);
+        if (!rv || rv->kind != ComptimeValue::Kind::Type) {
+            error(call->span,
+                  "type-level call did not evaluate to a `type` value");
+            type_call_cache_[key] = CachedTypeCall{.state = TypeCallCacheState::Done,
+                                                   .result = types_.error()};
+            return types_.error();
+        }
+
+        TypeId out = rv->type_value;
+        if (!allow_unsized && !types_.is_sized(out)) {
+            error(call->span, "unsized type must appear behind a pointer");
+            out = types_.error();
+        }
+
+        type_call_cache_[key] =
+            CachedTypeCall{.state = TypeCallCacheState::Done, .result = out};
         return out;
     }
 
@@ -654,10 +969,18 @@ class Checker {
                 return types_.type_type();
             case AstNodeKind::TypeNever:
                 return types_.never();
+            case AstNodeKind::TypeAuto:
+                error(ty->span,
+                      "`auto` is not a runtime type; it is only permitted in "
+                      "value type annotations and function signatures");
+                return types_.error();
             case AstNodeKind::TypePath:
                 return lower_type_path(mid,
                                        static_cast<const TypePath*>(ty)->path,
                                        allow_unsized, self_ty, allow_self);
+            case AstNodeKind::TypeCall:
+                return lower_type_call(mid, static_cast<const TypeCall*>(ty),
+                                       allow_unsized);
             case AstNodeKind::TypePtr: {
                 auto* p = static_cast<const TypePtr*>(ty);
                 TypeId pointee =
@@ -733,6 +1056,37 @@ class Checker {
         return it->second;
     }
 
+    std::optional<TypeId> try_lower_type_path(ModuleId mid, const Path* path) {
+        if (!path || path->segments.empty()) return std::nullopt;
+
+        if (path->segments.size() == 1) {
+            std::string_view name = path->segments[0]->text;
+            if (name == "bool") return types_.bool_();
+            if (auto ik = types_.parse_int_kind(name))
+                return types_.int_(*ik);
+            if (auto fk = types_.parse_float_kind(name))
+                return types_.float_(*fk);
+        }
+
+        const Item* item = resolve_type_item(mid, path, /*emit_errors=*/false);
+        if (!item) return std::nullopt;
+
+        switch (item->kind) {
+            case AstNodeKind::ItemStruct:
+                return types_.struct_(static_cast<const ItemStruct*>(item));
+            case AstNodeKind::ItemEnum:
+                return types_.enum_(static_cast<const ItemEnum*>(item));
+            case AstNodeKind::ItemTypeAlias: {
+                auto* ta = static_cast<const ItemTypeAlias*>(item);
+                return lower_type(mid, ta->aliased, /*allow_unsized=*/true,
+                                  std::nullopt, /*allow_self=*/false);
+            }
+            default:
+                break;
+        }
+        return std::nullopt;
+    }
+
     TypeId lower_type_path(ModuleId mid, const Path* path, bool allow_unsized,
                            std::optional<TypeId> self_ty, bool allow_self) {
         if (!path || path->segments.empty()) return types_.error();
@@ -783,6 +1137,103 @@ class Checker {
                                /*allow_self=*/false);
     }
 
+    TypeId infer_auto_type(ModuleId mid, const Type* syntax, TypeId source,
+                           bool allow_unsized, std::optional<TypeId> self_ty,
+                           bool allow_self) {
+        if (!syntax) return types_.error();
+        switch (syntax->kind) {
+            case AstNodeKind::TypeAuto:
+                return source;
+            case AstNodeKind::TypePtr: {
+                auto* p = static_cast<const TypePtr*>(syntax);
+                const TypeData& sd = types_.get(source);
+                if (sd.kind != TypeKind::Ptr) {
+                    error(syntax->span,
+                          "cannot infer `auto`: expected a pointer type, got `" +
+                              types_.to_string(source) + "`");
+                    return types_.error();
+                }
+                TypeId pointee = infer_auto_type(mid, p->pointee, sd.pointee,
+                                                 /*allow_unsized=*/true,
+                                                 self_ty, allow_self);
+                return types_.ptr(p->mutability, pointee);
+            }
+            case AstNodeKind::TypeSlice: {
+                if (!allow_unsized)
+                    error(syntax->span,
+                          "slice types must appear behind a pointer");
+                auto* s = static_cast<const TypeSlice*>(syntax);
+                const TypeData& sd = types_.get(source);
+                if (sd.kind != TypeKind::Slice) {
+                    error(syntax->span,
+                          "cannot infer `auto`: expected a slice type, got `" +
+                              types_.to_string(source) + "`");
+                    return types_.error();
+                }
+                TypeId elem = infer_auto_type(mid, s->elem, sd.elem,
+                                              /*allow_unsized=*/false, self_ty,
+                                              allow_self);
+                return types_.slice(elem);
+            }
+            case AstNodeKind::TypeArray: {
+                auto* a = static_cast<const TypeArray*>(syntax);
+                const TypeData& sd = types_.get(source);
+                if (sd.kind != TypeKind::Array) {
+                    error(syntax->span,
+                          "cannot infer `auto`: expected an array type, got `" +
+                              types_.to_string(source) + "`");
+                    return types_.error();
+                }
+                TypeId elem = infer_auto_type(mid, a->elem, sd.elem,
+                                              /*allow_unsized=*/false, self_ty,
+                                              allow_self);
+                return types_.array(elem, a->len);
+            }
+            case AstNodeKind::TypeTuple: {
+                auto* t = static_cast<const TypeTuple*>(syntax);
+                const TypeData& sd = types_.get(source);
+                if (sd.kind != TypeKind::Tuple) {
+                    error(syntax->span,
+                          "cannot infer `auto`: expected a tuple type, got `" +
+                              types_.to_string(source) + "`");
+                    return types_.error();
+                }
+                if (t->elems.size() != sd.tuple_elems.size()) {
+                    error(syntax->span,
+                          "cannot infer `auto`: tuple arity mismatch");
+                    return types_.error();
+                }
+                std::vector<TypeId> elems{};
+                elems.reserve(t->elems.size());
+                for (size_t i = 0; i < t->elems.size(); i++) {
+                    elems.push_back(infer_auto_type(mid, t->elems[i],
+                                                    sd.tuple_elems[i],
+                                                    /*allow_unsized=*/false,
+                                                    self_ty, allow_self));
+                }
+                return types_.tuple(std::move(elems));
+            }
+            case AstNodeKind::TypeFn:
+                error(syntax->span,
+                      "`auto` is not permitted in function types (`fn(...) -> "
+                      "R`)");
+                return types_.error();
+            case AstNodeKind::TypeCall: {
+                auto* c = static_cast<const TypeCall*>(syntax);
+                for (const Type* a : c->args) {
+                    if (type_contains_auto(a)) {
+                        error(a->span,
+                              "`auto` must not appear as a type-call argument");
+                        return types_.error();
+                    }
+                }
+                return lower_type(mid, syntax, allow_unsized, self_ty, allow_self);
+            }
+            default:
+                return lower_type(mid, syntax, allow_unsized, self_ty, allow_self);
+        }
+    }
+
     void check_bodies() {
         for (ModuleId mid = 0; mid < crate_.modules.size(); mid++) {
             const Module& m = crate_.modules[mid];
@@ -812,6 +1263,7 @@ class Checker {
         if (session_.has_errors()) return;
         if (!comptime_eval_) return;
         ComptimeEvaluator& eval = *comptime_eval_;
+        ScopedComptimeContext comptime_ctx(*this);
 
         // Evaluate array lengths that appear in item signatures and layouts.
         for (ModuleId mid = 0; mid < crate_.modules.size(); mid++) {
@@ -1005,35 +1457,73 @@ class Checker {
                 switch (item->kind) {
                     case AstNodeKind::ItemConst: {
                         auto* c = static_cast<const ItemConst*>(item);
-                        TypeId expected = const_types_.contains(c)
-                                              ? const_types_.at(c)
-                                              : types_.error();
+                        const bool has_auto = type_contains_auto(c->type);
+                        TypeId expected =
+                            (const_types_.contains(c) && !has_auto)
+                                ? const_types_.at(c)
+                                : types_.error();
                         Env env{};
-                        TypeId got =
-                            check_expr(mid, c->value, env, expected).type;
+                        env.in_function = false;
+                        TypeId got = check_expr(mid, c->value, env,
+                                                has_auto ? std::nullopt
+                                                         : std::optional<TypeId>(
+                                                               expected))
+                                         .type;
+                        if (has_auto) {
+                            TypeId inferred =
+                                infer_auto_type(mid, c->type, got,
+                                                /*allow_unsized=*/false,
+                                                std::nullopt,
+                                                /*allow_self=*/false);
+                            const_types_[c] = inferred;
+                            expected = inferred;
+                        }
                         if (!types_.can_coerce(got, expected)) {
-                            error(
-                                c->span,
-                                "const initializer type mismatch: expected `" +
-                                    types_.to_string(expected) + "`, got `" +
-                                    types_.to_string(got) + "`");
+                            error(c->span,
+                                  "const initializer type mismatch: expected `" +
+                                      types_.to_string(expected) + "`, got `" +
+                                      types_.to_string(got) + "`");
                         }
                         break;
                     }
                     case AstNodeKind::ItemStatic: {
                         auto* s = static_cast<const ItemStatic*>(item);
-                        TypeId expected = static_types_.contains(s)
-                                              ? static_types_.at(s)
-                                              : types_.error();
+                        const bool has_auto = type_contains_auto(s->type);
+                        TypeId expected =
+                            (static_types_.contains(s) && !has_auto)
+                                ? static_types_.at(s)
+                                : types_.error();
                         Env env{};
-                        TypeId got =
-                            check_expr(mid, s->value, env, expected).type;
+                        env.in_function = false;
+                        TypeId got = check_expr(mid, s->value, env,
+                                                has_auto ? std::nullopt
+                                                         : std::optional<TypeId>(
+                                                               expected))
+                                         .type;
+                        if (has_auto) {
+                            TypeId inferred =
+                                infer_auto_type(mid, s->type, got,
+                                                /*allow_unsized=*/false,
+                                                std::nullopt,
+                                                /*allow_self=*/false);
+                            static_types_[s] = inferred;
+                            expected = inferred;
+                            if (types_.get(inferred).kind == TypeKind::TypeType) {
+                                error(s->span,
+                                      "`static` type must be a runtime storage "
+                                      "type (got `type`)");
+                            }
+                            if (!types_.is_sized(inferred)) {
+                                error(s->span,
+                                      "`static` type must be sized (got `" +
+                                          types_.to_string(inferred) + "`)");
+                            }
+                        }
                         if (!types_.can_coerce(got, expected)) {
-                            error(
-                                s->span,
-                                "static initializer type mismatch: expected `" +
-                                    types_.to_string(expected) + "`, got `" +
-                                    types_.to_string(got) + "`");
+                            error(s->span,
+                                  "static initializer type mismatch: expected `" +
+                                      types_.to_string(expected) + "`, got `" +
+                                      types_.to_string(got) + "`");
                         }
                         break;
                     }
@@ -1048,9 +1538,15 @@ class Checker {
                            ComptimeEvaluator& eval) {
         if (!ty) return;
         switch (ty->kind) {
+            case AstNodeKind::TypeCall: {
+                auto* c = static_cast<const TypeCall*>(ty);
+                for (const Type* a : c->args) check_type_arrays(mid, a, eval);
+                return;
+            }
             case AstNodeKind::TypeArray: {
                 auto* a = static_cast<const TypeArray*>(ty);
                 if (a->len) {
+                    ScopedComptimeContext comptime_ctx(*this);
                     Env env{};
                     (void)check_expr(mid, a->len, env,
                                      types_.int_(IntKind::Usize));
@@ -1094,9 +1590,32 @@ class Checker {
         if (!fn || !fn->decl || !fn->decl->sig || !fn->body) return;
         auto it = fn_info_.find(fn);
         if (it == fn_info_.end()) return;
+        if (bodies_checked_.contains(fn)) return;
 
-        TypeId ret_ty = it->second.ret;
+        FnInfo& sig = it->second;
+
+        // If the function's signature contains `auto` but cannot be
+        // instantiated without a call site (because `auto` appears in a
+        // parameter type), skip checking its body for now.
+        if (sig.has_auto && !sig.auto_instantiated) {
+            const bool needs_call_site =
+                std::any_of(sig.param_has_auto.begin(), sig.param_has_auto.end(),
+                            [](bool b) { return b; });
+            if (needs_call_site) return;
+
+            // Return-type-only inference can run without call-site types.
+            if (auto_instantiating_.contains(fn)) {
+                error(fn->span,
+                      "cycle detected while inferring `auto` function return "
+                      "type");
+                return;
+            }
+            auto_instantiating_.insert(fn);
+        }
+
+        TypeId ret_ty = sig.ret;
         Env env{};
+        env.in_function = true;
         env.fn_ret = ret_ty;
         env.push_scope();
 
@@ -1104,17 +1623,81 @@ class Checker {
         size_t idx = 0;
         for (const Param* p : fn->decl->sig->params) {
             if (!p) continue;
-            TypeId pt = it->second.params.at(idx++);
+            TypeId pt = sig.params.at(idx++);
             env.declare(
                 p->name,
                 VarInfo{.type = pt, .is_mut = false, .state = VarState::Live});
         }
 
-        ExprResult body = check_block(mid, fn->body, env, ret_ty);
+        ExprResult body{};
+        std::vector<Env::ReturnCandidate> return_candidates{};
+        if (sig.has_auto && !sig.auto_instantiated) {
+            // v0.0.22: infer the return type from the body.
+            env.fn_ret = std::nullopt;
+            env.infer_return = true;
+            env.return_candidates = &return_candidates;
+            body = check_block(mid, fn->body, env, std::nullopt);
+
+            // If the top-level block reaches its end, it contributes an
+            // implicit return (tail expression or `()`).
+            if (!body.diverged) {
+                return_candidates.push_back(
+                    Env::ReturnCandidate{.span = fn->body->span, .type = body.type});
+            } else if (return_candidates.empty()) {
+                // No explicit returns collected; treat the body's type as the
+                // function return type (e.g. diverging `loop {}`).
+                return_candidates.push_back(
+                    Env::ReturnCandidate{.span = fn->body->span, .type = body.type});
+            }
+
+            TypeId inferred = types_.never();
+            bool have = false;
+            for (const auto& rc : return_candidates) {
+                if (types_.equal(rc.type, types_.never())) continue;
+                if (!have) {
+                    inferred = rc.type;
+                    have = true;
+                    continue;
+                }
+                if (types_.can_coerce(rc.type, inferred)) continue;
+                if (types_.can_coerce(inferred, rc.type)) {
+                    inferred = rc.type;
+                    continue;
+                }
+                error(rc.span,
+                      "cannot infer `auto` return type: incompatible return "
+                      "types `" +
+                          types_.to_string(inferred) + "` and `" +
+                          types_.to_string(rc.type) + "`");
+                inferred = types_.error();
+                have = true;
+            }
+            if (!have) inferred = types_.never();
+
+            for (const auto& rc : return_candidates) {
+                if (types_.equal(rc.type, types_.never())) continue;
+                if (!types_.can_coerce(rc.type, inferred)) {
+                    error(rc.span,
+                          "return type mismatch: expected `" +
+                              types_.to_string(inferred) + "`, got `" +
+                              types_.to_string(rc.type) + "`");
+                }
+            }
+
+            sig.ret = inferred;
+            sig.auto_instantiated = true;
+        } else if (types_.equal(ret_ty, types_.type_type())) {
+            ScopedComptimeContext comptime_ctx(*this);
+            body = check_block(mid, fn->body, env, ret_ty);
+        } else {
+            body = check_block(mid, fn->body, env, ret_ty);
+        }
         (void)body;
 
         env.pop_scope();
         (void)self_ty;
+        bodies_checked_.insert(fn);
+        auto_instantiating_.erase(fn);
     }
 
     ExprResult check_block(ModuleId mid, const Block* block, Env& env,
@@ -1153,20 +1736,31 @@ class Checker {
                 return {.type = types_.unit()};
             case AstNodeKind::StmtReturn: {
                 auto* r = static_cast<const StmtReturn*>(stmt);
-                if (!env.fn_ret) {
+                if (!env.in_function) {
                     error(stmt->span,
                           "`return` is only allowed inside function bodies");
                 }
-                TypeId expected =
-                    env.fn_ret.value_or(expected_ret.value_or(types_.unit()));
-                TypeId got = r->value
-                                 ? check_expr(mid, r->value, env, expected).type
-                                 : types_.unit();
-                if (!types_.can_coerce(got, expected)) {
-                    error(stmt->span, "return type mismatch: expected `" +
-                                          types_.to_string(expected) +
-                                          "`, got `" + types_.to_string(got) +
-                                          "`");
+                if (env.infer_return && env.return_candidates) {
+                    TypeId got = r->value
+                                     ? check_expr(mid, r->value, env,
+                                                  std::nullopt)
+                                           .type
+                                     : types_.unit();
+                    env.return_candidates->push_back(
+                        Env::ReturnCandidate{.span = stmt->span, .type = got});
+                } else {
+                    TypeId expected = env.fn_ret.value_or(
+                        expected_ret.value_or(types_.unit()));
+                    TypeId got =
+                        r->value
+                            ? check_expr(mid, r->value, env, expected).type
+                            : types_.unit();
+                    if (!types_.can_coerce(got, expected)) {
+                        error(stmt->span,
+                              "return type mismatch: expected `" +
+                                  types_.to_string(expected) + "`, got `" +
+                                  types_.to_string(got) + "`");
+                    }
                 }
                 return {.type = types_.never(), .diverged = true};
             }
@@ -1180,28 +1774,50 @@ class Checker {
     }
 
     void check_let(ModuleId mid, const StmtLet* s, Env& env) {
-        TypeId ann = s->type_ann ? lower_type(mid, s->type_ann, false,
-                                              std::nullopt, false)
-                                 : types_.error();
-        if (s->type_ann && comptime_eval_ && !session_.has_errors())
+        const bool has_ann = s->type_ann != nullptr;
+        const bool ann_has_auto =
+            has_ann && type_contains_auto(s->type_ann);
+
+        TypeId ann = types_.error();
+        std::optional<TypeId> expected{};
+        if (has_ann && !ann_has_auto) {
+            ann = lower_type(mid, s->type_ann, /*allow_unsized=*/false,
+                             std::nullopt, /*allow_self=*/false);
+            expected = ann;
+        }
+
+        if (has_ann && comptime_eval_ && !session_.has_errors())
             check_type_arrays(mid, s->type_ann, *comptime_eval_);
-        std::optional<TypeId> expected =
-            s->type_ann ? std::optional<TypeId>(ann) : std::nullopt;
 
         TypeId init_ty = types_.error();
         if (s->init) init_ty = check_expr(mid, s->init, env, expected).type;
 
-        TypeId pat_ty = expected.value_or(init_ty);
-        if (!s->type_ann && !s->init) {
+        TypeId pat_ty = types_.error();
+        if (!has_ann && !s->init) {
             error(s->span,
                   "`let` requires a type annotation or an initializer");
-            pat_ty = types_.error();
-        }
-
-        if (s->type_ann && s->init && !types_.can_coerce(init_ty, ann)) {
-            error(s->span, "type mismatch in `let`: expected `" +
-                               types_.to_string(ann) + "`, got `" +
-                               types_.to_string(init_ty) + "`");
+        } else if (has_ann && !s->init && ann_has_auto) {
+            error(s->span,
+                  "`let` with an `auto` type annotation requires an initializer");
+        } else if (!has_ann) {
+            pat_ty = init_ty;
+        } else if (ann_has_auto) {
+            ann = infer_auto_type(mid, s->type_ann, init_ty,
+                                  /*allow_unsized=*/false, std::nullopt,
+                                  /*allow_self=*/false);
+            if (s->init && !types_.can_coerce(init_ty, ann)) {
+                error(s->span, "type mismatch in `let`: expected `" +
+                                   types_.to_string(ann) + "`, got `" +
+                                   types_.to_string(init_ty) + "`");
+            }
+            pat_ty = ann;
+        } else {
+            if (s->init && !types_.can_coerce(init_ty, ann)) {
+                error(s->span, "type mismatch in `let`: expected `" +
+                                   types_.to_string(ann) + "`, got `" +
+                                   types_.to_string(init_ty) + "`");
+            }
+            pat_ty = ann;
         }
 
         VarState init_state = s->init ? VarState::Live : VarState::Uninit;
@@ -1414,9 +2030,12 @@ class Checker {
                                 env, expected);
                 break;
             case AstNodeKind::ExprComptime:
-                r = check_block(mid,
-                                static_cast<const ExprComptime*>(expr)->block,
-                                env, expected);
+                {
+                    ScopedComptimeContext comptime_ctx(*this);
+                    r = check_block(
+                        mid, static_cast<const ExprComptime*>(expr)->block, env,
+                        expected);
+                }
                 break;
             case AstNodeKind::ExprPath:
                 r = check_path_expr(mid,
@@ -1525,6 +2144,12 @@ class Checker {
             if (auto t = resolve_value_path(mid, path)) return {.type = *t};
         }
 
+        // In comptime contexts, types are first-class values of type `type`.
+        if (in_comptime_context()) {
+            if (auto ty = try_lower_type_path(mid, path))
+                return {.type = types_.type_type()};
+        }
+
         error(path->span, "unresolved path in expression");
         return {.type = types_.error()};
     }
@@ -1566,6 +2191,12 @@ class Checker {
                 if (fi == fn_info_.end())
                     return std::optional<TypeId>(types_.error());
                 const FnInfo& sig = fi->second;
+                if (sig.has_auto) {
+                    error(path->span,
+                          "functions with `auto` in their signature are not "
+                          "first-class values");
+                    return std::optional<TypeId>(types_.error());
+                }
                 if (!sig.comptime_params.empty() &&
                     std::any_of(sig.comptime_params.begin(),
                                 sig.comptime_params.end(),
@@ -1713,13 +2344,16 @@ class Checker {
     ExprResult check_array_repeat(ModuleId mid, const ExprArrayRepeat* a,
                                   Env& env, std::optional<TypeId> expected) {
         TypeId usize_ty = types_.int_(IntKind::Usize);
-        (void)check_expr(mid, a->count, env, usize_ty);
-
         std::optional<std::uint64_t> n{};
-        if (comptime_eval_ && !session_.has_errors()) {
-            if (auto v = comptime_eval_->eval_usize(mid, a->count)) {
-                n = *v;
-                types_.set_array_len_value(a->count, *v);
+        {
+            ScopedComptimeContext comptime_ctx(*this);
+            (void)check_expr(mid, a->count, env, usize_ty);
+
+            if (comptime_eval_ && !session_.has_errors()) {
+                if (auto v = comptime_eval_->eval_usize(mid, a->count)) {
+                    n = *v;
+                    types_.set_array_len_value(a->count, *v);
+                }
             }
         }
 
@@ -2183,40 +2817,102 @@ class Checker {
             if (callee_path->segments.size() == 2 &&
                 callee_path->segments[0]->text == "builtin" &&
                 callee_path->segments[1]->text == "size_of") {
+                TypeId type_ty = types_.type_type();
                 if (call->args.size() != 1) {
                     error(call->span, "builtin::size_of expects 1 argument");
                     return {.type = types_.int_(IntKind::Usize)};
                 }
-                auto ty = lower_type_value_expr(mid, call->args[0]);
-                if (ty && !types_.is_sized(*ty))
+                std::optional<TypeId> lit{};
+                if (!in_comptime_context()) {
+                    lit = lower_type_value_expr(mid, call->args[0]);
+                    if (call->args[0]) expr_types_[call->args[0]] = type_ty;
+                } else {
+                    TypeId got =
+                        check_expr(mid, call->args[0], env, type_ty).type;
+                    if (!types_.can_coerce(got, type_ty)) {
+                        error(call->args[0]->span,
+                              "argument type mismatch: expected `" +
+                                  types_.to_string(type_ty) + "`, got `" +
+                                  types_.to_string(got) + "`");
+                    }
+                    if (call->args[0] &&
+                        call->args[0]->kind == AstNodeKind::ExprPath) {
+                        const Path* p =
+                            static_cast<const ExprPath*>(call->args[0])->path;
+                        bool is_local = false;
+                        if (p && p->segments.size() == 1 && p->segments[0]) {
+                            is_local = env.lookup(p->segments[0]->text) != nullptr;
+                        }
+                        if (!is_local) lit = try_lower_type_path(mid, p);
+                    }
+                }
+
+                if (lit && !types_.is_sized(*lit)) {
                     error(call->args[0]->span,
                           "builtin::size_of requires a sized type");
+                }
                 return {.type = types_.int_(IntKind::Usize)};
             }
             if (callee_path->segments.size() == 2 &&
                 callee_path->segments[0]->text == "builtin" &&
                 callee_path->segments[1]->text == "align_of") {
+                TypeId type_ty = types_.type_type();
                 if (call->args.size() != 1) {
                     error(call->span, "builtin::align_of expects 1 argument");
                     return {.type = types_.int_(IntKind::Usize)};
                 }
-                auto ty = lower_type_value_expr(mid, call->args[0]);
-                if (ty && !types_.is_sized(*ty))
+                std::optional<TypeId> lit{};
+                if (!in_comptime_context()) {
+                    lit = lower_type_value_expr(mid, call->args[0]);
+                    if (call->args[0]) expr_types_[call->args[0]] = type_ty;
+                } else {
+                    TypeId got =
+                        check_expr(mid, call->args[0], env, type_ty).type;
+                    if (!types_.can_coerce(got, type_ty)) {
+                        error(call->args[0]->span,
+                              "argument type mismatch: expected `" +
+                                  types_.to_string(type_ty) + "`, got `" +
+                                  types_.to_string(got) + "`");
+                    }
+                    if (call->args[0] &&
+                        call->args[0]->kind == AstNodeKind::ExprPath) {
+                        const Path* p =
+                            static_cast<const ExprPath*>(call->args[0])->path;
+                        bool is_local = false;
+                        if (p && p->segments.size() == 1 && p->segments[0]) {
+                            is_local = env.lookup(p->segments[0]->text) != nullptr;
+                        }
+                        if (!is_local) lit = try_lower_type_path(mid, p);
+                    }
+                }
+
+                if (lit && !types_.is_sized(*lit)) {
                     error(call->args[0]->span,
                           "builtin::align_of requires a sized type");
+                }
                 return {.type = types_.int_(IntKind::Usize)};
             }
             if (callee_path->segments.size() == 2 &&
                 callee_path->segments[0]->text == "builtin" &&
                 callee_path->segments[1]->text == "type_info") {
+                TypeId type_ty = types_.type_type();
                 if (call->args.size() != 1) {
                     error(call->span, "builtin::type_info expects 1 argument");
                     return {.type = typeinfo_type()};
                 }
-                auto ty = lower_type_value_expr(mid, call->args[0]);
-                if (ty && !types_.is_sized(*ty))
-                    error(call->args[0]->span,
-                          "builtin::type_info currently requires a sized type");
+                if (!in_comptime_context()) {
+                    (void)lower_type_value_expr(mid, call->args[0]);
+                    if (call->args[0]) expr_types_[call->args[0]] = type_ty;
+                } else {
+                    TypeId got =
+                        check_expr(mid, call->args[0], env, type_ty).type;
+                    if (!types_.can_coerce(got, type_ty)) {
+                        error(call->args[0]->span,
+                              "argument type mismatch: expected `" +
+                                  types_.to_string(type_ty) + "`, got `" +
+                                  types_.to_string(got) + "`");
+                    }
+                }
                 return {.type = typeinfo_type()};
             }
             if (callee_path->segments.size() == 2 &&
@@ -2241,6 +2937,12 @@ class Checker {
             if (callee_path->segments.size() == 2 &&
                 callee_path->segments[0]->text == "builtin" &&
                 callee_path->segments[1]->text == "compile_error") {
+                if (!in_comptime_context()) {
+                    error(call->span,
+                          "builtin::compile_error is comptime-only (use it "
+                          "inside `comptime { ... }` or other comptime "
+                          "contexts)");
+                }
                 TypeId msg_ty = types_.ptr(
                     Mutability::Const, types_.slice(types_.int_(IntKind::U8)));
                 if (call->args.size() != 1) {
@@ -2256,6 +2958,231 @@ class Checker {
                               types_.to_string(got) + "`");
                 }
                 return {.type = types_.never(), .diverged = true};
+            }
+            if (callee_path->segments.size() == 2 &&
+                callee_path->segments[0]->text == "builtin" &&
+                callee_path->segments[1]->text == "cast") {
+                if (call->args.size() != 2) {
+                    error(call->span, "builtin::cast expects 2 arguments");
+                    return {.type = types_.error()};
+                }
+                auto dst_opt = lower_type_value_expr(mid, call->args[1]);
+                if (!dst_opt) return {.type = types_.error()};
+                TypeId dst = *dst_opt;
+
+                std::optional<TypeId> expected_src = std::nullopt;
+                const TypeData& dd_pre = types_.get(dst);
+                if (call->args[0] &&
+                    call->args[0]->kind == AstNodeKind::ExprInt &&
+                    dd_pre.kind == TypeKind::Int) {
+                    expected_src = dst;
+                } else if (call->args[0] &&
+                           call->args[0]->kind == AstNodeKind::ExprFloat &&
+                           dd_pre.kind == TypeKind::Float) {
+                    expected_src = dst;
+                } else if (call->args[0] &&
+                           call->args[0]->kind == AstNodeKind::ExprInt &&
+                           dd_pre.kind == TypeKind::Ptr) {
+                    expected_src = types_.int_(IntKind::Usize);
+                }
+
+                TypeId src =
+                    check_expr(mid, call->args[0], env, expected_src).type;
+
+                const TypeData& sd = types_.get(src);
+                const TypeData& dd = types_.get(dst);
+
+                bool ok = false;
+                if (sd.kind == TypeKind::Int && dd.kind == TypeKind::Int)
+                    ok = true;
+                if (sd.kind == TypeKind::Float && dd.kind == TypeKind::Float)
+                    ok = true;
+                if (sd.kind == TypeKind::Int && dd.kind == TypeKind::Float)
+                    ok = true;
+                if (sd.kind == TypeKind::Float && dd.kind == TypeKind::Int)
+                    ok = true;
+                if (sd.kind == TypeKind::Int && dd.kind == TypeKind::Ptr)
+                    ok = true;
+                if (sd.kind == TypeKind::Ptr && dd.kind == TypeKind::Int)
+                    ok = true;
+                if (sd.kind == TypeKind::Ptr && dd.kind == TypeKind::Ptr)
+                    ok = true;
+                if (sd.kind == TypeKind::Never) ok = true;
+
+                if (!ok) {
+                    error(call->span,
+                          "invalid cast from `" + types_.to_string(src) +
+                              "` to `" + types_.to_string(dst) + "`");
+                    return {.type = types_.error()};
+                }
+
+                return {.type = dst};
+            }
+
+            // v0.0.23: comptime-only type construction builtins.
+            if (callee_path->segments.size() == 2 &&
+                callee_path->segments[0]->text == "builtin") {
+                std::string_view name = callee_path->segments[1]->text;
+                if (name == "type_unit" || name == "type_never" ||
+                    name == "type_ptr_const" || name == "type_ptr_mut" ||
+                    name == "type_slice" || name == "type_array" ||
+                    name == "type_tuple" || name == "type_fn" ||
+                    name == "type_struct" || name == "type_enum") {
+                    if (!in_comptime_context()) {
+                        error(call->span,
+                              "builtin::" + std::string(name) +
+                                  " is comptime-only");
+                        return {.type = types_.type_type()};
+                    }
+
+                    TypeId type_ty = types_.type_type();
+                    TypeId type_slice_ptr =
+                        types_.ptr(Mutability::Const, types_.slice(type_ty));
+
+                    const ItemStruct* struct_desc_def =
+                        find_struct_in_builtin_module("StructDesc");
+                    const ItemStruct* enum_desc_def =
+                        find_struct_in_builtin_module("EnumDesc");
+                    TypeId struct_desc_ty = struct_desc_def
+                                                ? types_.struct_(struct_desc_def)
+                                                : types_.error();
+                    TypeId enum_desc_ty = enum_desc_def
+                                              ? types_.struct_(enum_desc_def)
+                                              : types_.error();
+
+                    if (name == "type_unit" || name == "type_never") {
+                        if (!call->args.empty()) {
+                            error(call->span,
+                                  "builtin::" + std::string(name) +
+                                      " expects 0 arguments");
+                        }
+                        return {.type = type_ty};
+                    }
+
+                    if (name == "type_ptr_const" || name == "type_ptr_mut" ||
+                        name == "type_slice") {
+                        if (call->args.size() != 1) {
+                            error(call->span,
+                                  "builtin::" + std::string(name) +
+                                      " expects 1 argument");
+                            return {.type = type_ty};
+                        }
+                        TypeId got =
+                            check_expr(mid, call->args[0], env, type_ty).type;
+                        if (!types_.can_coerce(got, type_ty)) {
+                            error(call->args[0]->span,
+                                  "argument type mismatch: expected `" +
+                                      types_.to_string(type_ty) + "`, got `" +
+                                      types_.to_string(got) + "`");
+                        }
+                        return {.type = type_ty};
+                    }
+
+                    if (name == "type_array") {
+                        if (call->args.size() != 2) {
+                            error(call->span,
+                                  "builtin::type_array expects 2 arguments");
+                            return {.type = type_ty};
+                        }
+                        TypeId child =
+                            check_expr(mid, call->args[0], env, type_ty).type;
+                        if (!types_.can_coerce(child, type_ty)) {
+                            error(call->args[0]->span,
+                                  "argument type mismatch: expected `" +
+                                      types_.to_string(type_ty) + "`, got `" +
+                                      types_.to_string(child) + "`");
+                        }
+                        TypeId usize_ty = types_.int_(IntKind::Usize);
+                        TypeId n =
+                            check_expr(mid, call->args[1], env, usize_ty).type;
+                        if (!types_.can_coerce(n, usize_ty)) {
+                            error(call->args[1]->span,
+                                  "argument type mismatch: expected `" +
+                                      types_.to_string(usize_ty) + "`, got `" +
+                                      types_.to_string(n) + "`");
+                        }
+                        return {.type = type_ty};
+                    }
+
+                    if (name == "type_tuple") {
+                        if (call->args.size() != 1) {
+                            error(call->span,
+                                  "builtin::type_tuple expects 1 argument");
+                            return {.type = type_ty};
+                        }
+                        TypeId got = check_expr(mid, call->args[0], env,
+                                                type_slice_ptr)
+                                         .type;
+                        if (!types_.can_coerce(got, type_slice_ptr)) {
+                            error(call->args[0]->span,
+                                  "argument type mismatch: expected `" +
+                                      types_.to_string(type_slice_ptr) +
+                                      "`, got `" + types_.to_string(got) + "`");
+                        }
+                        return {.type = type_ty};
+                    }
+
+                    if (name == "type_fn") {
+                        if (call->args.size() != 2) {
+                            error(call->span,
+                                  "builtin::type_fn expects 2 arguments");
+                            return {.type = type_ty};
+                        }
+                        TypeId got0 = check_expr(mid, call->args[0], env,
+                                                 type_slice_ptr)
+                                          .type;
+                        if (!types_.can_coerce(got0, type_slice_ptr)) {
+                            error(call->args[0]->span,
+                                  "argument type mismatch: expected `" +
+                                      types_.to_string(type_slice_ptr) +
+                                      "`, got `" + types_.to_string(got0) + "`");
+                        }
+                        TypeId got1 =
+                            check_expr(mid, call->args[1], env, type_ty).type;
+                        if (!types_.can_coerce(got1, type_ty)) {
+                            error(call->args[1]->span,
+                                  "argument type mismatch: expected `" +
+                                      types_.to_string(type_ty) + "`, got `" +
+                                      types_.to_string(got1) + "`");
+                        }
+                        return {.type = type_ty};
+                    }
+
+                    if (name == "type_struct") {
+                        if (call->args.size() != 1) {
+                            error(call->span,
+                                  "builtin::type_struct expects 1 argument");
+                            return {.type = type_ty};
+                        }
+                        TypeId got =
+                            check_expr(mid, call->args[0], env, struct_desc_ty)
+                                .type;
+                        if (!types_.can_coerce(got, struct_desc_ty)) {
+                            error(call->args[0]->span,
+                                  "argument type mismatch: expected `" +
+                                      types_.to_string(struct_desc_ty) +
+                                      "`, got `" + types_.to_string(got) + "`");
+                        }
+                        return {.type = type_ty};
+                    }
+
+                    if (name == "type_enum") {
+                        if (call->args.size() != 1) {
+                            error(call->span,
+                                  "builtin::type_enum expects 1 argument");
+                            return {.type = type_ty};
+                        }
+                        TypeId got =
+                            check_expr(mid, call->args[0], env, enum_desc_ty).type;
+                        if (!types_.can_coerce(got, enum_desc_ty)) {
+                            error(call->args[0]->span,
+                                  "argument type mismatch: expected `" +
+                                      types_.to_string(enum_desc_ty) +
+                                      "`, got `" + types_.to_string(got) + "`");
+                        }
+                        return {.type = type_ty};
+                    }
+                }
             }
 
             // Try value call (free function) first.
@@ -2401,7 +3328,7 @@ class Checker {
         auto it = fn_info_.find(fn);
         if (it == fn_info_.end()) return {.type = types_.error()};
 
-        const FnInfo& sig = it->second;
+        FnInfo& sig = it->second;
         const size_t fixed = sig.params.size();
         const bool has_comptime_params =
             !sig.comptime_params.empty() &&
@@ -2415,7 +3342,12 @@ class Checker {
         if (has_comptime_params) {
             layout.emplace(session_, types_, struct_info_, enum_info_,
                            target_layout_);
-            eval.emplace(session_, crate_, &types_, &*layout);
+            TypeConstructContext tc{};
+            tc.cache = &type_construct_cache_;
+            tc.arena = &crate_.builtins_arena;
+            tc.struct_info = &struct_info_;
+            tc.enum_info = &enum_info_;
+            eval.emplace(session_, crate_, &types_, &*layout, tc);
         }
         if (!sig.is_variadic) {
             if (args.size() != fixed) {
@@ -2432,17 +3364,32 @@ class Checker {
             }
         }
 
+        // First pass: type-check arguments (exactly once) and collect their
+        // types for `auto` instantiation and post-checking.
+        std::vector<TypeId> arg_types{};
+        arg_types.reserve(std::min(args.size(), fixed));
+
         for (size_t i = 0; i < fixed && i < args.size(); i++) {
-            TypeId got = check_expr(mid, args[i], env, sig.params[i]).type;
-            if (!types_.can_coerce(got, sig.params[i])) {
-                error(args[i]->span, "argument type mismatch: expected `" +
-                                         types_.to_string(sig.params[i]) +
-                                         "`, got `" + types_.to_string(got) +
-                                         "`");
+            const bool is_ct = has_comptime_params &&
+                               i < sig.comptime_params.size() &&
+                               sig.comptime_params[i];
+
+            std::optional<TypeId> expected_arg = sig.params[i];
+            if (sig.has_auto && !sig.auto_instantiated &&
+                i < sig.param_has_auto.size() && sig.param_has_auto[i]) {
+                expected_arg = std::nullopt;
             }
 
-            if (has_comptime_params && i < sig.comptime_params.size() &&
-                sig.comptime_params[i]) {
+            TypeId got = 0;
+            if (is_ct) {
+                ScopedComptimeContext comptime_ctx(*this);
+                got = check_expr(mid, args[i], env, expected_arg).type;
+            } else {
+                got = check_expr(mid, args[i], env, expected_arg).type;
+            }
+            arg_types.push_back(got);
+
+            if (is_ct) {
                 const size_t before = session_.diags.size();
                 auto v = eval->eval_expr(mid, args[i]);
                 if (!v && session_.diags.size() == before) {
@@ -2451,6 +3398,138 @@ class Checker {
                     error(args[i]->span,
                           "argument must be a comptime constant");
                 }
+            }
+        }
+
+        // `auto` function instantiation (v0.0.22 MVP: single instantiation per
+        // function per compilation).
+        if (sig.has_auto && !sig.auto_instantiated) {
+            if (!fn || !fn->decl || !fn->decl->sig || !fn->body) {
+                error(fn ? fn->span : Span{},
+                      "cannot instantiate `auto` for an extern declaration");
+            } else if (auto_instantiating_.contains(fn)) {
+                error(fn->span,
+                      "cycle detected while instantiating `auto` function");
+            } else {
+                auto_instantiating_.insert(fn);
+
+                ModuleId fn_mid = mid;
+                if (auto mit = fn_modules_.find(fn); mit != fn_modules_.end())
+                    fn_mid = mit->second;
+
+                // Infer concrete parameter types from the call site.
+                std::vector<TypeId> new_params{};
+                new_params.reserve(sig.params.size());
+                size_t pidx = 0;
+                for (const Param* p : fn->decl->sig->params) {
+                    if (!p) continue;
+                    TypeId src =
+                        pidx < arg_types.size() ? arg_types[pidx] : types_.error();
+                    TypeId pt = sig.params[pidx];
+                    if (pidx < sig.param_has_auto.size() &&
+                        sig.param_has_auto[pidx]) {
+                        pt = infer_auto_type(fn_mid, p->type, src,
+                                             /*allow_unsized=*/false,
+                                             std::nullopt,
+                                             /*allow_self=*/false);
+                    }
+                    new_params.push_back(pt);
+                    pidx++;
+                }
+                sig.params = std::move(new_params);
+
+                // Type-check the body (and infer the return type if needed).
+                Env fn_env{};
+                fn_env.in_function = true;
+                fn_env.push_scope();
+                size_t idx = 0;
+                for (const Param* p : fn->decl->sig->params) {
+                    if (!p) continue;
+                    TypeId pt = idx < sig.params.size() ? sig.params[idx]
+                                                        : types_.error();
+                    fn_env.declare(p->name, VarInfo{.type = pt,
+                                                   .is_mut = false,
+                                                   .state = VarState::Live});
+                    idx++;
+                }
+
+                if (sig.ret_has_auto) {
+                    fn_env.fn_ret = std::nullopt;
+                    fn_env.infer_return = true;
+                    std::vector<Env::ReturnCandidate> return_candidates{};
+                    fn_env.return_candidates = &return_candidates;
+
+                    ExprResult body = check_block(fn_mid, fn->body, fn_env,
+                                                  std::nullopt);
+                    if (!body.diverged) {
+                        return_candidates.push_back(Env::ReturnCandidate{
+                            .span = fn->body->span, .type = body.type});
+                    } else if (return_candidates.empty()) {
+                        return_candidates.push_back(Env::ReturnCandidate{
+                            .span = fn->body->span, .type = body.type});
+                    }
+
+                    TypeId inferred = types_.never();
+                    bool have = false;
+                    for (const auto& rc : return_candidates) {
+                        if (types_.equal(rc.type, types_.never())) continue;
+                        if (!have) {
+                            inferred = rc.type;
+                            have = true;
+                            continue;
+                        }
+                        if (types_.can_coerce(rc.type, inferred)) continue;
+                        if (types_.can_coerce(inferred, rc.type)) {
+                            inferred = rc.type;
+                            continue;
+                        }
+                        error(rc.span,
+                              "cannot infer `auto` return type: incompatible "
+                              "return types `" +
+                                  types_.to_string(inferred) + "` and `" +
+                                  types_.to_string(rc.type) + "`");
+                        inferred = types_.error();
+                        have = true;
+                    }
+                    if (!have) inferred = types_.never();
+
+                    for (const auto& rc : return_candidates) {
+                        if (types_.equal(rc.type, types_.never())) continue;
+                        if (!types_.can_coerce(rc.type, inferred)) {
+                            error(rc.span,
+                                  "return type mismatch: expected `" +
+                                      types_.to_string(inferred) + "`, got `" +
+                                      types_.to_string(rc.type) + "`");
+                        }
+                    }
+
+                    sig.ret = inferred;
+                } else {
+                    fn_env.fn_ret = sig.ret;
+                    if (types_.equal(sig.ret, types_.type_type())) {
+                        ScopedComptimeContext comptime_ctx(*this);
+                        (void)check_block(fn_mid, fn->body, fn_env, sig.ret);
+                    } else {
+                        (void)check_block(fn_mid, fn->body, fn_env, sig.ret);
+                    }
+                }
+
+                sig.auto_instantiated = true;
+                bodies_checked_.insert(fn);
+                fn_env.pop_scope();
+                auto_instantiating_.erase(fn);
+            }
+        }
+
+        // Second pass: validate argument coercions against the (now concrete)
+        // signature types.
+        for (size_t i = 0; i < fixed && i < arg_types.size(); i++) {
+            if (i >= sig.params.size()) break;
+            if (!types_.can_coerce(arg_types[i], sig.params[i])) {
+                error(args[i]->span,
+                      "argument type mismatch: expected `" +
+                          types_.to_string(sig.params[i]) + "`, got `" +
+                          types_.to_string(arg_types[i]) + "`");
             }
         }
 
@@ -2531,7 +3610,7 @@ class Checker {
         auto fi = fn_info_.find(method);
         if (fi == fn_info_.end()) return {.type = types_.error()};
 
-        const FnInfo& sig = fi->second;
+        FnInfo& sig = fi->second;
         if (sig.params.empty()) {
             error(method->span, "method is missing a receiver parameter");
             return {.type = sig.ret};
@@ -2570,14 +3649,162 @@ class Checker {
             return {.type = sig.ret};
         }
 
+        // Type-check args once and collect their types.
+        std::vector<TypeId> arg_types{};
+        arg_types.reserve(sig.params.size());
+        arg_types.push_back(recv_arg);
+
+        std::vector<TypeId> user_arg_types{};
+        user_arg_types.reserve(mc->args.size());
         for (size_t i = 0; i < mc->args.size(); i++) {
-            TypeId expected_arg = sig.params[i + 1];
-            TypeId got = check_expr(mid, mc->args[i], env, expected_arg).type;
-            if (!types_.can_coerce(got, expected_arg)) {
-                error(mc->args[i]->span, "argument type mismatch: expected `" +
-                                             types_.to_string(expected_arg) +
-                                             "`, got `" +
-                                             types_.to_string(got) + "`");
+            std::optional<TypeId> expected_arg = sig.params[i + 1];
+            const size_t param_index = i + 1;
+            if (sig.has_auto && !sig.auto_instantiated &&
+                param_index < sig.param_has_auto.size() &&
+                sig.param_has_auto[param_index]) {
+                expected_arg = std::nullopt;
+            }
+
+            TypeId got =
+                check_expr(mid, mc->args[i], env, expected_arg).type;
+            user_arg_types.push_back(got);
+            arg_types.push_back(got);
+        }
+
+        // Instantiate `auto` methods at the first call site.
+        if (sig.has_auto && !sig.auto_instantiated) {
+            if (!method || !method->decl || !method->decl->sig || !method->body) {
+                error(method ? method->span : Span{},
+                      "cannot instantiate `auto` for an extern declaration");
+            } else if (auto_instantiating_.contains(method)) {
+                error(method->span,
+                      "cycle detected while instantiating `auto` function");
+            } else {
+                auto_instantiating_.insert(method);
+
+                ModuleId fn_mid = mid;
+                if (auto mit = fn_modules_.find(method);
+                    mit != fn_modules_.end())
+                    fn_mid = mit->second;
+
+                std::vector<TypeId> new_params{};
+                new_params.reserve(sig.params.size());
+                size_t pidx = 0;
+                for (const Param* p : method->decl->sig->params) {
+                    if (!p) continue;
+                    TypeId src =
+                        pidx < arg_types.size() ? arg_types[pidx] : types_.error();
+                    TypeId pt = sig.params[pidx];
+                    if (pidx < sig.param_has_auto.size() &&
+                        sig.param_has_auto[pidx]) {
+                        pt = infer_auto_type(fn_mid, p->type, src,
+                                             /*allow_unsized=*/false,
+                                             std::nullopt,
+                                             /*allow_self=*/false);
+                    }
+                    new_params.push_back(pt);
+                    pidx++;
+                }
+                sig.params = std::move(new_params);
+
+                Env fn_env{};
+                fn_env.in_function = true;
+                fn_env.push_scope();
+                size_t idx = 0;
+                for (const Param* p : method->decl->sig->params) {
+                    if (!p) continue;
+                    TypeId pt = idx < sig.params.size() ? sig.params[idx]
+                                                        : types_.error();
+                    fn_env.declare(p->name, VarInfo{.type = pt,
+                                                   .is_mut = false,
+                                                   .state = VarState::Live});
+                    idx++;
+                }
+
+                if (sig.ret_has_auto) {
+                    fn_env.fn_ret = std::nullopt;
+                    fn_env.infer_return = true;
+                    std::vector<Env::ReturnCandidate> return_candidates{};
+                    fn_env.return_candidates = &return_candidates;
+                    ExprResult body =
+                        check_block(fn_mid, method->body, fn_env, std::nullopt);
+                    if (!body.diverged) {
+                        return_candidates.push_back(Env::ReturnCandidate{
+                            .span = method->body->span, .type = body.type});
+                    } else if (return_candidates.empty()) {
+                        return_candidates.push_back(Env::ReturnCandidate{
+                            .span = method->body->span, .type = body.type});
+                    }
+
+                    TypeId inferred = types_.never();
+                    bool have = false;
+                    for (const auto& rc : return_candidates) {
+                        if (types_.equal(rc.type, types_.never())) continue;
+                        if (!have) {
+                            inferred = rc.type;
+                            have = true;
+                            continue;
+                        }
+                        if (types_.can_coerce(rc.type, inferred)) continue;
+                        if (types_.can_coerce(inferred, rc.type)) {
+                            inferred = rc.type;
+                            continue;
+                        }
+                        error(rc.span,
+                              "cannot infer `auto` return type: incompatible "
+                              "return types `" +
+                                  types_.to_string(inferred) + "` and `" +
+                                  types_.to_string(rc.type) + "`");
+                        inferred = types_.error();
+                        have = true;
+                    }
+                    if (!have) inferred = types_.never();
+
+                    for (const auto& rc : return_candidates) {
+                        if (types_.equal(rc.type, types_.never())) continue;
+                        if (!types_.can_coerce(rc.type, inferred)) {
+                            error(rc.span,
+                                  "return type mismatch: expected `" +
+                                      types_.to_string(inferred) + "`, got `" +
+                                      types_.to_string(rc.type) + "`");
+                        }
+                    }
+                    sig.ret = inferred;
+                } else {
+                    fn_env.fn_ret = sig.ret;
+                    if (types_.equal(sig.ret, types_.type_type())) {
+                        ScopedComptimeContext comptime_ctx(*this);
+                        (void)check_block(fn_mid, method->body, fn_env, sig.ret);
+                    } else {
+                        (void)check_block(fn_mid, method->body, fn_env, sig.ret);
+                    }
+                }
+
+                sig.auto_instantiated = true;
+                bodies_checked_.insert(method);
+                fn_env.pop_scope();
+                auto_instantiating_.erase(method);
+            }
+        }
+
+        // Validate coercions against the (concrete) signature.
+        if (!sig.params.empty()) {
+            self_param = sig.params[0];
+            if (!types_.can_coerce(recv_arg, self_param)) {
+                error(mc->receiver->span,
+                      "receiver type mismatch: expected `" +
+                          types_.to_string(self_param) + "`, got `" +
+                          types_.to_string(recv_arg) + "`");
+            }
+        }
+        for (size_t i = 0; i < user_arg_types.size(); i++) {
+            TypeId expected_arg =
+                (i + 1) < sig.params.size() ? sig.params[i + 1] : types_.error();
+            if (!types_.can_coerce(user_arg_types[i], expected_arg)) {
+                error(mc->args[i]->span,
+                      "argument type mismatch: expected `" +
+                          types_.to_string(expected_arg) + "`, got `" +
+                          types_.to_string(user_arg_types[i]) + "`");
             }
         }
 

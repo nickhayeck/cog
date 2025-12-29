@@ -38,7 +38,7 @@ struct ResolvedCrate {
 
     // Storage for compiler-injected AST nodes (builtins, synthetic items).
     // These nodes are treated like normal AST items by later passes.
-    AstArena builtins_arena{};
+    mutable AstArena builtins_arena{};
 };
 
 ResolvedCrate resolve_crate(Session& session, FileId root_file);

@@ -1,0 +1,6 @@
+// `builtin::compile_error` is comptime-only.
+
+fn main() -> i32 {
+    builtin::compile_error("nope");
+}
+

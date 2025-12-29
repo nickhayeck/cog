@@ -16,6 +16,10 @@ std::string_view ast_kind_name(AstNodeKind kind) {
             return "Attr";
         case AstNodeKind::TypePath:
             return "TypePath";
+        case AstNodeKind::TypeCall:
+            return "TypeCall";
+        case AstNodeKind::TypeAuto:
+            return "TypeAuto";
         case AstNodeKind::TypePtr:
             return "TypePtr";
         case AstNodeKind::TypeSlice:
@@ -303,6 +307,12 @@ void dump_ast(std::ostream& os, const AstNode* node, int indent) {
         }
         case AstNodeKind::TypePath: {
             dump_ast(os, static_cast<const TypePath*>(node)->path, indent + 1);
+            return;
+        }
+        case AstNodeKind::TypeCall: {
+            auto* n = static_cast<const TypeCall*>(node);
+            dump_ast(os, n->callee, indent + 1);
+            for (const Type* a : n->args) dump_ast(os, a, indent + 1);
             return;
         }
         case AstNodeKind::TypePtr: {

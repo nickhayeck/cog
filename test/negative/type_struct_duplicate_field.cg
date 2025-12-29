@@ -1,0 +1,33 @@
+// v0.0.23: constructed structs must not contain duplicate fields.
+
+fn Bad(comptime T: type) -> type {
+    let fields = [
+        builtin::StructField{
+            name: "x",
+            ty: T,
+            vis: builtin::Vis::Pub,
+        },
+        builtin::StructField{
+            name: "x",
+            ty: T,
+            vis: builtin::Vis::Pub,
+        },
+    ];
+
+    let desc = builtin::StructDesc{
+        name: "Dup",
+        repr: builtin::StructRepr::Cog,
+        fields: &fields,
+    };
+
+    builtin::type_struct(desc)
+}
+
+type X = Bad(i32);
+
+fn takes_x(_x: X) -> () {
+}
+
+fn main() -> i32 {
+    0
+}

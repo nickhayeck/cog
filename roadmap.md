@@ -6,12 +6,9 @@ This document is written as a **spec-driven** path to **v0.1.0 conformance**. Ea
 - examples that exercise the feature(s),
 - and at least one targeted compile test (positive or negative).
 
-Status: **v0.0.20 is implemented** (AST→HIR→MIR→LLVM pipeline + MIR interpreter for const/comptime embedding). The v0.1 core language spec lives in `spec/README.md`.
+Status: **v0.0.23 is implemented** (AST→HIR→MIR→LLVM pipeline + MIR interpreter for const/comptime embedding, plus type-level calls/`auto`/type construction). The v0.1 core language spec lives in `spec/README.md`.
 
-Key spec gaps as of v0.0.20 (blocking v0.1.0):
-- Builtins: implement `spec/builtins.md` (notably `builtin::cast` and type construction)
-- `type` as a first-class comptime value + type-level calls in type positions (`spec/comptime.md`, `spec/types.md`, `spec/syntax.md`)
-- `auto` type placeholder (`spec/auto.md`)
+Key spec gaps as of v0.0.23 (blocking v0.1.0):
 - `core::Option/Result` + `?` (`spec/stdlib.md`)
 - `comptime_int`/`comptime_float` semantics (`spec/types.md`, `spec/lexical.md`)
 - `loop` as an expression via `break expr` (`spec/expressions.md`)
@@ -44,7 +41,7 @@ Key spec gaps as of v0.0.20 (blocking v0.1.0):
 - Conservative local move checker:
   - rejects use-after-move of locals
   - assignment re-initializes locals
-  - `Copy` modeled for primitives/pointers/tuples/arrays (struct/enum structural `Copy` is still pending for v0.1 conformance; see v0.0.24)
+  - `Copy` modeled for primitives/pointers/tuples/arrays (struct/enum structural `Copy` is still pending for v0.1 conformance; see v0.0.25)
 
 ### v0.0.5 — Legacy: dynamic dispatch scaffolding (done; not part of v0.1 spec)
 - The prototype implemented a trait/dyn object system for experimentation.
@@ -202,9 +199,7 @@ Goal: get an end-to-end HIR/MIR pipeline working so comptime interpretation and 
   - Keep the existing compile suite green.
   - Add at least one test that exercises `--emit-hir` and `--emit-mir`.
 
-## Next milestones
-
-### v0.0.21 — Builtins inventory + `type` values + type-level calls (foundation)
+### v0.0.21 — Builtins inventory + `type` values + type-level calls (foundation) (done)
 Goal: make `type`-producing comptime functions possible and clarify the builtin surface (`spec/comptime.md`, `spec/types.md`, `spec/syntax.md`).
 
 - Builtins conformance (non-type-construction):
@@ -221,10 +216,10 @@ Goal: make `type`-producing comptime functions possible and clarify the builtin 
   - During type lowering, evaluate type-level calls at comptime and lower the returned `type` value to a `TypeId`.
   - Add canonicalization so repeated `Option(i32)` yields the same `TypeId` within a compilation.
 - Examples/tests:
-  - Add an example that calls a comptime type function which *selects* among existing types (no type construction yet), and uses the result in a `type` alias and in a value signature.
-  - Add negative tests for type-level calls that do not return `type` or misuse `type` outside comptime contexts.
+  - Example: `examples/type_level_calls/`.
+  - Negative tests: `test/negative/compile_error_outside_comptime.cg`, `test/negative/type_call_not_type.cg`.
 
-### v0.0.22 — `auto` type placeholder (parser + typing)
+### v0.0.22 — `auto` type placeholder (parser + typing) (done)
 Goal: enable polymorphic functions without generics syntax (`spec/auto.md`).
 
 - Parsing:
@@ -238,9 +233,10 @@ Goal: enable polymorphic functions without generics syntax (`spec/auto.md`).
 - Lowering/comptime:
   - Implement `auto`-polymorphic functions by implicitly passing type arguments and compiling via comptime interpretation + residualization (caching is an optimization).
 - Examples/tests:
-  - Add a small example with `fn id(x: auto) -> auto` and a negative suite covering the disallowed positions.
+  - Example: `examples/auto_placeholder/`.
+  - Negative tests: `test/negative/auto_in_struct_field.cg`, `test/negative/auto_in_enum_payload.cg`, `test/negative/auto_in_type_alias.cg`, `test/negative/auto_in_cast_target.cg`, `test/negative/auto_in_extern_signature.cg`, `test/negative/function_pointer_to_auto_fn.cg`.
 
-### v0.0.23 — Type construction builtins (MVP) + user-defined Option/Result
+### v0.0.23 — Type construction builtins (MVP) + user-defined Option/Result (done)
 Goal: unlock user-space “generic” data structures as real Cog code (`spec/comptime.md`, `spec/stdlib.md`).
 
 - Implement type-construction builtins from `spec/builtins.md`:
@@ -252,10 +248,85 @@ Goal: unlock user-space “generic” data structures as real Cog code (`spec/co
   - layout/ABI queries (`size_of`/`align_of`/`type_info`)
   - codegen for construction, matching, and field access
 - Examples/tests:
-  - Add an example that defines `Option`/`Result` as comptime type functions (not `core::` yet), uses `type OptI32 = Option(i32);`, and constructs/matches `OptI32::Some(...)`.
-  - Add negative tests for malformed type construction (bad field/variant definitions; non-serializable type values; etc).
+  - Example: `examples/user_option_result/`.
+  - Negative tests: `test/negative/type_enum_tagged_payload.cg`, `test/negative/type_struct_duplicate_field.cg`, `test/negative/type_struct_field_ty_is_type.cg`.
 
-### v0.0.24 — Core semantics conformance: `loop` values, `Copy`, `comptime_int/float`
+## Next milestones
+
+### v0.0.24 — MIR comptime unification: `type` values + type construction on MIR
+Goal: eliminate the “two comptime engines” split by making MIR capable of executing the
+same comptime surface needed for type-level programming (and eventually all comptime).
+
+Today:
+- type-level calls (`Name(T, ...)` in type positions) are evaluated by the AST comptime evaluator.
+- const/static + `comptime { ... }` residualization are evaluated by the MIR interpreter.
+
+This milestone makes MIR the *authoritative* comptime execution engine for:
+- `type` values (first-class at comptime)
+- `builtin::type_*` constructors (including nominal `type_struct`/`type_enum`)
+- and the minimal pointer/ref story needed by descriptor values (`&local` as a comptime heap reference)
+
+Concrete deliverables:
+
+- MIR representation:
+  - Add `MirConst::Type{TypeId}` (a literal “type value”) for comptime-only MIR bodies.
+  - Add MIR opcodes for type construction builtins so they do not go through normal call resolution:
+    - either new `MirRvalue` variants (preferred) or a dedicated “intrinsic call” rvalue.
+    - cover all v0.1 constructors: `type_unit`, `type_never`, `type_ptr_const`, `type_ptr_mut`,
+      `type_slice`, `type_array`, `type_tuple`, `type_fn`, `type_struct`, `type_enum`.
+  - Update `--emit-mir` dumps to print these new forms clearly.
+
+- MIR lowering:
+  - Lower `fn ... -> type` bodies to MIR as **comptime-only MIR bodies** (not codegenned).
+    - `lower_mir` currently skips these (`src/lower_mir.cpp`) — remove that restriction.
+  - In comptime-only bodies, treat type paths as values:
+    - lower `i32`, `MyStruct`, `Option(i32)`, etc (when used as expressions) to `MirConst::Type`.
+  - Lower `builtin::type_*` calls to the new MIR intrinsic opcodes in comptime-only bodies.
+  - Keep existing runtime MIR lowering behavior unchanged (no runtime codegen for `type`).
+
+- MIR interpreter:
+  - Extend the MIR interpreter to evaluate `MirConst::Type` as `ComptimeValue::Type`.
+  - Implement comptime `&`/`&mut` for locals/temporaries by introducing a comptime heap (like the AST evaluator):
+    - interpret `MirRvalue::AddrOf` as `ComptimeValue::Ref` to a heap cell containing a *copy* of the place value.
+    - keep `ComptimeValue::Ptr` reserved for integer↔pointer casts.
+  - Evaluate `builtin::type_*` MIR intrinsics:
+    - reuse the existing canonicalization + type-construction cache
+    - reuse the same synthetic nominal item allocation strategy
+    - update `struct_info` / `enum_info` side tables so layout/codegen can see constructed types
+  - Ensure the interpreter remains deterministic and keeps resource limits.
+
+- Checker integration:
+  - Replace type-level call evaluation (`TypeCall`) to run via MIR interpretation of the callee:
+    - `Checker::lower_type_call` should no longer invoke the AST evaluator for `fn ... -> type`.
+    - The type-call cache key must be based on type identity (not just printed names).
+  - Keep the AST evaluator only for legacy gaps (if any), with a clear “delete me” path.
+
+- Backend integration:
+  - Ensure LLVM codegen never attempts to emit comptime-only MIR bodies.
+  - Keep nominal type emission driven by `checked_.struct_info` / `checked_.enum_info` (constructed types included).
+
+- Examples/tests:
+  - Add at least one example that uses a `fn ... -> type` body containing:
+    - `&local` references to descriptor arrays
+    - `builtin::type_struct` *and* `builtin::type_enum`
+  - Add a stress example that passes constructed types as type-level call arguments (cache collision test).
+  - Add a small negative suite for MIR-only comptime errors (e.g. using `builtin::type_enum` outside comptime).
+
+End product (what “done” means):
+- There is exactly one semantics engine used to *execute comptime* for `type`-level programming: MIR.
+- The compiler can evaluate and cache type-level calls via MIR, producing canonical constructed types.
+- `builtin::type_*` works anywhere a comptime expression is permitted, and it does not require bespoke AST-only behavior.
+
+Ergonomics follow-ups (do these at the end of this milestone):
+- Type-qualified paths (eliminate “must alias first”):
+  - Extend path syntax so the left-hand side of `::` can be a type expression (at least `type_path` and `type_call`).
+  - Support `Option(i32)::Some(1)` construction and `match x { Option(i32)::Some(v) => ... }` patterns.
+  - Update `spec/syntax.md` and add a targeted example + compile test.
+- `auto` polymorphism correctness:
+  - Remove the current “single instantiation per function” behavior; type-check + lower polymorphic fns per call-site (with caching keyed by deduced types).
+  - Add a stress test that calls the same `auto`-polymorphic function with at least two distinct argument type shapes and verifies both compile/codegen.
+
+### v0.0.25 — Core semantics conformance: `loop` values, `Copy`, `comptime_int/float`
 Goal: close the biggest remaining semantic gaps in `spec/expressions.md`, `spec/moves.md`, and `spec/types.md`.
 
 - `loop` as an expression (Rust-like):
@@ -277,7 +348,7 @@ Goal: close the biggest remaining semantic gaps in `spec/expressions.md`, `spec/
 - Address-of `const` items:
   - Implement `&CONST` by materializing a private global (implementation-defined deduplication; no pointer identity guarantees) (`spec/items.md`).
 
-### v0.0.25 — Tags, visibility, and C ABI conformance
+### v0.0.26 — Tags, visibility, and C ABI conformance
 Goal: match `spec/modules.md` visibility rules and `spec/layout_abi.md` interop rules.
 
 - Visibility:
@@ -307,7 +378,7 @@ Goal: match `spec/modules.md` visibility rules and `spec/layout_abi.md` interop 
   - Add an end-to-end C interop example using `malloc/free/printf` and (optionally) a `enum[tag(i32)]`.
   - Add negative tests for invalid C ABI signatures and bad enum discriminants.
 
-### v0.0.26 — Build mode plumbing (CLI + lowering hooks)
+### v0.0.27 — Build mode plumbing (CLI + lowering hooks)
 Goal: introduce build-mode selection without changing semantics yet.
 
 - Add `--build-mode {debug,release_safe,release_fast}` and plumb through parsing/checking/comptime/codegen.
@@ -315,7 +386,7 @@ Goal: introduce build-mode selection without changing semantics yet.
 - Tests:
   - Add at least one compile-smoke test per build mode (same input program; just ensure compilation succeeds).
 
-### v0.0.27 — Runtime traps (Debug/ReleaseSafe) + UB in ReleaseFast
+### v0.0.28 — Runtime traps (Debug/ReleaseSafe) + UB in ReleaseFast
 Goal: implement the required safety checks from `spec/build_modes.md`.
 
 - Traps in `Debug`/`ReleaseSafe`:
@@ -330,7 +401,7 @@ Goal: implement the required safety checks from `spec/build_modes.md`.
 - Tests:
   - Add targeted negative tests for each trap class in safe modes (and at least one “compiles in ReleaseFast” case).
 
-### v0.0.28 — Ship `core` + prelude + `?` operator
+### v0.0.29 — Ship `core` + prelude + `?` operator
 Goal: implement `spec/stdlib.md` once the compiler surface (CLI/build modes/emits) is stable.
 
 - `core` module:
@@ -347,7 +418,7 @@ Goal: implement `spec/stdlib.md` once the compiler surface (CLI/build modes/emit
   - Add an example that uses both `core::Option(...)` and `core::Result(..., ...)` and uses `?` in at least one helper function.
   - Add negative tests for `?` misuse (wrong return type, wrong operand type).
 
-### v0.0.29 — Tech debt cleanup (stabilize for v0.1)
+### v0.0.30 — Tech debt cleanup (stabilize for v0.1)
 Goal: keep the compiler maintainable as we approach v0.1.
 
 - Remove host-UB integer math from comptime evaluation (use checked/wrapping ops or APInt everywhere).
@@ -355,7 +426,7 @@ Goal: keep the compiler maintainable as we approach v0.1.
 - Add/refresh key comments in confusing subsystems (parser/type checker/comptime/codegen).
 - Clean up any v0.0.x legacy scaffolding that no longer serves the v0.1 spec.
 
-### v0.0.30 — v0.1.0 RC
+### v0.0.31 — v0.1.0 RC
 Goal: reach “practical conformance” with the v0.1 spec and stabilize a release candidate.
 
 - Align docs and implementation around the v0.1 subset; ensure examples cover the v0.1 surface.

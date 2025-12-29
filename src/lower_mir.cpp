@@ -52,6 +52,17 @@ class Lowerer {
 
                     auto it = checked_.fn_info.find(fn);
                     if (it == checked_.fn_info.end()) break;
+                    if (it->second.has_auto && !it->second.auto_instantiated) {
+                        // v0.0.22 MVP: `auto` functions are instantiated on
+                        // demand. Uninstantiated `auto` functions have no
+                        // monomorphic MIR body.
+                        break;
+                    }
+                    if (types_.equal(it->second.ret, types_.type_type())) {
+                        // v0.0.21: `type`-returning functions are comptime-only
+                        // and are not lowered to runtime MIR yet.
+                        break;
+                    }
 
                     MirBody body = lower_fn_body(d.id, d.module, fn, it->second,
                                                  /*self_ty=*/std::nullopt);
@@ -390,6 +401,26 @@ class Lowerer {
         const VariantDecl* decl = nullptr;
         std::uint32_t index = 0;
     };
+
+    ResolvedVariant resolve_variant_from_type(TypeId enum_ty,
+                                              std::string_view vname) const {
+        const TypeData& td = types_.get(enum_ty);
+        if (td.kind != TypeKind::Enum || !td.enum_def) return {};
+
+        auto info_it = checked_.enum_info.find(td.enum_def);
+        if (info_it == checked_.enum_info.end()) return {};
+        const EnumInfo& ei = info_it->second;
+        for (size_t i = 0; i < ei.variants_in_order.size(); i++) {
+            if (ei.variants_in_order[i] != vname) continue;
+            auto vit = ei.variants.find(std::string(vname));
+            const VariantDecl* vd =
+                vit != ei.variants.end() ? vit->second.ast : nullptr;
+            return {.def = td.enum_def,
+                    .decl = vd,
+                    .index = static_cast<std::uint32_t>(i)};
+        }
+        return {.def = td.enum_def, .decl = nullptr, .index = 0};
+    }
 
     ResolvedVariant resolve_variant_path(ModuleId mid, const Path* path) const {
         if (!path || path->segments.size() < 2) return {};
@@ -857,19 +888,30 @@ class Lowerer {
         }
 
         // Enum unit variant.
-        ResolvedVariant rv = resolve_variant_path(mid, p->path);
-        if (rv.def && rv.decl && rv.decl->payload.empty()) {
+        if (p->path->segments.size() >= 2) {
             TypeId enum_ty = type_of(static_cast<const Expr*>(p));
-            MirLocalId tmp = add_temp(enum_ty);
-            MirRvalue::Aggregate agg{};
-            agg.kind = MirRvalue::AggregateKind::EnumVariant;
-            agg.ty = enum_ty;
-            agg.variant_index = rv.index;
-            emit_stmt(MirStatement{MirStatement::Assign{
-                .dst = MirPlace::local(tmp),
-                .src = MirRvalue{std::move(agg)},
-            }});
-            return MirOperand{MirOperand::Copy{MirPlace::local(tmp)}};
+            std::string_view vname = p->path->segments.back()->text;
+            ResolvedVariant rv = resolve_variant_from_type(enum_ty, vname);
+            if (rv.def) {
+                auto info_it = checked_.enum_info.find(rv.def);
+                if (info_it != checked_.enum_info.end()) {
+                    const EnumInfo& ei = info_it->second;
+                    auto vit = ei.variants.find(std::string(vname));
+                    if (vit != ei.variants.end() && vit->second.payload.empty()) {
+                        MirLocalId tmp = add_temp(enum_ty);
+                        MirRvalue::Aggregate agg{};
+                        agg.kind = MirRvalue::AggregateKind::EnumVariant;
+                        agg.ty = enum_ty;
+                        agg.variant_index = rv.index;
+                        emit_stmt(MirStatement{MirStatement::Assign{
+                            .dst = MirPlace::local(tmp),
+                            .src = MirRvalue{std::move(agg)},
+                        }});
+                        return MirOperand{
+                            MirOperand::Copy{MirPlace::local(tmp)}};
+                    }
+                }
+            }
         }
 
         // Function item value (for function pointers).
@@ -1549,7 +1591,11 @@ class Lowerer {
                     args = &vp->args;
                 }
 
-                ResolvedVariant rv = resolve_variant_path(mid, path);
+                std::string_view vname =
+                    (path && !path->segments.empty())
+                        ? path->segments.back()->text
+                        : std::string_view{};
+                ResolvedVariant rv = resolve_variant_from_type(scrut_ty, vname);
                 if (!rv.def || !rv.decl) {
                     error(pat->span, "unresolved enum variant pattern");
                     return bool_operand(false);
@@ -1666,7 +1712,11 @@ class Lowerer {
                 const TypeData& td = types_.get(scrut_ty);
                 if (td.kind != TypeKind::Enum || !td.enum_def) return;
 
-                ResolvedVariant rv = resolve_variant_path(mid, vp->path);
+                std::string_view vname =
+                    (vp->path && !vp->path->segments.empty())
+                        ? vp->path->segments.back()->text
+                        : std::string_view{};
+                ResolvedVariant rv = resolve_variant_from_type(scrut_ty, vname);
                 if (!rv.def || !rv.decl) return;
                 auto info_it = checked_.enum_info.find(rv.def);
                 if (info_it == checked_.enum_info.end()) return;
@@ -1732,15 +1782,15 @@ class Lowerer {
             if (name == "type_info") {
                 if (call->args.size() != 1) return unit_operand();
                 TypeId arg_ty = lower_type_value_expr(mid, call->args[0]);
-                if (!types_.is_sized(arg_ty)) {
-                    error(call->args[0] ? call->args[0]->span : call->span,
-                          "builtin::type_info currently requires a sized type");
-                    return unit_operand();
+                std::uint64_t sz = 0;
+                std::uint64_t al = 0;
+                if (types_.is_sized(arg_ty)) {
+                    auto sz_opt = layout_.size_of(arg_ty, call->span);
+                    auto al_opt = layout_.align_of(arg_ty, call->span);
+                    if (!sz_opt || !al_opt) return unit_operand();
+                    sz = *sz_opt;
+                    al = *al_opt;
                 }
-
-                auto sz = layout_.size_of(arg_ty, call->span);
-                auto al = layout_.align_of(arg_ty, call->span);
-                if (!sz || !al) return unit_operand();
 
                 const TypeData& out_td =
                     types_.get(type_of(static_cast<const Expr*>(call)));
@@ -1753,12 +1803,96 @@ class Lowerer {
                 std::unordered_map<std::string, MirOperand> field_vals{};
                 for (const auto& f : si.fields_in_order) {
                     if (f.name == "kind") {
-                        std::int64_t kind_code =
-                            static_cast<std::int64_t>(types_.get(arg_ty).kind);
-                        field_vals.insert({std::string(f.name),
-                                           int_operand(f.type, kind_code)});
+                        const TypeData& kd = types_.get(f.type);
+                        if (kd.kind == TypeKind::Enum && kd.enum_def) {
+                            std::optional<std::uint32_t> idx{};
+                            switch (types_.get(arg_ty).kind) {
+                                case TypeKind::Int:
+                                    idx = 0;
+                                    break;
+                                case TypeKind::Float:
+                                    idx = 1;
+                                    break;
+                                case TypeKind::Bool:
+                                    idx = 2;
+                                    break;
+                                case TypeKind::Unit:
+                                    idx = 3;
+                                    break;
+                                case TypeKind::Never:
+                                    idx = 4;
+                                    break;
+                                case TypeKind::Ptr:
+                                    idx = 5;
+                                    break;
+                                case TypeKind::Slice:
+                                    idx = 6;
+                                    break;
+                                case TypeKind::Array:
+                                    idx = 7;
+                                    break;
+                                case TypeKind::Tuple:
+                                    idx = 8;
+                                    break;
+                                case TypeKind::Struct:
+                                    idx = 9;
+                                    break;
+                                case TypeKind::Enum:
+                                    idx = 10;
+                                    break;
+                                case TypeKind::Fn:
+                                    idx = 11;
+                                    break;
+                                default:
+                                    idx = std::nullopt;
+                                    break;
+                            }
+                            if (idx) {
+                                MirRvalue::Aggregate kind_agg{};
+                                kind_agg.kind =
+                                    MirRvalue::AggregateKind::EnumVariant;
+                                kind_agg.ty = f.type;
+                                kind_agg.variant_index = *idx;
+                                MirLocalId kind_tmp = add_temp(f.type);
+                                emit_stmt(MirStatement{MirStatement::Assign{
+                                    .dst = MirPlace::local(kind_tmp),
+                                    .src = MirRvalue{std::move(kind_agg)},
+                                }});
+                                field_vals.insert(
+                                    {std::string(f.name),
+                                     MirOperand{MirOperand::Copy{
+                                         MirPlace::local(kind_tmp)}}});
+                            }
+                        }
+                        if (!field_vals.contains(std::string(f.name))) {
+                            if (kd.kind == TypeKind::Enum && kd.enum_def) {
+                                // Fall back to the first variant (and keep
+                                // going) if the type kind is not representable
+                                // in `builtin::TypeKind`.
+                                MirRvalue::Aggregate kind_agg{};
+                                kind_agg.kind =
+                                    MirRvalue::AggregateKind::EnumVariant;
+                                kind_agg.ty = f.type;
+                                kind_agg.variant_index = 0;
+                                MirLocalId kind_tmp = add_temp(f.type);
+                                emit_stmt(MirStatement{MirStatement::Assign{
+                                    .dst = MirPlace::local(kind_tmp),
+                                    .src = MirRvalue{std::move(kind_agg)},
+                                }});
+                                field_vals.insert(
+                                    {std::string(f.name),
+                                     MirOperand{MirOperand::Copy{
+                                         MirPlace::local(kind_tmp)}}});
+                            } else {
+                                field_vals.insert({std::string(f.name),
+                                                   int_operand(f.type, 0)});
+                            }
+                            error(call->span,
+                                  "builtin::type_info does not support this "
+                                  "type kind");
+                        }
                     } else if (f.name == "size") {
-                        if (*sz >
+                        if (sz >
                             static_cast<std::uint64_t>(
                                 std::numeric_limits<std::int64_t>::max())) {
                             error(call->span, "comptime integer overflow");
@@ -1768,10 +1902,10 @@ class Lowerer {
                             field_vals.insert(
                                 {std::string(f.name),
                                  int_operand(f.type,
-                                             static_cast<std::int64_t>(*sz))});
+                                             static_cast<std::int64_t>(sz))});
                         }
                     } else if (f.name == "align") {
-                        if (*al >
+                        if (al >
                             static_cast<std::uint64_t>(
                                 std::numeric_limits<std::int64_t>::max())) {
                             error(call->span, "comptime integer overflow");
@@ -1781,7 +1915,7 @@ class Lowerer {
                             field_vals.insert(
                                 {std::string(f.name),
                                  int_operand(f.type,
-                                             static_cast<std::int64_t>(*al))});
+                                             static_cast<std::int64_t>(al))});
                         }
                     }
                 }
@@ -1806,6 +1940,11 @@ class Lowerer {
                 return MirOperand{MirOperand::Copy{MirPlace::local(tmp)}};
             }
             if (name == "compile_error") {
+                if (!in_comptime_context_) {
+                    error(call->span,
+                          "builtin::compile_error is comptime-only");
+                    return unit_operand();
+                }
                 std::string msg = "builtin::compile_error";
                 if (call->args.size() == 1) {
                     if (call->args[0] &&
@@ -1822,6 +1961,17 @@ class Lowerer {
                 terminate(MirTerminator{MirTerminator::Unreachable{}});
                 start_new_block(add_block());
                 return unit_operand();
+            }
+            if (name == "cast") {
+                if (call->args.size() != 2) return unit_operand();
+                MirOperand v = lower_expr(mid, call->args[0]);
+                TypeId dst = lower_type_value_expr(mid, call->args[1]);
+                MirLocalId tmp = add_temp(dst);
+                MirRvalue rv{};
+                rv.data = MirRvalue::Cast{.operand = std::move(v), .to = dst};
+                emit_stmt(MirStatement{MirStatement::Assign{
+                    .dst = MirPlace::local(tmp), .src = std::move(rv)}});
+                return MirOperand{MirOperand::Copy{MirPlace::local(tmp)}};
             }
         }
 
@@ -1861,9 +2011,10 @@ class Lowerer {
             }
 
             // Enum variant constructor.
-            ResolvedVariant rv = resolve_variant_path(mid, callee_path);
+            TypeId enum_ty = type_of(static_cast<const Expr*>(call));
+            std::string_view vname = callee_path->segments.back()->text;
+            ResolvedVariant rv = resolve_variant_from_type(enum_ty, vname);
             if (rv.def && rv.decl) {
-                TypeId enum_ty = type_of(static_cast<const Expr*>(call));
                 MirRvalue::Aggregate agg{};
                 agg.kind = MirRvalue::AggregateKind::EnumVariant;
                 agg.ty = enum_ty;

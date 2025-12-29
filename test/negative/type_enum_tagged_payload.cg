@@ -1,0 +1,30 @@
+// v0.0.23: tagged enums (`tag_type=Some(int)`) must be fieldless.
+
+fn Bad(comptime T: type) -> type {
+    let payload = [T];
+
+    let variants = [
+        builtin::EnumVariant{
+            name: "A",
+            payload: &payload,
+            discriminant: builtin::MaybeComptimeInt::None,
+        },
+    ];
+
+    let desc = builtin::EnumDesc{
+        name: "BadEnum",
+        variants: &variants,
+        tag_type: builtin::MaybeType::Some(i32),
+    };
+
+    builtin::type_enum(desc)
+}
+
+type X = Bad(i32);
+
+fn takes_x(_x: X) -> () {
+}
+
+fn main() -> i32 {
+    0
+}

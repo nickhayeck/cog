@@ -156,6 +156,7 @@ static bool parse_float_literal(double& out) {
 "enum"                   { return KW_ENUM; }
 "impl"                   { return KW_IMPL; }
 "type"                   { return KW_TYPE; }
+"auto"                   { return KW_AUTO; }
 "const"                  { return KW_CONST; }
 "static"                 { return KW_STATIC; }
 "mod"                    { return KW_MOD; }

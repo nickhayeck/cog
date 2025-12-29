@@ -1,0 +1,7 @@
+fn id(x: auto) -> auto { x }
+
+fn main() -> i32 {
+    let p: const* fn(i32) -> i32 = id as const* fn(i32) -> i32;
+    p(0 as i32)
+}
+

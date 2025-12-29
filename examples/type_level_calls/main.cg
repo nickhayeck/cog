@@ -1,0 +1,32 @@
+// v0.0.21: `type` values + type-level calls in type positions.
+//
+// `PickWord(T)` is a comptime type function that selects among existing types
+// based on `builtin::type_info`.
+//
+// - `comptime T: type` means the parameter is a compile-time value whose type
+//   is `type` (a value that represents a Cog type).
+// - Because this function returns `type`, it is intended to be evaluated at
+//   compile time when used from a type position.
+
+fn PickWord(comptime T: type) -> type {
+    // `builtin::type_info(T)` is always evaluated at compile time and returns a
+    // `TypeInfo` record describing the runtime layout/category of `T`.
+    let ti: TypeInfo = builtin::type_info(T);
+    match ti.kind {
+        // `i32` and `usize` here are *type values* (because we are in a comptime
+        // context and the function returns `type`).
+        builtin::TypeKind::Int => i32,
+        _ => usize,
+    }
+}
+
+// Type alias using a “type-level call” in a type position.
+type Word = PickWord(i32);
+
+fn add_one(x: Word) -> Word {
+    x + (1 as Word)
+}
+
+fn main() -> i32 {
+    add_one(41 as PickWord(i32)) as i32
+}
