@@ -1,0 +1,34 @@
+// Tiny C-string helpers for the perfect-hash example.
+//
+// `c"..."` literals are NUL-terminated and have type `const* u8`.
+
+const P: i64 = 2147483647;
+
+pub(crate) fn cstr_eq(a: const* u8, b: const* u8) -> bool {
+    let mut i: usize = 0;
+    while true {
+        let ca: u8 = a[i];
+        let cb: u8 = b[i];
+        if ca != cb { return false; };
+        if ca == 0 { return true; };
+        i = i + 1;
+    };
+    false
+}
+
+// A stable, overflow-safe C-string hash:
+//   h = (h*257 + byte) mod P
+//
+// This stays in-range for i64 and is suitable for safe build modes too (no
+// wrapping arithmetic required).
+pub(crate) fn cstr_hash_modp(s: const* u8) -> i64 {
+    let mut h: i64 = 0;
+    let mut i: usize = 0;
+    while true {
+        let b: u8 = s[i];
+        if b == 0 { break; };
+        h = (h * 257 + (b as i64)) % P;
+        i = i + 1;
+    };
+    if h < 0 { h + P } else { h }
+}

@@ -1,0 +1,274 @@
+// Minimal perfect hashing computed at comptime.
+//
+// This example builds three “perfect hash tables”:
+// - `i32` keys -> `const* u8` (C string) values
+// - `f64` keys -> `i32` values
+// - `const* u8` C-string keys -> opcodes (then dispatched via `match`)
+//
+// The perfect-hash *seed* and the “g table” are computed at comptime.
+//
+// Current limitation:
+// - The MIR comptime interpreter cannot dereference pointers yet, so for the
+//   string-keyed map we *precompute* the per-key string fingerprints (hashes)
+//   as integer constants. At runtime we compute the same hash for the query.
+
+mod phf;
+mod cstr;
+
+fn fp_i32(x: i32) -> i64 { x as i64 }
+
+// Fingerprint for floats: scale by 1000 and truncate. For an actual library you
+// would want a bit-pattern hash, but that requires a bitcast story.
+fn fp_f64(x: f64) -> i64 { (x * 1000.0) as i64 }
+
+const SEED_LIMIT: i64 = 2000;
+
+// ---- Map #1: i32 -> C string ----
+
+struct IntMap {
+    phf: phf::Phf,
+    keys: [i32; 9],
+    values: [const* u8; 9],
+}
+
+static INT_MAP: IntMap = comptime {
+    let keys: [i32; 9] = [200, 201, 204, 301, 400, 401, 403, 404, 500];
+    let values: [const* u8; 9] = [
+        c"OK",
+        c"Created",
+        c"No Content",
+        c"Moved Permanently",
+        c"Bad Request",
+        c"Unauthorized",
+        c"Forbidden",
+        c"Not Found",
+        c"Internal Server Error",
+    ];
+
+    let mut fps: [i64; phf::MAX_KEYS] = [0; phf::MAX_KEYS];
+    let mut i: usize = 0;
+    while i < 9 {
+        fps[i] = fp_i32(keys[i]);
+        i = i + 1;
+    };
+
+    // We choose a non-minimal table size here (m=18) so the seed search is fast.
+    let m: usize = 18;
+    let mut seed: i64 = 0;
+    let mut found: bool = false;
+    while seed < SEED_LIMIT {
+        let mut used: [bool; phf::MAX_KEYS] = [false; phf::MAX_KEYS];
+        let mut ok: bool = true;
+        let mut j: usize = 0;
+        while j < 9 {
+            let s: usize = phf::slot(m, fps[j], seed);
+            if used[s] { ok = false; break; };
+            used[s] = true;
+            j = j + 1;
+        };
+        if ok { found = true; break; };
+        seed = seed + 1;
+    };
+    if !found { builtin::compile_error("perfect hash seed search failed (i32 map)"); };
+
+    let mut g: [usize; phf::MAX_KEYS] = [0; phf::MAX_KEYS];
+    let mut j: usize = 0;
+    while j < 9 {
+        let s: usize = phf::slot(m, fps[j], seed);
+        g[s] = j;
+        j = j + 1;
+    };
+    let p: phf::Phf = phf::Phf{n: 9, m: m, seed: seed, g: g};
+
+    IntMap{phf: p, keys: keys, values: values}
+};
+
+fn int_get(code: i32) -> const* u8 {
+    let idx: usize = phf::index(&INT_MAP.phf, fp_i32(code));
+    if INT_MAP.keys[idx] == code { INT_MAP.values[idx] } else { 0 as const* u8 }
+}
+
+// ---- Map #2: f64 -> i32 ----
+
+struct FloatMap {
+    phf: phf::Phf,
+    keys: [f64; 6],
+    values: [i32; 6],
+}
+
+static FLOAT_MAP: FloatMap = comptime {
+    let keys: [f64; 6] = [0.5, 1.0, 2.0, 3.0, 10.0, 42.0];
+    let values: [i32; 6] = [5, 10, 20, 30, 100, 420];
+
+    let mut fps: [i64; phf::MAX_KEYS] = [0; phf::MAX_KEYS];
+    let mut i: usize = 0;
+    while i < 6 {
+        fps[i] = fp_f64(keys[i]);
+        i = i + 1;
+    };
+
+    // For this keyset, m=11 works well (and m=12 does not for this hash family).
+    let m: usize = 11;
+    let mut seed: i64 = 0;
+    let mut found: bool = false;
+    while seed < SEED_LIMIT {
+        let mut used: [bool; phf::MAX_KEYS] = [false; phf::MAX_KEYS];
+        let mut ok: bool = true;
+        let mut j: usize = 0;
+        while j < 6 {
+            let s: usize = phf::slot(m, fps[j], seed);
+            if used[s] { ok = false; break; };
+            used[s] = true;
+            j = j + 1;
+        };
+        if ok { found = true; break; };
+        seed = seed + 1;
+    };
+    if !found { builtin::compile_error("perfect hash seed search failed (f64 map)"); };
+
+    let mut g: [usize; phf::MAX_KEYS] = [0; phf::MAX_KEYS];
+    let mut j: usize = 0;
+    while j < 6 {
+        let s: usize = phf::slot(m, fps[j], seed);
+        g[s] = j;
+        j = j + 1;
+    };
+    let p: phf::Phf = phf::Phf{n: 6, m: m, seed: seed, g: g};
+
+    FloatMap{phf: p, keys: keys, values: values}
+};
+
+fn float_get(x: f64) -> i32 {
+    let idx: usize = phf::index(&FLOAT_MAP.phf, fp_f64(x));
+    if FLOAT_MAP.keys[idx] == x { FLOAT_MAP.values[idx] } else { -1 }
+}
+
+// ---- Map #3: C string -> function pointer ----
+
+fn cmd_inc(x: i32) -> i32 { x + 1 }
+fn cmd_dec(x: i32) -> i32 { x - 1 }
+fn cmd_double(x: i32) -> i32 { x * 2 }
+fn cmd_half(x: i32) -> i32 { x / 2 }
+fn cmd_square(x: i32) -> i32 { x * x }
+fn cmd_neg(x: i32) -> i32 { -x }
+fn cmd_abs(x: i32) -> i32 { if x < 0 { -x } else { x } }
+fn cmd_xor42(x: i32) -> i32 { x ^ 42 }
+
+fn cmd_apply(op: i32, x: i32) -> i32 {
+    match op {
+        0 => cmd_inc(x),
+        1 => cmd_dec(x),
+        2 => cmd_double(x),
+        3 => cmd_half(x),
+        4 => cmd_square(x),
+        5 => cmd_neg(x),
+        6 => cmd_abs(x),
+        7 => cmd_xor42(x),
+        _ => x,
+    }
+}
+
+struct CmdMap {
+    phf: phf::Phf,
+    keys: [const* u8; 8],
+    // Fingerprints for the keys above, computed offline using `cstr_hash_modp`.
+    // Once comptime pointer reads exist, these can be computed inside the
+    // comptime block from the string literals directly.
+    key_fps: [i64; 8],
+    // v0.0.23 limitation: function pointer values are not supported in comptime
+    // evaluation yet, so we store a small opcode and dispatch with `match`.
+    values: [i32; 8],
+}
+
+static CMD_MAP: CmdMap = comptime {
+    let keys: [const* u8; 8] = [
+        c"inc",
+        c"dec",
+        c"double",
+        c"half",
+        c"square",
+        c"neg",
+        c"abs",
+        c"xor42",
+    ];
+
+    let key_fps: [i64; 8] = [
+        6963514,     // inc
+        6630956,     // dec
+        558501453,   // double
+        1771792283,  // half
+        1072399358,  // square
+        7291450,     // neg
+        6432054,     // abs
+        1402161075,  // xor42
+    ];
+
+    let values: [i32; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
+
+    let mut fps: [i64; phf::MAX_KEYS] = [0; phf::MAX_KEYS];
+    let mut i: usize = 0;
+    while i < 8 {
+        fps[i] = key_fps[i];
+        i = i + 1;
+    };
+
+    // This one is minimal (m=n=8).
+    let m: usize = 8;
+    let mut seed: i64 = 0;
+    let mut found: bool = false;
+    while seed < SEED_LIMIT {
+        let mut used: [bool; phf::MAX_KEYS] = [false; phf::MAX_KEYS];
+        let mut ok: bool = true;
+        let mut j: usize = 0;
+        while j < 8 {
+            let s: usize = phf::slot(m, fps[j], seed);
+            if used[s] { ok = false; break; };
+            used[s] = true;
+            j = j + 1;
+        };
+        if ok { found = true; break; };
+        seed = seed + 1;
+    };
+    if !found { builtin::compile_error("perfect hash seed search failed (cstr map)"); };
+
+    let mut g: [usize; phf::MAX_KEYS] = [0; phf::MAX_KEYS];
+    let mut j: usize = 0;
+    while j < 8 {
+        let s: usize = phf::slot(m, fps[j], seed);
+        g[s] = j;
+        j = j + 1;
+    };
+    let p: phf::Phf = phf::Phf{n: 8, m: m, seed: seed, g: g};
+
+    CmdMap{phf: p, keys: keys, key_fps: key_fps, values: values}
+};
+
+fn cmd_lookup(name: const* u8) -> i32 {
+    let fp: i64 = cstr::cstr_hash_modp(name);
+    let idx: usize = phf::index(&CMD_MAP.phf, fp);
+    if cstr::cstr_eq(CMD_MAP.keys[idx], name) { CMD_MAP.values[idx] } else { -1 }
+}
+
+fn main() -> i32 {
+    // i32 map
+    let a: const* u8 = int_get(404);
+    let b: const* u8 = int_get(123);
+
+    // f64 map
+    let c: i32 = float_get(10.0);
+    let d: i32 = float_get(1.5);
+
+    // cstr -> function pointer map
+    let f: i32 = cmd_lookup(c"square");
+    let g: i32 = cmd_lookup(c"nope");
+
+    let mut out: i32 = 0;
+    if a != 0 as const* u8 { out = out + 1; };
+    if b == 0 as const* u8 { out = out + 2; };
+    if c == 100 { out = out + 3; };
+    if d == -1 { out = out + 4; };
+    if f != -1 { out = out + cmd_apply(f, 7); };
+    if g == -1 { out = out + 5; };
+
+    out
+}

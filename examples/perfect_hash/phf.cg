@@ -1,0 +1,55 @@
+// Minimal perfect hashing (MPH) for a fixed keyset.
+//
+// This module intentionally keeps the algorithm very small and very explicit,
+// so it can run in the current comptime interpreter (which has limited support
+// for pointers/loads).
+//
+// Design:
+// - We build an MPH over an array of *integer fingerprints* `fp[i]` (not the
+//   original keys). The user is responsible for defining a stable fingerprint
+//   function for their key type.
+// - We brute-force a `seed` such that:
+//       slot(fp[i], seed) = hash(fp[i], seed) % n
+//   is collision-free for all keys.
+// - We then build a small “g” table mapping `slot` → original index `i`.
+//
+// Lookup:
+// - Compute `slot(fp(query), seed)`, then `idx = g[slot]`.
+// - Finally, verify the original key equality to reject non-members.
+
+pub(crate) const MAX_KEYS: usize = 64;
+
+// A prime less than 2^31. We keep all arithmetic below i64 overflow so comptime
+// evaluation is well-defined with the current interpreter (which uses i64).
+pub(crate) const P: i64 = 2147483647;
+
+pub(crate) struct Phf {
+    n: usize,                 // number of keys (<= MAX_KEYS)
+    m: usize,                 // table size (n <= m <= MAX_KEYS)
+    seed: i64,                // chosen seed (>= 0)
+    g: [usize; MAX_KEYS],     // slot -> original index
+}
+
+fn mod_p(x: i64) -> i64 {
+    let r: i64 = x % P;
+    if r < 0 { r + P } else { r }
+}
+
+// A very small hash family that stays within i64 range:
+//   h = (a*fp + b) mod P
+// where a,b are derived from `seed`.
+pub(crate) fn hash_mod_p(fp: i64, seed: i64) -> i64 {
+    let s = mod_p(seed);
+    let a = mod_p(s * 2 + 1); // odd and non-zero mod P
+    let b = mod_p(s * 3 + 1);
+    mod_p(a * mod_p(fp) + b)
+}
+
+pub(crate) fn slot(m: usize, fp: i64, seed: i64) -> usize {
+    (hash_mod_p(fp, seed) % (m as i64)) as usize
+}
+
+pub(crate) fn index(phf: const* Phf, fp: i64) -> usize {
+    let s: usize = slot(phf.m, fp, phf.seed);
+    phf.g[s]
+}

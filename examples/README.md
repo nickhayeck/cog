@@ -16,6 +16,7 @@ These examples are intended to compile with the current prototype compiler.
 - `type_level_calls/`: `type` values + type-level calls in type positions.
 - `auto_placeholder/`: `auto` placeholder for inference + call-site polymorphism.
 - `user_option_result/`: user-defined `Option`/`Result` via comptime type construction (`builtin::type_enum`).
+- `perfect_hash/`: minimal perfect hashing computed at comptime (ints/floats/c-strings via fingerprints).
 - `match_or_patterns/`: `match` with `|` pattern alternatives and guards.
 - `match_exhaustiveness/`: `match` exhaustiveness (positive cases).
 - `never_type/`: `!` (never) type unification through control flow.

@@ -125,6 +125,7 @@ add_test(NAME compile_crc32_tool             COMMAND cogc --emit-exe test_23.bin
 add_test(NAME compile_type_level_calls       COMMAND cogc --emit-exe test_24.bin ${CMAKE_CURRENT_SOURCE_DIR}/examples/type_level_calls/main.cg)
 add_test(NAME compile_auto_placeholder       COMMAND cogc --emit-exe test_25.bin ${CMAKE_CURRENT_SOURCE_DIR}/examples/auto_placeholder/main.cg)
 add_test(NAME compile_user_option_result     COMMAND cogc --emit-exe test_26.bin ${CMAKE_CURRENT_SOURCE_DIR}/examples/user_option_result/main.cg)
+add_test(NAME compile_perfect_hash          COMMAND cogc --emit-exe test_27.bin ${CMAKE_CURRENT_SOURCE_DIR}/examples/perfect_hash/main.cg)
 
 # v0.0.20: IR dumps (smoke)
 add_test(NAME emit_hir_smoke  COMMAND cogc --emit-hir test_emit_00.hir ${CMAKE_CURRENT_SOURCE_DIR}/examples/comptime_parameters/main.cg)
