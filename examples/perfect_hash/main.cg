@@ -1,20 +1,32 @@
 // Minimal perfect hashing computed at comptime.
 //
 // This example builds three “perfect hash tables”:
-// - `i32` keys -> `const* u8` (C string) values
+// - `i32` keys -> `CStr` values
 // - `f64` keys -> `i32` values
-// - `const* u8` C-string keys -> opcodes (then dispatched via `match`)
+// - `CStr` keys -> opcodes (then dispatched via `match`)
 //
 // The perfect-hash *seed* and the “g table” are computed at comptime.
 //
-// Current limitation:
-// - The MIR comptime interpreter cannot dereference pointers yet, so for the
-//   string-keyed map we *precompute* the per-key string fingerprints (hashes)
-//   as integer constants. At runtime we compute the same hash for the query.
+// v0.0.23+ note:
+// This example also demonstrates “generic programming” via `fn ... -> type`:
+// - `PhfMap(K, V)` returns a concrete struct type specialized to `K` and `V`.
+// - The type is constructed at comptime using builtin type-construction.
+//
+// Current compiler limitation (important for the shape of this example):
+// - Constructed types (`fn ... -> type` + `builtin::type_struct`) are not yet
+//   supported in LLVM *global constant* emission, so we store the computed
+//   tables in ordinary `static` items and build the `PhfMap(K, V)` values at
+//   runtime as small structs of pointers.
 
 mod phf;
 mod cstr;
 
+use phf::{Phf, MAX_KEYS};
+
+// A C string is a thin pointer (`const* u8`), not a slice.
+type CStr = const* u8;
+
+// Fingerprints convert keys into stable integers for hashing.
 fn fp_i32(x: i32) -> i64 { x as i64 }
 
 // Fingerprint for floats: scale by 1000 and truncate. For an actual library you
@@ -23,32 +35,78 @@ fn fp_f64(x: f64) -> i64 { (x * 1000.0) as i64 }
 
 const SEED_LIMIT: i64 = 2000;
 
-// ---- Map #1: i32 -> C string ----
+// ---- Generic “perfect hash map” type (computed at comptime) ----
+//
+// This is the generic part: we return a *type* specialized to `K` and `V`.
+//
+// The map stores pointers to:
+// - a `phf::Phf` table (seed + g[])
+// - the key array
+// - the value array
+//
+// The key/value arrays are stored separately as statics so we don't need any
+// runtime allocation.
+fn PhfMap(comptime K: type, comptime V: type) -> type {
+    let phf_ptr: type = builtin::type_ptr_const(Phf);
+    let keys_ptr: type = builtin::type_ptr_const(builtin::type_slice(K));
+    let values_ptr: type = builtin::type_ptr_const(builtin::type_slice(V));
 
-struct IntMap {
-    phf: phf::Phf,
-    keys: [i32; 9],
-    values: [const* u8; 9],
-}
-
-static INT_MAP: IntMap = comptime {
-    let keys: [i32; 9] = [200, 201, 204, 301, 400, 401, 403, 404, 500];
-    let values: [const* u8; 9] = [
-        c"OK",
-        c"Created",
-        c"No Content",
-        c"Moved Permanently",
-        c"Bad Request",
-        c"Unauthorized",
-        c"Forbidden",
-        c"Not Found",
-        c"Internal Server Error",
+    let fields = [
+        builtin::StructField{
+            name: "phf",
+            ty: phf_ptr,
+            vis: builtin::Vis::Pub,
+        },
+        builtin::StructField{
+            name: "keys",
+            ty: keys_ptr,
+            vis: builtin::Vis::Pub,
+        },
+        builtin::StructField{
+            name: "values",
+            ty: values_ptr,
+            vis: builtin::Vis::Pub,
+        },
     ];
 
-    let mut fps: [i64; phf::MAX_KEYS] = [0; phf::MAX_KEYS];
+    let desc = builtin::StructDesc{
+        name: "PhfMap",
+        repr: builtin::StructRepr::Cog,
+        fields: &fields,
+    };
+
+    builtin::type_struct(desc)
+}
+
+// ---- Map #1: i32 -> CStr ----
+
+// Demonstrate “arbitrary values”: the map's value type can be any `Copy` type,
+// including small structs.
+struct StatusInfo {
+    phrase: CStr,
+    code_class: i32,
+}
+
+type IntMap = PhfMap(i32, StatusInfo);
+
+static INT_KEYS: [i32; 9] = [200, 201, 204, 301, 400, 401, 403, 404, 500];
+static INT_VALUES: [StatusInfo; 9] = [
+    StatusInfo{phrase: c"OK", code_class: 2},
+    StatusInfo{phrase: c"Created", code_class: 2},
+    StatusInfo{phrase: c"No Content", code_class: 2},
+    StatusInfo{phrase: c"Moved Permanently", code_class: 3},
+    StatusInfo{phrase: c"Bad Request", code_class: 4},
+    StatusInfo{phrase: c"Unauthorized", code_class: 4},
+    StatusInfo{phrase: c"Forbidden", code_class: 4},
+    StatusInfo{phrase: c"Not Found", code_class: 4},
+    StatusInfo{phrase: c"Internal Server Error", code_class: 5},
+];
+
+static INT_PHF: Phf = comptime {
+    let mut fps: [i64; MAX_KEYS] = [0; MAX_KEYS];
     let mut i: usize = 0;
     while i < 9 {
-        fps[i] = fp_i32(keys[i]);
+        fps[i] = fp_i32(INT_KEYS[i]);
         i = i + 1;
     };
 
@@ -57,7 +115,7 @@ static INT_MAP: IntMap = comptime {
     let mut seed: i64 = 0;
     let mut found: bool = false;
     while seed < SEED_LIMIT {
-        let mut used: [bool; phf::MAX_KEYS] = [false; phf::MAX_KEYS];
+        let mut used: [bool; MAX_KEYS] = [false; MAX_KEYS];
         let mut ok: bool = true;
         let mut j: usize = 0;
         while j < 9 {
@@ -71,39 +129,46 @@ static INT_MAP: IntMap = comptime {
     };
     if !found { builtin::compile_error("perfect hash seed search failed (i32 map)"); };
 
-    let mut g: [usize; phf::MAX_KEYS] = [0; phf::MAX_KEYS];
+    let mut g: [usize; MAX_KEYS] = [0; MAX_KEYS];
     let mut j: usize = 0;
     while j < 9 {
         let s: usize = phf::slot(m, fps[j], seed);
         g[s] = j;
         j = j + 1;
     };
-    let p: phf::Phf = phf::Phf{n: 9, m: m, seed: seed, g: g};
 
-    IntMap{phf: p, keys: keys, values: values}
+    Phf{n: 9, m: m, seed: seed, g: g}
 };
 
-fn int_get(code: i32) -> const* u8 {
-    let idx: usize = phf::index(&INT_MAP.phf, fp_i32(code));
-    if INT_MAP.keys[idx] == code { INT_MAP.values[idx] } else { 0 as const* u8 }
+fn int_map() -> IntMap {
+    // `&[T; N]` implicitly coerces to `const* [T]` (a slice fat pointer).
+    let keys: const* [i32] = &INT_KEYS;
+    let values: const* [StatusInfo] = &INT_VALUES;
+    IntMap{phf: &INT_PHF, keys: keys, values: values}
+}
+
+fn int_get_info(code: i32) -> StatusInfo {
+    let m: IntMap = int_map();
+    let idx: usize = phf::index(m.phf, fp_i32(code));
+    if m.keys[idx] == code { m.values[idx] } else { StatusInfo{phrase: 0 as CStr, code_class: 0} }
+}
+
+fn int_get(code: i32) -> CStr {
+    int_get_info(code).phrase
 }
 
 // ---- Map #2: f64 -> i32 ----
 
-struct FloatMap {
-    phf: phf::Phf,
-    keys: [f64; 6],
-    values: [i32; 6],
-}
+type FloatMap = PhfMap(f64, i32);
 
-static FLOAT_MAP: FloatMap = comptime {
-    let keys: [f64; 6] = [0.5, 1.0, 2.0, 3.0, 10.0, 42.0];
-    let values: [i32; 6] = [5, 10, 20, 30, 100, 420];
+static FLOAT_KEYS: [f64; 6] = [0.5, 1.0, 2.0, 3.0, 10.0, 42.0];
+static FLOAT_VALUES: [i32; 6] = [5, 10, 20, 30, 100, 420];
 
-    let mut fps: [i64; phf::MAX_KEYS] = [0; phf::MAX_KEYS];
+static FLOAT_PHF: Phf = comptime {
+    let mut fps: [i64; MAX_KEYS] = [0; MAX_KEYS];
     let mut i: usize = 0;
     while i < 6 {
-        fps[i] = fp_f64(keys[i]);
+        fps[i] = fp_f64(FLOAT_KEYS[i]);
         i = i + 1;
     };
 
@@ -112,7 +177,7 @@ static FLOAT_MAP: FloatMap = comptime {
     let mut seed: i64 = 0;
     let mut found: bool = false;
     while seed < SEED_LIMIT {
-        let mut used: [bool; phf::MAX_KEYS] = [false; phf::MAX_KEYS];
+        let mut used: [bool; MAX_KEYS] = [false; MAX_KEYS];
         let mut ok: bool = true;
         let mut j: usize = 0;
         while j < 6 {
@@ -126,24 +191,33 @@ static FLOAT_MAP: FloatMap = comptime {
     };
     if !found { builtin::compile_error("perfect hash seed search failed (f64 map)"); };
 
-    let mut g: [usize; phf::MAX_KEYS] = [0; phf::MAX_KEYS];
+    let mut g: [usize; MAX_KEYS] = [0; MAX_KEYS];
     let mut j: usize = 0;
     while j < 6 {
         let s: usize = phf::slot(m, fps[j], seed);
         g[s] = j;
         j = j + 1;
     };
-    let p: phf::Phf = phf::Phf{n: 6, m: m, seed: seed, g: g};
 
-    FloatMap{phf: p, keys: keys, values: values}
+    Phf{n: 6, m: m, seed: seed, g: g}
 };
 
-fn float_get(x: f64) -> i32 {
-    let idx: usize = phf::index(&FLOAT_MAP.phf, fp_f64(x));
-    if FLOAT_MAP.keys[idx] == x { FLOAT_MAP.values[idx] } else { -1 }
+fn float_map() -> FloatMap {
+    let keys: const* [f64] = &FLOAT_KEYS;
+    let values: const* [i32] = &FLOAT_VALUES;
+    FloatMap{phf: &FLOAT_PHF, keys: keys, values: values}
 }
 
-// ---- Map #3: C string -> function pointer ----
+fn float_get(x: f64) -> i32 {
+    let m: FloatMap = float_map();
+    let idx: usize = phf::index(m.phf, fp_f64(x));
+    if m.keys[idx] == x { m.values[idx] } else { -1 }
+}
+
+// ---- Map #3: CStr -> opcode ----
+//
+// v0.0.23 limitation: function pointer values are not supported in comptime
+// evaluation yet, so we store a small opcode and dispatch with `match`.
 
 fn cmd_inc(x: i32) -> i32 { x + 1 }
 fn cmd_dec(x: i32) -> i32 { x - 1 }
@@ -168,47 +242,40 @@ fn cmd_apply(op: i32, x: i32) -> i32 {
     }
 }
 
-struct CmdMap {
-    phf: phf::Phf,
-    keys: [const* u8; 8],
-    // Fingerprints for the keys above, computed offline using `cstr_hash_modp`.
-    // Once comptime pointer reads exist, these can be computed inside the
-    // comptime block from the string literals directly.
-    key_fps: [i64; 8],
-    // v0.0.23 limitation: function pointer values are not supported in comptime
-    // evaluation yet, so we store a small opcode and dispatch with `match`.
-    values: [i32; 8],
-}
+type CmdMap = PhfMap(CStr, i32);
 
-static CMD_MAP: CmdMap = comptime {
-    let keys: [const* u8; 8] = [
-        c"inc",
-        c"dec",
-        c"double",
-        c"half",
-        c"square",
-        c"neg",
-        c"abs",
-        c"xor42",
-    ];
+static CMD_KEYS: [CStr; 8] = [
+    c"inc",
+    c"dec",
+    c"double",
+    c"half",
+    c"square",
+    c"neg",
+    c"abs",
+    c"xor42",
+];
 
-    let key_fps: [i64; 8] = [
-        6963514,     // inc
-        6630956,     // dec
-        558501453,   // double
-        1771792283,  // half
-        1072399358,  // square
-        7291450,     // neg
-        6432054,     // abs
-        1402161075,  // xor42
-    ];
+// Fingerprints for the keys above, computed offline using `cstr_hash_modp`.
+// Once comptime pointer reads exist, these can be computed from the string
+// literals directly.
+static CMD_KEY_FPS: [i64; 8] = [
+    6963514,     // inc
+    6630956,     // dec
+    558501453,   // double
+    1771792283,  // half
+    1072399358,  // square
+    7291450,     // neg
+    6432054,     // abs
+    1402161075,  // xor42
+];
 
-    let values: [i32; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
+static CMD_VALUES: [i32; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
 
-    let mut fps: [i64; phf::MAX_KEYS] = [0; phf::MAX_KEYS];
+static CMD_PHF: Phf = comptime {
+    let mut fps: [i64; MAX_KEYS] = [0; MAX_KEYS];
     let mut i: usize = 0;
     while i < 8 {
-        fps[i] = key_fps[i];
+        fps[i] = CMD_KEY_FPS[i];
         i = i + 1;
     };
 
@@ -217,7 +284,7 @@ static CMD_MAP: CmdMap = comptime {
     let mut seed: i64 = 0;
     let mut found: bool = false;
     while seed < SEED_LIMIT {
-        let mut used: [bool; phf::MAX_KEYS] = [false; phf::MAX_KEYS];
+        let mut used: [bool; MAX_KEYS] = [false; MAX_KEYS];
         let mut ok: bool = true;
         let mut j: usize = 0;
         while j < 8 {
@@ -231,40 +298,46 @@ static CMD_MAP: CmdMap = comptime {
     };
     if !found { builtin::compile_error("perfect hash seed search failed (cstr map)"); };
 
-    let mut g: [usize; phf::MAX_KEYS] = [0; phf::MAX_KEYS];
+    let mut g: [usize; MAX_KEYS] = [0; MAX_KEYS];
     let mut j: usize = 0;
     while j < 8 {
         let s: usize = phf::slot(m, fps[j], seed);
         g[s] = j;
         j = j + 1;
     };
-    let p: phf::Phf = phf::Phf{n: 8, m: m, seed: seed, g: g};
 
-    CmdMap{phf: p, keys: keys, key_fps: key_fps, values: values}
+    Phf{n: 8, m: m, seed: seed, g: g}
 };
 
-fn cmd_lookup(name: const* u8) -> i32 {
+fn cmd_map() -> CmdMap {
+    let keys: const* [CStr] = &CMD_KEYS;
+    let values: const* [i32] = &CMD_VALUES;
+    CmdMap{phf: &CMD_PHF, keys: keys, values: values}
+}
+
+fn cmd_lookup(name: CStr) -> i32 {
+    let m: CmdMap = cmd_map();
     let fp: i64 = cstr::cstr_hash_modp(name);
-    let idx: usize = phf::index(&CMD_MAP.phf, fp);
-    if cstr::cstr_eq(CMD_MAP.keys[idx], name) { CMD_MAP.values[idx] } else { -1 }
+    let idx: usize = phf::index(m.phf, fp);
+    if cstr::cstr_eq(m.keys[idx], name) { m.values[idx] } else { -1 }
 }
 
 fn main() -> i32 {
     // i32 map
-    let a: const* u8 = int_get(404);
-    let b: const* u8 = int_get(123);
+    let a: CStr = int_get(404);
+    let b: CStr = int_get(123);
 
     // f64 map
     let c: i32 = float_get(10.0);
     let d: i32 = float_get(1.5);
 
-    // cstr -> function pointer map
+    // cstr -> opcode map
     let f: i32 = cmd_lookup(c"square");
     let g: i32 = cmd_lookup(c"nope");
 
     let mut out: i32 = 0;
-    if a != 0 as const* u8 { out = out + 1; };
-    if b == 0 as const* u8 { out = out + 2; };
+    if a != 0 as CStr { out = out + 1; };
+    if b == 0 as CStr { out = out + 2; };
     if c == 100 { out = out + 3; };
     if d == -1 { out = out + 4; };
     if f != -1 { out = out + cmd_apply(f, 7); };

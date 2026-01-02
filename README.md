@@ -1,31 +1,93 @@
 # Cog
 
-Cog is a Rust-syntax systems language with Zig-style compile-time execution, targeting low-latency software.
+Cog is an opinionated systems programming language with compile-time metaprogramming, reflection, and metatyping.
 
 This repo contains an early C++ prototype compiler (`cogc`).
 
-- Core language spec (v0.1 draft): `spec/README.md`
+Status (v0.0.23): the prototype compiles most of the syntax through HIR → MIR → LLVM, and embeds MIR-interpreted comptime results into runtime constants. It also supports `type`-level programming (`fn ... -> type`) and an early C interop surface (`fn[extern(C)]`/`fn[export(C)]`, string literals, varargs).
+
+- Core language spec (v0.1 draft): `spec/*.md`
 - Roadmap: `roadmap.md`
-- Grammar: `spec/syntax.md` (core) and `grammar.md` (prototype parser)
-- Comptime design notes: `comptime_design.md`
 - Examples: `examples/`
 
-## Status (v0.0.23)
-- Front-end: parse → modules/`use` → type check + local move check → HIR → MIR.
-- Comptime: function calls (with resource limits), `comptime` parameters with residualization, and `builtin::type_info(type)`.
-- Type-level programming:
-  - `type` values + type-level calls in type positions (`PickWord(i32)`)
-  - comptime type construction builtins (`builtin::type_enum`, `builtin::type_struct`, etc)
-- `auto` type placeholder (MVP polymorphic functions, see `spec/auto.md`).
-- Core typing: `!` (never) type + match exhaustiveness (bool/enums; `_` required for int matches), tuple structs + `.0/.1`, and function pointers (`const* fn(...) -> R`).
-- Core surface: array literals (`[e0, e1, ...]` and `[x; N]`), float literals/types (`f32`/`f64`), bitwise ops/shifts, and indexing (`a[i]`, including raw pointer indexing).
-- MIR interpreter: const/static initialization + comptime blocks/paths are evaluated on MIR, and the result is embedded as runtime constants.
-- LLVM backend: MIR → LLVM lowering (alloca-based locals; rely on LLVM `mem2reg` as the initial strategy).
-- Executables: implements `main` entrypoint selection per `spec/layout_abi.md`.
-- C interop surface (early): keyword tags on items, `fn[extern(C)]` declarations, `fn[export(C)]` definitions, `extern_name(...)`/`export_name(...)`, and extern-only `...` varargs.
-- String literals:
-  - `"..."` is `const* [u8]` (fat pointer `{ptr,len}`)
-  - `c"..."` is `const* u8` (NUL-terminated)
+## Small examples
+
+Full versions live in `examples/crc32_tool/` and `examples/user_option_result/`.
+
+### CRC32 tool (comptime-generated data + C interop)
+
+```cog
+fn[extern(C)] printf(fmt: const* u8, ...) -> i32;
+
+static CRC32_TABLE: [u32; 256] = comptime {
+    let mut table: [u32; 256] = [0 as u32; 256];
+    let mut i: usize = 0;
+    while i < 256 {
+        let mut crc: u32 = i as u32;
+        let mut j: usize = 0;
+        while j < 8 {
+            if (crc & (1 as u32)) != (0 as u32) {
+                crc = (crc >> (1 as u32)) ^ (0xEDB88320 as u32);
+            } else {
+                crc = crc >> (1 as u32);
+            };
+            j = j + 1;
+        };
+        table[i] = crc;
+        i = i + 1;
+    };
+    table
+};
+
+fn calculate_crc32(s: const* u8) -> u32 {
+    let mut crc: u32 = 0xFFFF_FFFF as u32;
+    let mut i: usize = 0;
+    while s[i] != (0 as u8) {
+        let b: u32 = s[i] as u32;
+        let idx: usize = ((crc ^ b) & (0xFF as u32)) as usize;
+        crc = (crc >> (8 as u32)) ^ CRC32_TABLE[idx];
+        i = i + 1;
+    };
+    ~crc
+}
+```
+
+### User-defined `Option(T)` via `type` values (no generics syntax)
+
+```cog
+fn Option(comptime T: type) -> type {
+    let none_payload: [type; 0] = [];
+    let some_payload = [T];
+
+    let variants = [
+        builtin::EnumVariant {
+            name: "None",
+            payload: &none_payload,
+            discriminant: builtin::MaybeComptimeInt::None,
+        },
+        builtin::EnumVariant {
+            name: "Some",
+            payload: &some_payload,
+            discriminant: builtin::MaybeComptimeInt::None,
+        },
+    ];
+
+    let desc = builtin::EnumDesc {
+        name: "Option",
+        variants: &variants,
+        tag_type: builtin::MaybeType::None,
+    };
+
+    builtin::type_enum(desc)
+}
+
+fn unwrap_or(x: Option(i32), fallback: i32) -> i32 {
+    match x {
+        Option(i32)::Some(v) => v,
+        _ => fallback,
+    }
+}
+```
 
 ## Build and run
 Prereqs: CMake, a C++23 compiler, Flex/Bison, LLVM (C++ libraries), and `clang` (currently used as the linker driver for `--emit-exe`).
@@ -52,4 +114,4 @@ Other emits:
 - `./build/cogc --emit-mir-after lower build/out.mir examples/basic_codegen/main.cg`
 
 Format:
-- `find . -name "*.cpp" -o -name "*.hpp" | xargs -I {} /opt/homebrew/opt/llvm/bin/clang-format -i {}`
+- `find . -name "*.cpp" -o -name "*.hpp" | xargs clang-format -i`

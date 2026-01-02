@@ -312,7 +312,7 @@ Concrete deliverables:
   - Add a stress example that passes constructed types as type-level call arguments (cache collision test).
   - Add a small negative suite for MIR-only comptime errors (e.g. using `builtin::type_enum` outside comptime).
 
-End product (what “done” means):
+End product:
 - There is exactly one semantics engine used to *execute comptime* for `type`-level programming: MIR.
 - The compiler can evaluate and cache type-level calls via MIR, producing canonical constructed types.
 - `builtin::type_*` works anywhere a comptime expression is permitted, and it does not require bespoke AST-only behavior.
