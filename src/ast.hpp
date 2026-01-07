@@ -100,6 +100,7 @@ enum class AstNodeKind : std::uint16_t {
     PatTuple,
     PatStruct,
     PatVariant,
+    PatTypeVariant,
     PatPath,
     PatOr,
     PatField,
@@ -115,6 +116,7 @@ enum class AstNodeKind : std::uint16_t {
     ExprString,
     ExprUnit,
     ExprPath,
+    ExprTypeMember,
     ExprBlock,
     ExprComptime,
     ExprIf,
@@ -363,6 +365,24 @@ struct PatVariant final : Pattern {
           args(std::move(args)) {}
 };
 
+// A type-qualified enum variant pattern where the qualifier is a type
+// expression rather than a simple path.
+//
+// Example:
+//   `<Option(i32)>::Some(x)`
+//   `<Option(i32)>::None`
+struct PatTypeVariant final : Pattern {
+    Type* type = nullptr;
+    std::string variant{};
+    std::vector<Pattern*> args{};
+    explicit PatTypeVariant(Span span, Type* type, std::string variant,
+                            std::vector<Pattern*> args)
+        : Pattern(AstNodeKind::PatTypeVariant, span),
+          type(type),
+          variant(std::move(variant)),
+          args(std::move(args)) {}
+};
+
 struct PatPath final : Pattern {
     Path* path = nullptr;
     explicit PatPath(Span span, Path* path)
@@ -413,6 +433,20 @@ struct ExprPath final : Expr {
     Path* path = nullptr;
     explicit ExprPath(Span span, Path* path)
         : Expr(AstNodeKind::ExprPath, span), path(path) {}
+};
+
+// A type-qualified path, where the qualifier is a type expression instead of a
+// path.
+//
+// Example: `<Option(i32)>::Some` (as a callee) or `<Option(i32)>::None` (unit
+// variant value).
+struct ExprTypeMember final : Expr {
+    Type* type = nullptr;
+    std::string member{};
+    explicit ExprTypeMember(Span span, Type* type, std::string member)
+        : Expr(AstNodeKind::ExprTypeMember, span),
+          type(type),
+          member(std::move(member)) {}
 };
 
 struct ExprBlock final : Expr {

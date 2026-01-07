@@ -206,7 +206,8 @@ int main(int argc, char** argv) {
 
     std::optional<cog::MirInterpreter> mir_eval{};
     if (!session.has_errors() && hir && mir) {
-        mir_eval.emplace(session, *mir);
+        mir_eval.emplace(session, *mir,
+                         target ? target->layout : cog::TargetLayout{});
         for (const cog::HirDef& d : hir->defs) {
             if (d.kind == cog::HirDefKind::Const)
                 (void)mir_eval->eval_const(d.id);

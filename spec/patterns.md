@@ -61,6 +61,16 @@ match opt {
 }
 ```
 
+If the enum type is a type expression (for example a type-level call), use the
+type-qualified form:
+
+```cog
+match opt {
+    <Option(i32)>::Some(x) => ...
+    _ => ...
+}
+```
+
 ### Alternatives
 
 `p0 | p1 | ...` matches if any alternative matches.

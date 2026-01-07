@@ -297,7 +297,8 @@ class LlvmBackend {
         if (mir_eval) {
             mir_eval_ = mir_eval;
         } else {
-            mir_eval_owned_ = std::make_unique<MirInterpreter>(session_, mir_);
+            mir_eval_owned_ =
+                std::make_unique<MirInterpreter>(session_, mir_, target.layout);
             mir_eval_ = mir_eval_owned_.get();
         }
     }
@@ -348,6 +349,11 @@ class LlvmBackend {
 
     std::unordered_map<const ItemFn*, llvm::Function*> fn_decls_{};
     std::unordered_set<const ItemFn*> emitted_fns_{};
+
+    // `auto` specializations (v0.0.24): these are monomorphic functions that
+    // do not exist as AST items / HIR defs, so we declare+emit them on demand.
+    std::unordered_map<DefId, llvm::Function*> internal_fn_decls_{};
+    std::unordered_set<DefId> emitted_internal_fns_{};
 
     std::unordered_map<const ItemStatic*, llvm::GlobalVariable*>
         static_globals_{};
@@ -641,6 +647,10 @@ class LlvmBackend {
             // v0.0.22 MVP: `auto` functions are instantiated on demand.
             return;
         }
+        if (sig.ret == checked_.types.type_type()) {
+            // Comptime-only body.
+            return;
+        }
         if (!sig.comptime_params.empty() &&
             std::any_of(sig.comptime_params.begin(), sig.comptime_params.end(),
                         [](bool b) { return b; })) {
@@ -693,12 +703,12 @@ class LlvmBackend {
     }
 
     llvm::Function* get_or_create_comptime_specialization(
-        const ItemFn* fn, const FnInfo& sig,
+        DefId def, std::string_view base_symbol, const FnInfo& sig,
         const std::vector<ComptimeValue>& comptime_args, Span use_site) {
-        if (!fn || !fn->decl || !fn->decl->sig) return nullptr;
+        if (sig.ret == checked_.types.type_type()) return nullptr;
 
         // Construct a stable specialization name.
-        std::string name = locator_.symbol_for(fn);
+        std::string name = std::string(base_symbol);
         name += "$ct";
 
         size_t ct_index = 0;
@@ -734,17 +744,51 @@ class LlvmBackend {
         comptime_specializations_.insert({name, specialized});
 
         // Emit the residualized body immediately.
-        if (fn->body) {
-            auto dit = hir_.def_ids.find(static_cast<const Item*>(fn));
-            if (dit != hir_.def_ids.end()) {
-                if (const MirBody* body = mir_.body_for_fn(dit->second)) {
-                    llvm::IRBuilder<>::InsertPointGuard guard(builder_);
-                    mir_emit_body(specialized, *body, sig, &comptime_args,
-                                  use_site);
-                }
-            }
+        if (const MirBody* body = mir_.body_for_fn(def)) {
+            llvm::IRBuilder<>::InsertPointGuard guard(builder_);
+            mir_emit_body(specialized, *body, sig, &comptime_args, use_site);
         }
         return specialized;
+    }
+
+    llvm::Function* get_or_create_internal_function(DefId def, Span use_site) {
+        if (auto it = internal_fn_decls_.find(def);
+            it != internal_fn_decls_.end())
+            return it->second;
+
+        const AutoFnInstance* inst = auto_instance(def);
+        if (!inst) {
+            error(use_site, "internal error: missing internal function def");
+            return nullptr;
+        }
+        const FnInfo& sig = inst->sig;
+        if (sig.ret == checked_.types.type_type()) return nullptr;
+
+        llvm::FunctionType* fty = llvm_fn_type(sig);
+        std::string symbol = symbol_for_auto_instance(*inst);
+        llvm::Function* f = llvm::Function::Create(
+            fty, llvm::GlobalValue::InternalLinkage, symbol, module_.get());
+        internal_fn_decls_.insert({def, f});
+        return f;
+    }
+
+    llvm::Function* get_or_create_internal_function_body(DefId def,
+                                                         Span use_site) {
+        llvm::Function* f = get_or_create_internal_function(def, use_site);
+        if (!f) return nullptr;
+        if (emitted_internal_fns_.contains(def)) return f;
+        emitted_internal_fns_.insert(def);
+
+        const AutoFnInstance* inst = auto_instance(def);
+        const MirBody* body = mir_.body_for_fn(def);
+        if (!inst || !body) {
+            error(use_site,
+                  "internal error: missing MIR body for internal function");
+            return f;
+        }
+        llvm::IRBuilder<>::InsertPointGuard guard(builder_);
+        mir_emit_body(f, *body, inst->sig, /*comptime_args=*/nullptr, use_site);
+        return f;
     }
 
     void build_function_bodies() {
@@ -787,6 +831,38 @@ class LlvmBackend {
         if (!hd || hd->kind != HirDefKind::Fn || !hd->ast) return nullptr;
         if (hd->ast->kind != AstNodeKind::ItemFn) return nullptr;
         return static_cast<const ItemFn*>(hd->ast);
+    }
+
+    const AutoFnInstance* auto_instance(DefId def) const {
+        auto it =
+            checked_.auto_fn_instances.find(static_cast<std::uint32_t>(def));
+        return it == checked_.auto_fn_instances.end() ? nullptr : &it->second;
+    }
+
+    std::string symbol_for_auto_instance(const AutoFnInstance& inst) const {
+        std::string name = locator_.symbol_for(inst.base);
+        name += "$auto";
+        for (TypeId p : inst.sig.params) {
+            name += "$";
+            name += std::to_string(p);
+        }
+        return name;
+    }
+
+    std::string symbol_for_def(DefId def) const {
+        if (const ItemFn* fn = fn_def(def)) return locator_.symbol_for(fn);
+        if (const AutoFnInstance* inst = auto_instance(def))
+            return symbol_for_auto_instance(*inst);
+        return "cog$def$" + std::to_string(def);
+    }
+
+    const FnInfo* sig_for_def(DefId def) const {
+        if (const ItemFn* fn = fn_def(def)) {
+            auto it = checked_.fn_info.find(fn);
+            return it == checked_.fn_info.end() ? nullptr : &it->second;
+        }
+        if (const AutoFnInstance* inst = auto_instance(def)) return &inst->sig;
+        return nullptr;
     }
 
     const ItemStatic* static_def(DefId def) const {
@@ -1789,27 +1865,27 @@ class LlvmBackend {
             // Direct calls (`Fn(def#)`) vs indirect calls (`fp(...)`).
             if (std::holds_alternative<MirOperand::Fn>(c.callee.data)) {
                 DefId callee_def = std::get<MirOperand::Fn>(c.callee.data).def;
-                const ItemFn* callee_ast = fn_def(callee_def);
-                if (!callee_ast) {
-                    error(Span{},
-                          "missing function def during MIR call lowering");
+                const FnInfo* sig = sig_for_def(callee_def);
+                if (!sig) {
+                    error(Span{}, "missing function signature during MIR call lowering");
                     builder_.CreateBr(f.blocks[c.next]);
                     return;
                 }
-                auto sig_it = checked_.fn_info.find(callee_ast);
-                if (sig_it == checked_.fn_info.end()) {
-                    builder_.CreateBr(f.blocks[c.next]);
-                    return;
-                }
-                const FnInfo& sig = sig_it->second;
 
                 bool is_extern_c = false;
-                for (const Attr* a : callee_ast->attrs) {
-                    if (a && a->name && path_is_ident(a->name, "extern"))
-                        is_extern_c = true;
+                if (const ItemFn* callee_ast = fn_def(callee_def)) {
+                    for (const Attr* a : callee_ast->attrs) {
+                        if (a && a->name && path_is_ident(a->name, "extern"))
+                            is_extern_c = true;
+                    }
+                } else if (const AutoFnInstance* inst = auto_instance(callee_def)) {
+                    for (const Attr* a : inst->base->attrs) {
+                        if (a && a->name && path_is_ident(a->name, "extern"))
+                            is_extern_c = true;
+                    }
                 }
 
-                if (has_comptime_params(sig) && sig.is_variadic) {
+                if (has_comptime_params(*sig) && sig->is_variadic) {
                     error(Span{},
                           "functions with comptime parameters cannot be "
                           "variadic (internal limitation)");
@@ -1822,28 +1898,28 @@ class LlvmBackend {
                 args.reserve(c.args.size());
 
                 const Span use_site = f.body ? f.body->span : Span{};
-                const size_t fixed = sig.params.size();
+                const size_t fixed = sig->params.size();
                 for (size_t i = 0; i < c.args.size(); i++) {
-                    const bool is_ct = i < sig.comptime_params.size() &&
-                                       sig.comptime_params[i];
+                    const bool is_ct = i < sig->comptime_params.size() &&
+                                       sig->comptime_params[i];
                     if (is_ct) {
                         auto v = mir_eval_comptime_operand(
-                            f, c.args[i], sig.params[i], use_site);
+                            f, c.args[i], sig->params[i], use_site);
                         if (v) ct_args.push_back(*v);
                         continue;
                     }
 
                     CgValue av = mir_emit_operand(f, c.args[i]);
-                    if (!sig.is_variadic) {
+                    if (!sig->is_variadic) {
                         if (i < fixed) {
-                            av = mir_coerce_value(av, sig.params[i], use_site);
+                            av = mir_coerce_value(av, sig->params[i], use_site);
                         }
                         args.push_back(av.value);
                         continue;
                     }
 
                     if (i < fixed) {
-                        av = mir_coerce_value(av, sig.params[i], use_site);
+                        av = mir_coerce_value(av, sig->params[i], use_site);
                         args.push_back(av.value);
                         continue;
                     }
@@ -1855,11 +1931,17 @@ class LlvmBackend {
                 }
 
                 llvm::Function* callee_ll = nullptr;
-                if (has_comptime_params(sig)) {
+                if (has_comptime_params(*sig)) {
                     callee_ll = get_or_create_comptime_specialization(
-                        callee_ast, sig, ct_args, use_site);
+                        callee_def, symbol_for_def(callee_def), *sig, ct_args,
+                        use_site);
                 } else {
-                    callee_ll = llvm_fn(callee_ast);
+                    if (const ItemFn* callee_ast = fn_def(callee_def)) {
+                        callee_ll = llvm_fn(callee_ast);
+                    } else {
+                        callee_ll =
+                            get_or_create_internal_function_body(callee_def, use_site);
+                    }
                 }
 
                 if (!callee_ll) {
@@ -2014,6 +2096,10 @@ class LlvmBackend {
         const FnInfo& sig = sig_it->second;
         if (has_comptime_params(sig)) {
             // Emitted on demand as `$ct...` variants.
+            return;
+        }
+        if (sig.ret == checked_.types.type_type()) {
+            // Comptime-only body.
             return;
         }
 

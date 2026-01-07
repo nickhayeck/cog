@@ -92,6 +92,8 @@ std::string_view ast_kind_name(AstNodeKind kind) {
             return "PatStruct";
         case AstNodeKind::PatVariant:
             return "PatVariant";
+        case AstNodeKind::PatTypeVariant:
+            return "PatTypeVariant";
         case AstNodeKind::PatPath:
             return "PatPath";
         case AstNodeKind::PatOr:
@@ -116,6 +118,8 @@ std::string_view ast_kind_name(AstNodeKind kind) {
             return "ExprUnit";
         case AstNodeKind::ExprPath:
             return "ExprPath";
+        case AstNodeKind::ExprTypeMember:
+            return "ExprTypeMember";
         case AstNodeKind::ExprBlock:
             return "ExprBlock";
         case AstNodeKind::ExprComptime:
@@ -273,6 +277,12 @@ void dump_ast(std::ostream& os, const AstNode* node, int indent) {
             break;
         case AstNodeKind::PatBinding:
             dump_text(os, static_cast<const PatBinding*>(node)->name);
+            break;
+        case AstNodeKind::PatTypeVariant:
+            dump_text(os, static_cast<const PatTypeVariant*>(node)->variant);
+            break;
+        case AstNodeKind::ExprTypeMember:
+            dump_text(os, static_cast<const ExprTypeMember*>(node)->member);
             break;
         default:
             break;
@@ -471,6 +481,12 @@ void dump_ast(std::ostream& os, const AstNode* node, int indent) {
             for (const Pattern* p : n->args) dump_ast(os, p, indent + 1);
             return;
         }
+        case AstNodeKind::PatTypeVariant: {
+            auto* n = static_cast<const PatTypeVariant*>(node);
+            dump_ast(os, n->type, indent + 1);
+            for (const Pattern* p : n->args) dump_ast(os, p, indent + 1);
+            return;
+        }
         case AstNodeKind::PatPath: {
             dump_ast(os, static_cast<const PatPath*>(node)->path, indent + 1);
             return;
@@ -487,6 +503,11 @@ void dump_ast(std::ostream& os, const AstNode* node, int indent) {
         }
         case AstNodeKind::ExprPath: {
             dump_ast(os, static_cast<const ExprPath*>(node)->path, indent + 1);
+            return;
+        }
+        case AstNodeKind::ExprTypeMember: {
+            dump_ast(os, static_cast<const ExprTypeMember*>(node)->type,
+                     indent + 1);
             return;
         }
         case AstNodeKind::ExprBlock: {

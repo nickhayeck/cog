@@ -695,6 +695,9 @@ primary_expr
       for (cog::Expr* e : take_vec($4)) elems.push_back(e);
       $$ = MK(cog::ExprTuple, @$, std::move(elems));
     }
+  | '<' type '>' TOK_COLONCOLON IDENT {
+      $$ = MK(cog::ExprTypeMember, @$, $2, cog::take_str($5));
+    }
   | path { $$ = MK(cog::ExprPath, @$, $1); }
   | block { $$ = MK(cog::ExprBlock, @$, $1); }
   | KW_COMPTIME block { $$ = MK(cog::ExprComptime, @$, $2); }
@@ -780,6 +783,12 @@ pattern_primary
     }
   | path '{' pat_fields_opt '}' {
       $$ = MK(cog::PatStruct, @$, $1, take_vec($3));
+    }
+  | '<' type '>' TOK_COLONCOLON IDENT {
+      $$ = MK(cog::PatTypeVariant, @$, $2, cog::take_str($5), std::vector<cog::Pattern*>{});
+    }
+  | '<' type '>' TOK_COLONCOLON IDENT '(' pat_list_opt ')' {
+      $$ = MK(cog::PatTypeVariant, @$, $2, cog::take_str($5), take_vec($7));
     }
   | qpath { $$ = MK(cog::PatPath, @$, $1); }
   ;

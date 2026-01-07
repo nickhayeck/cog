@@ -4,17 +4,17 @@ Cog is an opinionated systems programming language with compile-time metaprogram
 
 This repo contains an early C++ prototype compiler (`cogc`).
 
-Status (v0.0.23): the prototype compiles most of the syntax through HIR → MIR → LLVM, and embeds MIR-interpreted comptime results into runtime constants. It also supports `type`-level programming (`fn ... -> type`) and an early C interop surface (`fn[extern(C)]`/`fn[export(C)]`, string literals, varargs).
+Status (v0.0.24): the prototype compiles most of the syntax through HIR → MIR → LLVM, and embeds MIR-interpreted comptime results into runtime constants. MIR interpretation also powers type-level calls (`fn ... -> type`) and type construction builtins, and `auto` functions are compiled per call site.
 
 - Core language spec (v0.1 draft): `spec/*.md`
 - Roadmap: `roadmap.md`
 - Examples: `examples/`
 
-## Small examples
+## Examples
 
 Full versions live in `examples/crc32_tool/` and `examples/user_option_result/`.
 
-### CRC32 tool (comptime-generated data + C interop)
+### CRC32 via compile-time computed look-up table
 
 ```cog
 fn[extern(C)] printf(fmt: const* u8, ...) -> i32;
@@ -39,10 +39,10 @@ static CRC32_TABLE: [u32; 256] = comptime {
     table
 };
 
-fn calculate_crc32(s: const* u8) -> u32 {
+fn calculate_crc32(s: const* u8, len: usize) -> u32 {
     let mut crc: u32 = 0xFFFF_FFFF as u32;
     let mut i: usize = 0;
-    while s[i] != (0 as u8) {
+    while i < len { // for-loops don't exist yet lol
         let b: u32 = s[i] as u32;
         let idx: usize = ((crc ^ b) & (0xFF as u32)) as usize;
         crc = (crc >> (8 as u32)) ^ CRC32_TABLE[idx];
@@ -52,7 +52,7 @@ fn calculate_crc32(s: const* u8) -> u32 {
 }
 ```
 
-### User-defined `Option(T)` via `type` values (no generics syntax)
+### "Optional" type
 
 ```cog
 fn Option(comptime T: type) -> type {
@@ -83,7 +83,7 @@ fn Option(comptime T: type) -> type {
 
 fn unwrap_or(x: Option(i32), fallback: i32) -> i32 {
     match x {
-        Option(i32)::Some(v) => v,
+        <Option(i32)>::Some(v) => v,
         _ => fallback,
     }
 }

@@ -6,9 +6,9 @@ This document is written as a **spec-driven** path to **v0.1.0 conformance**. Ea
 - examples that exercise the feature(s),
 - and at least one targeted compile test (positive or negative).
 
-Status: **v0.0.23 is implemented** (AST→HIR→MIR→LLVM pipeline + MIR interpreter for const/comptime embedding, plus type-level calls/`auto`/type construction). The v0.1 core language spec lives in `spec/README.md`.
+Status: **v0.0.24 is implemented** (AST→HIR→MIR→LLVM pipeline; a single MIR comptime engine for const/comptime embedding and type-level calls; `auto` per call-site compilation; and `<TypeExpr>::Variant` paths for computed enum types). The v0.1 core language spec lives in `spec/README.md`.
 
-Key spec gaps as of v0.0.23 (blocking v0.1.0):
+Key spec gaps as of v0.0.24 (blocking v0.1.0):
 - `core::Option/Result` + `?` (`spec/stdlib.md`)
 - `comptime_int`/`comptime_float` semantics (`spec/types.md`, `spec/lexical.md`)
 - `loop` as an expression via `break expr` (`spec/expressions.md`)
@@ -251,17 +251,15 @@ Goal: unlock user-space “generic” data structures as real Cog code (`spec/co
   - Example: `examples/user_option_result/`.
   - Negative tests: `test/negative/type_enum_tagged_payload.cg`, `test/negative/type_struct_duplicate_field.cg`, `test/negative/type_struct_field_ty_is_type.cg`.
 
-## Next milestones
-
-### v0.0.24 — MIR comptime unification: `type` values + type construction on MIR
+### v0.0.24 — MIR comptime unification: `type` values + type construction on MIR (done)
 Goal: eliminate the “two comptime engines” split by making MIR capable of executing the
 same comptime surface needed for type-level programming (and eventually all comptime).
 
-Today:
+Previously (v0.0.23):
 - type-level calls (`Name(T, ...)` in type positions) are evaluated by the AST comptime evaluator.
 - const/static + `comptime { ... }` residualization are evaluated by the MIR interpreter.
 
-This milestone makes MIR the *authoritative* comptime execution engine for:
+Implemented: MIR is the *authoritative* comptime execution engine for:
 - `type` values (first-class at comptime)
 - `builtin::type_*` constructors (including nominal `type_struct`/`type_enum`)
 - and the minimal pointer/ref story needed by descriptor values (`&local` as a comptime heap reference)
@@ -317,14 +315,16 @@ End product:
 - The compiler can evaluate and cache type-level calls via MIR, producing canonical constructed types.
 - `builtin::type_*` works anywhere a comptime expression is permitted, and it does not require bespoke AST-only behavior.
 
-Ergonomics follow-ups (do these at the end of this milestone):
+Ergonomics follow-ups (included in v0.0.24):
 - Type-qualified paths (eliminate “must alias first”):
   - Extend path syntax so the left-hand side of `::` can be a type expression (at least `type_path` and `type_call`).
-  - Support `Option(i32)::Some(1)` construction and `match x { Option(i32)::Some(v) => ... }` patterns.
+  - Support `<Option(i32)>::Some(1)` construction and `match x { <Option(i32)>::Some(v) => ... }` patterns (the `<...>` form avoids parser ambiguity in an LALR(1) grammar).
   - Update `spec/syntax.md` and add a targeted example + compile test.
 - `auto` polymorphism correctness:
   - Remove the current “single instantiation per function” behavior; type-check + lower polymorphic fns per call-site (with caching keyed by deduced types).
   - Add a stress test that calls the same `auto`-polymorphic function with at least two distinct argument type shapes and verifies both compile/codegen.
+
+## Next milestones
 
 ### v0.0.25 — Core semantics conformance: `loop` values, `Copy`, `comptime_int/float`
 Goal: close the biggest remaining semantic gaps in `spec/expressions.md`, `spec/moves.md`, and `spec/types.md`.

@@ -1,4 +1,4 @@
-// v0.0.23: user-defined "generic" Option/Result types via comptime type
+// v0.0.24: user-defined "generic" Option/Result types via comptime type
 // construction builtins.
 //
 // This file is intentionally comment-heavy: it’s an end-to-end demonstration of
@@ -160,6 +160,20 @@ fn opt_to_i32(x: OptI32) -> i32 {
     }
 }
 
+// Type-qualified enum variant paths:
+//
+// When the enum type is a type expression (like `Option(i32)`), you can’t write
+// `Option(i32)::Some(...)` directly because it’s syntactically ambiguous with a
+// normal call expression in an LALR(1) parser.
+//
+// Instead, Cog uses the explicit form `<TypeExpr>::Variant(...)`.
+fn opt_to_i32_direct(x: Option(i32)) -> i32 {
+    match x {
+        <Option(i32)>::None => 0,
+        <Option(i32)>::Some(v) => v,
+    }
+}
+
 fn res_to_i32(x: ResI32) -> i32 {
     match x {
         ResI32::Ok(v) => v,
@@ -186,12 +200,17 @@ fn wrap_opt_u8_to_i32(x: WrapOptU8) -> i32 {
 }
 
 fn main() -> i32 {
-    // Variant constructors use `Type::Variant(...)` syntax.
+    // Variant constructors use `Type::Variant(...)` syntax when `Type` is a
+    // normal path. If the enum type is a type expression, use
+    // `<TypeExpr>::Variant(...)` instead.
     //
     // Note: `OptI32` is a type alias, but method/variant lookup uses the
     // underlying constructed enum type.
     let a: OptI32 = OptI32::Some(10);
     let b: OptI32 = OptI32::None;
+
+    let a2: Option(i32) = <Option(i32)>::Some(10);
+    let b2: Option(i32) = <Option(i32)>::None;
 
     let ok: ResI32 = ResI32::Ok(32);
     let err: ResI32 = ResI32::Err(-1);
@@ -200,7 +219,8 @@ fn main() -> i32 {
     let nested_err: OptResI32 = OptResI32::Some(err);
     let nested_none: OptResI32 = OptResI32::None;
 
-    opt_to_i32(a) + opt_to_i32(b) + nested_to_i32(nested_ok) +
+    opt_to_i32(a) + opt_to_i32(b) + opt_to_i32_direct(a2) +
+        opt_to_i32_direct(b2) + nested_to_i32(nested_ok) +
         nested_to_i32(nested_err) + nested_to_i32(nested_none) +
         wrap_opt_i32_to_i32(WrapOptI32{value: OptI32::Some(1)}) +
         wrap_opt_u8_to_i32(WrapOptU8{value: OptU8::Some(2)})

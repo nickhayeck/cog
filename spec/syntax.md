@@ -249,6 +249,7 @@ primary_expr :=
   | "(" ")"                          // unit
   | "(" expr ")"                     // parens
   | "(" expr "," args? ")"           // tuple expr (trailing comma)
+  | "<" type ">" "::" IDENT          // type-qualified enum variant path
   | path
   | path "{" field_inits? "}"        // struct literal
   | block
@@ -286,6 +287,8 @@ pattern_primary :=
   | "(" ")"                             // empty tuple
   | "(" pattern ")"                     // parens
   | "(" pattern "," pat_list? ")"       // tuple pattern
+  | "<" type ">" "::" IDENT "(" pat_list? ")"  // type-qualified enum variant pattern
+  | "<" type ">" "::" IDENT                    // type-qualified path pattern (unit variant)
   | path "(" pat_list? ")"              // enum variant pattern
   | path "{" pat_fields? "}"            // struct pattern
   | path                                // path pattern (fieldless enum variant)

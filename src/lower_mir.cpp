@@ -1,5 +1,6 @@
 #include "lower_mir.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <limits>
 #include <optional>
@@ -32,6 +33,10 @@ class Lowerer {
           hir_(hir),
           crate_(*hir.crate),
           checked_(*hir.checked),
+          expr_types_(&checked_.expr_types),
+          binding_types_(&checked_.binding_types),
+          auto_call_targets_(&checked_.auto_call_targets),
+          auto_method_call_targets_(&checked_.auto_method_call_targets),
           types_(const_cast<TypeStore&>(checked_.types)),
           layout_(session, types_, checked_.struct_info, checked_.enum_info,
                   TargetLayout{}) {}
@@ -41,7 +46,8 @@ class Lowerer {
         program.hir = &hir_;
         program.types = &types_;
         program_ = &program;
-        next_internal_def_ = static_cast<DefId>(hir_.defs.size());
+        next_internal_def_ = std::max(static_cast<DefId>(hir_.defs.size()),
+                                      static_cast<DefId>(checked_.next_internal_def));
 
         for (const HirDef& d : hir_.defs) {
             switch (d.kind) {
@@ -56,11 +62,6 @@ class Lowerer {
                         // v0.0.22 MVP: `auto` functions are instantiated on
                         // demand. Uninstantiated `auto` functions have no
                         // monomorphic MIR body.
-                        break;
-                    }
-                    if (types_.equal(it->second.ret, types_.type_type())) {
-                        // v0.0.21: `type`-returning functions are comptime-only
-                        // and are not lowered to runtime MIR yet.
                         break;
                     }
 
@@ -108,9 +109,153 @@ class Lowerer {
             }
         }
 
+        // `auto` specializations (v0.0.24): monomorphic function bodies that do
+        // not exist as HIR defs.
+        for (const auto& [def, inst] : checked_.auto_fn_instances) {
+            if (inst.state != AutoFnInstance::State::Done) continue;
+            if (!inst.base || !inst.base->decl || !inst.base->decl->sig ||
+                !inst.base->body)
+                continue;
+
+            struct ScopedMaps {
+                Lowerer& self;
+                const std::unordered_map<const Expr*, TypeId>* saved_expr;
+                const std::unordered_map<const PatBinding*, TypeId>* saved_bind;
+                const std::unordered_map<const ExprCall*, std::uint32_t>* saved_calls;
+                const std::unordered_map<const ExprMethodCall*, std::uint32_t>*
+                    saved_methods;
+                explicit ScopedMaps(Lowerer& self, const AutoFnInstance& inst)
+                    : self(self),
+                      saved_expr(self.expr_types_),
+                      saved_bind(self.binding_types_),
+                      saved_calls(self.auto_call_targets_),
+                      saved_methods(self.auto_method_call_targets_) {
+                    self.expr_types_ = &inst.expr_types;
+                    self.binding_types_ = &inst.binding_types;
+                    self.auto_call_targets_ = &inst.call_targets;
+                    self.auto_method_call_targets_ = &inst.method_call_targets;
+                }
+                ~ScopedMaps() {
+                    self.expr_types_ = saved_expr;
+                    self.binding_types_ = saved_bind;
+                    self.auto_call_targets_ = saved_calls;
+                    self.auto_method_call_targets_ = saved_methods;
+                }
+            };
+
+            ScopedMaps scoped(*this, inst);
+
+            MirBody body = lower_fn_body(static_cast<DefId>(inst.def), inst.module,
+                                         inst.base, inst.sig, std::nullopt);
+            MirBodyId bid = static_cast<MirBodyId>(program.bodies.size());
+            body.id = bid;
+            program.fn_bodies.insert({static_cast<DefId>(inst.def), bid});
+            program.bodies.push_back(std::move(body));
+        }
+
         // Methods (impl items) are represented as `HirDefKind::Fn` too; they
         // are already included above because `build_hir` registers them as
         // defs.
+
+        program_ = nullptr;
+        if (session_.has_errors()) return std::nullopt;
+        return program;
+    }
+
+    std::optional<MirProgram> run_single_fn(DefId fn_def) {
+        MirProgram program{};
+        program.hir = &hir_;
+        program.types = &types_;
+        program_ = &program;
+        next_internal_def_ = std::max(static_cast<DefId>(hir_.defs.size()),
+                                      static_cast<DefId>(checked_.next_internal_def));
+
+        const HirDef* d = hir_.def(fn_def);
+        if (!d || d->kind != HirDefKind::Fn) {
+            error(Span{}, "internal error: requested non-function MIR body");
+            program_ = nullptr;
+            return std::nullopt;
+        }
+
+        auto* fn = d->ast ? static_cast<const ItemFn*>(d->ast) : nullptr;
+        if (!fn || fn->kind != AstNodeKind::ItemFn || !fn->decl ||
+            !fn->decl->sig) {
+            error(Span{},
+                  "internal error: missing function AST for MIR lowering");
+            program_ = nullptr;
+            return std::nullopt;
+        }
+        if (!fn->body) {
+            error(fn->span,
+                  "internal error: cannot lower extern function body");
+            program_ = nullptr;
+            return std::nullopt;
+        }
+
+        auto it = checked_.fn_info.find(fn);
+        if (it == checked_.fn_info.end()) {
+            error(fn->span, "internal error: missing function signature");
+            program_ = nullptr;
+            return std::nullopt;
+        }
+        if (it->second.has_auto && !it->second.auto_instantiated) {
+            error(fn->span,
+                  "internal error: cannot lower uninstantiated `auto` function");
+            program_ = nullptr;
+            return std::nullopt;
+        }
+
+        MirBody body =
+            lower_fn_body(d->id, d->module, fn, it->second, std::nullopt);
+        MirBodyId bid = static_cast<MirBodyId>(program.bodies.size());
+        body.id = bid;
+        program.fn_bodies.insert({d->id, bid});
+        program.bodies.push_back(std::move(body));
+
+        // Include all currently-known `auto` specializations so the interpreter
+        // can follow calls.
+        for (const auto& [def, inst] : checked_.auto_fn_instances) {
+            if (inst.state != AutoFnInstance::State::Done) continue;
+            if (!inst.base || !inst.base->decl || !inst.base->decl->sig ||
+                !inst.base->body)
+                continue;
+
+            struct ScopedMaps {
+                Lowerer& self;
+                const std::unordered_map<const Expr*, TypeId>* saved_expr;
+                const std::unordered_map<const PatBinding*, TypeId>* saved_bind;
+                const std::unordered_map<const ExprCall*, std::uint32_t>* saved_calls;
+                const std::unordered_map<const ExprMethodCall*, std::uint32_t>*
+                    saved_methods;
+                explicit ScopedMaps(Lowerer& self, const AutoFnInstance& inst)
+                    : self(self),
+                      saved_expr(self.expr_types_),
+                      saved_bind(self.binding_types_),
+                      saved_calls(self.auto_call_targets_),
+                      saved_methods(self.auto_method_call_targets_) {
+                    self.expr_types_ = &inst.expr_types;
+                    self.binding_types_ = &inst.binding_types;
+                    self.auto_call_targets_ = &inst.call_targets;
+                    self.auto_method_call_targets_ = &inst.method_call_targets;
+                }
+                ~ScopedMaps() {
+                    self.expr_types_ = saved_expr;
+                    self.binding_types_ = saved_bind;
+                    self.auto_call_targets_ = saved_calls;
+                    self.auto_method_call_targets_ = saved_methods;
+                }
+            };
+
+            ScopedMaps scoped(*this, inst);
+
+            MirBody inst_body =
+                lower_fn_body(static_cast<DefId>(inst.def), inst.module, inst.base,
+                              inst.sig, std::nullopt);
+            MirBodyId ibid = static_cast<MirBodyId>(program.bodies.size());
+            inst_body.id = ibid;
+            program.fn_bodies.insert({static_cast<DefId>(inst.def), ibid});
+            program.bodies.push_back(std::move(inst_body));
+        }
 
         program_ = nullptr;
         if (session_.has_errors()) return std::nullopt;
@@ -122,6 +267,12 @@ class Lowerer {
     const HirCrate& hir_;
     const ResolvedCrate& crate_;
     const CheckedCrate& checked_;
+    const std::unordered_map<const Expr*, TypeId>* expr_types_ = nullptr;
+    const std::unordered_map<const PatBinding*, TypeId>* binding_types_ = nullptr;
+    const std::unordered_map<const ExprCall*, std::uint32_t>* auto_call_targets_ =
+        nullptr;
+    const std::unordered_map<const ExprMethodCall*, std::uint32_t>*
+        auto_method_call_targets_ = nullptr;
     TypeStore& types_;
 
     // Used for `builtin::type_info` evaluation during lowering of comptime-only
@@ -147,8 +298,8 @@ class Lowerer {
 
     TypeId type_of(const Expr* e) const {
         if (!e) return types_.error();
-        auto it = checked_.expr_types.find(e);
-        if (it == checked_.expr_types.end()) return types_.error();
+        auto it = expr_types_->find(e);
+        if (it == expr_types_->end()) return types_.error();
         return it->second;
     }
 
@@ -156,8 +307,8 @@ class Lowerer {
         if (!p) return types_.error();
         if (p->kind != AstNodeKind::PatBinding) return types_.error();
         auto* b = static_cast<const PatBinding*>(p);
-        auto it = checked_.binding_types.find(b);
-        if (it == checked_.binding_types.end()) return types_.error();
+        auto it = binding_types_->find(b);
+        if (it == binding_types_->end()) return types_.error();
         return it->second;
     }
 
@@ -540,7 +691,8 @@ class Lowerer {
     MirBody lower_fn_body(DefId owner_def, ModuleId mid, const ItemFn* fn,
                           const FnInfo& sig, std::optional<TypeId> self_ty) {
         (void)self_ty;
-        in_comptime_context_ = false;
+        // v0.0.24: functions returning `type` are comptime-only bodies.
+        in_comptime_context_ = types_.equal(sig.ret, types_.type_type());
         out_ = MirBody{};
         out_.owner = owner_def;
         out_.span = fn ? fn->span : Span{};
@@ -801,6 +953,9 @@ class Lowerer {
             }
             case AstNodeKind::ExprPath:
                 return lower_path_expr(mid, static_cast<const ExprPath*>(e));
+            case AstNodeKind::ExprTypeMember:
+                return lower_type_member_expr(
+                    mid, static_cast<const ExprTypeMember*>(e));
             case AstNodeKind::ExprBlock:
                 return lower_block_expr(
                     mid, static_cast<const ExprBlock*>(e)->block);
@@ -921,7 +1076,48 @@ class Lowerer {
                 return MirOperand{MirOperand::Fn{it->second}};
         }
 
+        // v0.0.24: in comptime contexts, types are first-class values of type
+        // `type`.
+        if (in_comptime_context_ &&
+            types_.equal(type_of(static_cast<const Expr*>(p)), types_.type_type())) {
+            TypeId ty = lower_type_path(mid, p->path);
+            MirOperand::Const c{};
+            c.ty = types_.type_type();
+            c.value.data = MirConst::Type{.ty = ty};
+            return MirOperand{std::move(c)};
+        }
+
         error(p->span, "unresolved path in MIR lowering");
+        return unit_operand();
+    }
+
+    MirOperand lower_type_member_expr(ModuleId mid, const ExprTypeMember* tm) {
+        (void)mid;
+        if (!tm) return unit_operand();
+
+        TypeId enum_ty = type_of(static_cast<const Expr*>(tm));
+        ResolvedVariant rv = resolve_variant_from_type(enum_ty, tm->member);
+        if (rv.def) {
+            auto info_it = checked_.enum_info.find(rv.def);
+            if (info_it != checked_.enum_info.end()) {
+                const EnumInfo& ei = info_it->second;
+                auto vit = ei.variants.find(tm->member);
+                if (vit != ei.variants.end() && vit->second.payload.empty()) {
+                    MirLocalId tmp = add_temp(enum_ty);
+                    MirRvalue::Aggregate agg{};
+                    agg.kind = MirRvalue::AggregateKind::EnumVariant;
+                    agg.ty = enum_ty;
+                    agg.variant_index = rv.index;
+                    emit_stmt(MirStatement{MirStatement::Assign{
+                        .dst = MirPlace::local(tmp),
+                        .src = MirRvalue{std::move(agg)},
+                    }});
+                    return MirOperand{MirOperand::Copy{MirPlace::local(tmp)}};
+                }
+            }
+        }
+
+        error(tm->span, "unresolved type-qualified enum variant");
         return unit_operand();
     }
 
@@ -1574,27 +1770,32 @@ class Lowerer {
                                         std::move(rhs));
             }
             case AstNodeKind::PatPath:
-            case AstNodeKind::PatVariant: {
+            case AstNodeKind::PatVariant:
+            case AstNodeKind::PatTypeVariant: {
                 const TypeData& td = types_.get(scrut_ty);
                 if (td.kind != TypeKind::Enum || !td.enum_def) {
                     error(pat->span, "enum pattern on non-enum");
                     return bool_operand(false);
                 }
 
-                const Path* path = nullptr;
                 const std::vector<Pattern*>* args = nullptr;
+                std::string_view vname{};
                 if (pat->kind == AstNodeKind::PatPath) {
-                    path = static_cast<const PatPath*>(pat)->path;
-                } else {
+                    const Path* path = static_cast<const PatPath*>(pat)->path;
+                    vname = (path && !path->segments.empty())
+                                ? path->segments.back()->text
+                                : std::string_view{};
+                } else if (pat->kind == AstNodeKind::PatVariant) {
                     auto* vp = static_cast<const PatVariant*>(pat);
-                    path = vp->path;
                     args = &vp->args;
+                    vname = (vp->path && !vp->path->segments.empty())
+                                ? vp->path->segments.back()->text
+                                : std::string_view{};
+                } else {
+                    auto* vp = static_cast<const PatTypeVariant*>(pat);
+                    args = &vp->args;
+                    vname = vp->variant;
                 }
-
-                std::string_view vname =
-                    (path && !path->segments.empty())
-                        ? path->segments.back()->text
-                        : std::string_view{};
                 ResolvedVariant rv = resolve_variant_from_type(scrut_ty, vname);
                 if (!rv.def || !rv.decl) {
                     error(pat->span, "unresolved enum variant pattern");
@@ -1747,6 +1948,43 @@ class Lowerer {
                 }
                 return;
             }
+            case AstNodeKind::PatTypeVariant: {
+                auto* vp = static_cast<const PatTypeVariant*>(pat);
+                const TypeData& td = types_.get(scrut_ty);
+                if (td.kind != TypeKind::Enum || !td.enum_def) return;
+
+                ResolvedVariant rv =
+                    resolve_variant_from_type(scrut_ty, vp->variant);
+                if (!rv.def || !rv.decl) return;
+                auto info_it = checked_.enum_info.find(rv.def);
+                if (info_it == checked_.enum_info.end()) return;
+                const EnumInfo& ei = info_it->second;
+                auto vit = ei.variants.find(rv.decl->name);
+                if (vit == ei.variants.end()) return;
+                const VariantInfo& vi = vit->second;
+                if (vp->args.size() != vi.payload.size()) return;
+
+                for (size_t i = 0; i < vp->args.size(); i++) {
+                    const Pattern* ap = vp->args[i];
+                    if (!ap || ap->kind != AstNodeKind::PatBinding) continue;
+                    auto* b = static_cast<const PatBinding*>(ap);
+                    TypeId payload_ty = vi.payload[i];
+                    MirLocalId id = add_local(payload_ty, b->name);
+                    declare_local(b->name, id);
+
+                    MirPlace field = MirPlace::local(scrut_local);
+                    field.projection.push_back(
+                        MirProjection{MirProjection::Downcast{rv.index}});
+                    field.projection.push_back(MirProjection{
+                        MirProjection::Field{static_cast<std::uint32_t>(i)}});
+                    emit_stmt(MirStatement{MirStatement::Assign{
+                        .dst = MirPlace::local(id),
+                        .src = MirRvalue{MirRvalue::Use{MirOperand{
+                            MirOperand::Copy{std::move(field)}}}},
+                    }});
+                }
+                return;
+            }
             default:
                 error(pat->span, "unsupported binding pattern in MIR lowering");
                 return;
@@ -1760,12 +1998,36 @@ class Lowerer {
         const Path* callee_path = nullptr;
         if (call->callee && call->callee->kind == AstNodeKind::ExprPath)
             callee_path = static_cast<const ExprPath*>(call->callee)->path;
+        const ExprTypeMember* callee_tm = nullptr;
+        if (call->callee && call->callee->kind == AstNodeKind::ExprTypeMember)
+            callee_tm = static_cast<const ExprTypeMember*>(call->callee);
 
         if (callee_path && callee_path->segments.size() == 2 &&
             callee_path->segments[0]->text == "builtin") {
             std::string_view name = callee_path->segments[1]->text;
+            auto emit_intrinsic = [&](MirRvalue::IntrinsicKind kind,
+                                      std::vector<MirOperand> args) -> MirOperand {
+                TypeId out_ty = type_of(static_cast<const Expr*>(call));
+                MirLocalId tmp = add_temp(out_ty);
+                MirRvalue rv{};
+                rv.data =
+                    MirRvalue::Intrinsic{.kind = kind, .args = std::move(args)};
+                emit_stmt(MirStatement{MirStatement::Assign{
+                    .dst = MirPlace::local(tmp),
+                    .src = std::move(rv),
+                }});
+                return MirOperand{MirOperand::Copy{MirPlace::local(tmp)}};
+            };
             if (name == "size_of" || name == "align_of") {
                 if (call->args.size() != 1) return unit_operand();
+                if (in_comptime_context_) {
+                    return emit_intrinsic(
+                        name == "size_of" ? MirRvalue::IntrinsicKind::SizeOf
+                                          : MirRvalue::IntrinsicKind::AlignOf,
+                        std::vector<MirOperand>{
+                            lower_expr(mid, call->args[0]),
+                        });
+                }
                 TypeId ty = lower_type_value_expr(mid, call->args[0]);
                 std::optional<std::uint64_t> v{};
                 if (name == "size_of") v = layout_.size_of(ty, call->span);
@@ -1781,6 +2043,12 @@ class Lowerer {
             }
             if (name == "type_info") {
                 if (call->args.size() != 1) return unit_operand();
+                if (in_comptime_context_) {
+                    return emit_intrinsic(MirRvalue::IntrinsicKind::TypeInfo,
+                                          std::vector<MirOperand>{
+                                              lower_expr(mid, call->args[0]),
+                                          });
+                }
                 TypeId arg_ty = lower_type_value_expr(mid, call->args[0]);
                 std::uint64_t sz = 0;
                 std::uint64_t al = 0;
@@ -1973,6 +2241,42 @@ class Lowerer {
                     .dst = MirPlace::local(tmp), .src = std::move(rv)}});
                 return MirOperand{MirOperand::Copy{MirPlace::local(tmp)}};
             }
+
+            // v0.0.24: comptime-only type construction builtins.
+            if (in_comptime_context_) {
+                if (name == "type_unit")
+                    return emit_intrinsic(MirRvalue::IntrinsicKind::TypeUnit, {});
+                if (name == "type_never")
+                    return emit_intrinsic(MirRvalue::IntrinsicKind::TypeNever, {});
+                if (name == "type_ptr_const" && call->args.size() == 1)
+                    return emit_intrinsic(MirRvalue::IntrinsicKind::TypePtrConst,
+                                          {lower_expr(mid, call->args[0])});
+                if (name == "type_ptr_mut" && call->args.size() == 1)
+                    return emit_intrinsic(MirRvalue::IntrinsicKind::TypePtrMut,
+                                          {lower_expr(mid, call->args[0])});
+                if (name == "type_slice" && call->args.size() == 1)
+                    return emit_intrinsic(MirRvalue::IntrinsicKind::TypeSlice,
+                                          {lower_expr(mid, call->args[0])});
+                if (name == "type_array" && call->args.size() == 2)
+                    return emit_intrinsic(
+                        MirRvalue::IntrinsicKind::TypeArray,
+                        {lower_expr(mid, call->args[0]),
+                         lower_expr(mid, call->args[1])});
+                if (name == "type_tuple" && call->args.size() == 1)
+                    return emit_intrinsic(MirRvalue::IntrinsicKind::TypeTuple,
+                                          {lower_expr(mid, call->args[0])});
+                if (name == "type_fn" && call->args.size() == 2)
+                    return emit_intrinsic(
+                        MirRvalue::IntrinsicKind::TypeFn,
+                        {lower_expr(mid, call->args[0]),
+                         lower_expr(mid, call->args[1])});
+                if (name == "type_struct" && call->args.size() == 1)
+                    return emit_intrinsic(MirRvalue::IntrinsicKind::TypeStruct,
+                                          {lower_expr(mid, call->args[0])});
+                if (name == "type_enum" && call->args.size() == 1)
+                    return emit_intrinsic(MirRvalue::IntrinsicKind::TypeEnum,
+                                          {lower_expr(mid, call->args[0])});
+            }
         }
 
         // Direct function call?
@@ -1982,7 +2286,25 @@ class Lowerer {
                 if (dit == hir_.def_ids.end()) return unit_operand();
                 auto sig_it = checked_.fn_info.find(fn);
                 if (sig_it == checked_.fn_info.end()) return unit_operand();
-                const FnInfo& sig = sig_it->second;
+                DefId callee_def = dit->second;
+                const FnInfo* sig = &sig_it->second;
+                if (sig->has_auto && !sig->auto_instantiated) {
+                    auto ct_it = auto_call_targets_->find(call);
+                    if (ct_it == auto_call_targets_->end()) {
+                        error(call->span,
+                              "internal error: missing `auto` call target");
+                        return unit_operand();
+                    }
+                    callee_def = static_cast<DefId>(ct_it->second);
+                    auto inst_it = checked_.auto_fn_instances.find(ct_it->second);
+                    if (inst_it == checked_.auto_fn_instances.end()) {
+                        error(call->span,
+                              "internal error: missing `auto` specialization "
+                              "signature");
+                        return unit_operand();
+                    }
+                    sig = &inst_it->second.sig;
+                }
 
                 TypeId ret_ty = type_of(static_cast<const Expr*>(call));
                 std::optional<MirLocalId> out_local{};
@@ -1990,12 +2312,12 @@ class Lowerer {
                 MirBlockId next_bb = add_block();
 
                 MirTerminator::Call t{};
-                t.callee = MirOperand{MirOperand::Fn{dit->second}};
+                t.callee = MirOperand{MirOperand::Fn{callee_def}};
                 t.args.reserve(call->args.size());
                 for (size_t i = 0; i < call->args.size(); i++) {
                     const Expr* a = call->args[i];
-                    const bool is_ct = i < sig.comptime_params.size() &&
-                                       sig.comptime_params[i];
+                    const bool is_ct = i < sig->comptime_params.size() &&
+                                       sig->comptime_params[i];
                     if (is_ct)
                         t.args.push_back(lower_as_internal_const_item(mid, a));
                     else
@@ -2067,6 +2389,29 @@ class Lowerer {
             }
         }
 
+        // Type-qualified enum variant constructor `TypeExpr::Variant(...)`.
+        if (callee_tm) {
+            TypeId enum_ty = type_of(static_cast<const Expr*>(call));
+            ResolvedVariant rv =
+                resolve_variant_from_type(enum_ty, callee_tm->member);
+            if (rv.def && rv.decl) {
+                MirRvalue::Aggregate agg{};
+                agg.kind = MirRvalue::AggregateKind::EnumVariant;
+                agg.ty = enum_ty;
+                agg.variant_index = rv.index;
+                for (const Expr* a : call->args)
+                    agg.elems.push_back(lower_expr(mid, a));
+                MirLocalId tmp = add_temp(enum_ty);
+                emit_stmt(MirStatement{MirStatement::Assign{
+                    .dst = MirPlace::local(tmp),
+                    .src = MirRvalue{std::move(agg)},
+                }});
+                return MirOperand{MirOperand::Copy{MirPlace::local(tmp)}};
+            }
+            error(call->span, "unresolved type-qualified enum constructor");
+            return unit_operand();
+        }
+
         // Indirect call (callee expression).
         MirOperand callee = lower_expr(mid, call->callee);
         return emit_call(mid, call, std::move(callee));
@@ -2125,11 +2470,28 @@ class Lowerer {
 
         auto sig_it = checked_.fn_info.find(method);
         if (sig_it == checked_.fn_info.end()) return unit_operand();
-        const FnInfo& sig = sig_it->second;
-        if (sig.params.empty()) return unit_operand();
+        DefId callee_def = dit->second;
+        const FnInfo* sig = &sig_it->second;
+        if (sig->has_auto && !sig->auto_instantiated) {
+            auto ct_it = auto_method_call_targets_->find(mc);
+            if (ct_it == auto_method_call_targets_->end()) {
+                error(mc->span,
+                      "internal error: missing `auto` method call target");
+                return unit_operand();
+            }
+            callee_def = static_cast<DefId>(ct_it->second);
+            auto inst_it = checked_.auto_fn_instances.find(ct_it->second);
+            if (inst_it == checked_.auto_fn_instances.end()) {
+                error(mc->span,
+                      "internal error: missing `auto` specialization signature");
+                return unit_operand();
+            }
+            sig = &inst_it->second.sig;
+        }
+        if (sig->params.empty()) return unit_operand();
 
         // Compute self argument.
-        TypeId self_param_ty = sig.params[0];
+        TypeId self_param_ty = sig->params[0];
         MirOperand self_arg{};
         const TypeData& sd = types_.get(self_param_ty);
         if (sd.kind == TypeKind::Ptr) {
@@ -2158,13 +2520,13 @@ class Lowerer {
         if (ret_ty != types_.unit()) out_local = add_temp(ret_ty);
         MirBlockId next_bb = add_block();
         MirTerminator::Call t{};
-        t.callee = MirOperand{MirOperand::Fn{dit->second}};
+        t.callee = MirOperand{MirOperand::Fn{callee_def}};
         t.args.push_back(std::move(self_arg));
         for (size_t i = 0; i < mc->args.size(); i++) {
             const Expr* a = mc->args[i];
             const size_t param_index = 1 + i;
-            const bool is_ct = param_index < sig.comptime_params.size() &&
-                               sig.comptime_params[param_index];
+            const bool is_ct = param_index < sig->comptime_params.size() &&
+                               sig->comptime_params[param_index];
             if (is_ct)
                 t.args.push_back(lower_as_internal_const_item(mid, a));
             else
@@ -2184,6 +2546,12 @@ class Lowerer {
 std::optional<MirProgram> lower_mir(Session& session, const HirCrate& hir) {
     Lowerer l{session, hir};
     return l.run();
+}
+
+std::optional<MirProgram> lower_mir_for_fn(Session& session, const HirCrate& hir,
+                                           DefId fn_def) {
+    Lowerer l{session, hir};
+    return l.run_single_fn(fn_def);
 }
 
 }  // namespace cog

@@ -50,6 +50,8 @@ static void dump_const(std::ostream& os, const MirConst& c) {
                 os << v.v;
             } else if constexpr (std::is_same_v<T, MirConst::Float>) {
                 os << v.v;
+            } else if constexpr (std::is_same_v<T, MirConst::Type>) {
+                os << "type(" << v.ty << ")";
             } else if constexpr (std::is_same_v<T, MirConst::String>) {
                 os << (v.is_c_string ? "c\"" : "\"") << v.bytes << "\"";
             }
@@ -111,6 +113,44 @@ static void dump_rvalue(std::ostream& os, const TypeStore& ts,
                 os << "enum_tag(";
                 dump_operand(os, ts, v.operand);
                 os << ")";
+            } else if constexpr (std::is_same_v<T, MirRvalue::Intrinsic>) {
+                auto kind_name = [&]() -> std::string_view {
+                    switch (v.kind) {
+                        case MirRvalue::IntrinsicKind::SizeOf:
+                            return "size_of";
+                        case MirRvalue::IntrinsicKind::AlignOf:
+                            return "align_of";
+                        case MirRvalue::IntrinsicKind::TypeInfo:
+                            return "type_info";
+                        case MirRvalue::IntrinsicKind::TypeUnit:
+                            return "type_unit";
+                        case MirRvalue::IntrinsicKind::TypeNever:
+                            return "type_never";
+                        case MirRvalue::IntrinsicKind::TypePtrConst:
+                            return "type_ptr_const";
+                        case MirRvalue::IntrinsicKind::TypePtrMut:
+                            return "type_ptr_mut";
+                        case MirRvalue::IntrinsicKind::TypeSlice:
+                            return "type_slice";
+                        case MirRvalue::IntrinsicKind::TypeArray:
+                            return "type_array";
+                        case MirRvalue::IntrinsicKind::TypeTuple:
+                            return "type_tuple";
+                        case MirRvalue::IntrinsicKind::TypeFn:
+                            return "type_fn";
+                        case MirRvalue::IntrinsicKind::TypeStruct:
+                            return "type_struct";
+                        case MirRvalue::IntrinsicKind::TypeEnum:
+                            return "type_enum";
+                    }
+                    return "<intrinsic>";
+                };
+                os << "intrinsic(" << kind_name() << ", [";
+                for (size_t i = 0; i < v.args.size(); i++) {
+                    if (i) os << ", ";
+                    dump_operand(os, ts, v.args[i]);
+                }
+                os << "])";
             } else if constexpr (std::is_same_v<T, MirRvalue::Aggregate>) {
                 os << "agg(";
                 switch (v.kind) {

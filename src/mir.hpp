@@ -63,12 +63,15 @@ struct MirConst {
     struct Float {
         double v = 0.0;
     };
+    struct Type {
+        TypeId ty = 0;
+    };
     struct String {
         std::string bytes{};
         bool is_c_string = false;
     };
 
-    std::variant<Unit, Bool, Int, Float, String> data{};
+    std::variant<Unit, Bool, Int, Float, Type, String> data{};
 };
 
 struct MirOperand {
@@ -117,6 +120,30 @@ struct MirRvalue {
         MirOperand operand{};
     };
 
+    enum class IntrinsicKind : std::uint8_t {
+        // Layout/reflect (compile-time constant)
+        SizeOf,
+        AlignOf,
+        TypeInfo,
+
+        // Type construction (comptime-only)
+        TypeUnit,
+        TypeNever,
+        TypePtrConst,
+        TypePtrMut,
+        TypeSlice,
+        TypeArray,
+        TypeTuple,
+        TypeFn,
+        TypeStruct,
+        TypeEnum,
+    };
+
+    struct Intrinsic {
+        IntrinsicKind kind{};
+        std::vector<MirOperand> args{};
+    };
+
     enum class AggregateKind : std::uint8_t {
         Tuple,
         Array,
@@ -130,7 +157,8 @@ struct MirRvalue {
         std::vector<MirOperand> elems{};
     };
 
-    std::variant<Use, Unary, Binary, Cast, AddrOf, EnumTag, Aggregate> data{};
+    std::variant<Use, Unary, Binary, Cast, AddrOf, EnumTag, Intrinsic, Aggregate>
+        data{};
 };
 
 struct MirStatement {

@@ -7,11 +7,12 @@ These are project-local instructions for working in this repo.
 - Prefer correctness and debuggability over cleverness.
 - Avoid “magic” build steps; everything should run via CMake.
 
-## Current compiler pipeline (v0.0.23)
+## Current compiler pipeline (v0.0.24)
 - `cogc <file.cg>` runs: parse → module loading + `use` resolution → type checking + local move checking → HIR → MIR → LLVM.
-- Comptime extensions (v0.0.16–v0.0.23): comptime function calls (with limits), `comptime` parameters with residualization, `builtin::type_info(type)`, and comptime array construction/indexing.
-- Type-level programming (v0.0.21–v0.0.23): `type` values + type-level calls in type positions, `auto` placeholder, and comptime type construction builtins (`builtin::type_enum`, `builtin::type_struct`, etc).
+- Comptime extensions (v0.0.16–v0.0.24): MIR interpretation for `const`/`static` initializers and `comptime { ... }` blocks, comptime parameters with residualization, `builtin::type_info(type)`, and comptime array construction/indexing.
+- Type-level programming (v0.0.21–v0.0.24): `type` values + type-level calls in type positions, `auto` placeholder, and comptime type construction builtins (`builtin::type_enum`, `builtin::type_struct`, etc). Type-level calls are evaluated via the MIR interpreter (single comptime engine).
 - Core typing extensions (v0.0.18): `!`, match exhaustiveness, tuple structs + `.0/.1`, and function pointers.
+- Ergonomics (v0.0.24): type-qualified enum variant paths via `<TypeExpr>::Variant` for computed types (e.g. `<Option(i32)>::Some(1)`).
 - Optional backends:
   - `cogc --emit-llvm <out.ll> <file.cg>` emits LLVM IR.
   - `cogc --emit-bc <out.bc> <file.cg>` emits LLVM bitcode.
